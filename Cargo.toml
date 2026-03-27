@@ -1,0 +1,107 @@
+[package]
+name = "rtpbridge"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "High-performance RTP media routing server"
+license = "MIT"
+repository = "https://github.com/zyno-io/rtpbridge"
+keywords = ["rtp", "media", "voip", "webrtc"]
+categories = ["multimedia::audio", "network-programming"]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "signal", "fs"] }
+tokio-util = "0.7"
+
+# WebSocket
+tokio-tungstenite = "0.26"
+futures-util = "0.3"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# CLI / Config
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Utilities
+uuid = { version = "1", features = ["v4", "serde"] }
+dashmap = "6"
+thiserror = "2"
+anyhow = "1"
+rand = "0.9"
+
+# WebRTC
+str0m = "0.17"
+
+# Codecs
+xlaw = "0.0.3"
+ezk-g722 = "0.1"
+opus = "0.3"
+
+# Audio file decode
+symphonia = { version = "0.5", features = ["mp3", "ogg", "wav", "flac", "pcm", "vorbis"] }
+reqwest = { version = "0.12", features = ["stream"] }
+
+# Recording
+pcap-file = "2.0"
+percent-encoding = "2.3"
+etherparse = "0.19"
+
+# VAD
+earshot = "1.0"
+
+# Base64
+base64 = "0.22"
+
+# SRTP crypto primitives
+aes = "0.8"
+hmac = "0.12"
+sha1 = "0.10"
+ctr = "0.9"
+subtle = "2.6"
+zeroize = "1.8"
+
+# Date/time
+time = { version = "0.3", features = ["formatting"] }
+
+# Metrics
+prometheus-client = "0.22"
+
+[features]
+vendored-openssl = ["openssl/vendored"]
+
+[dependencies.openssl]
+version = "0.10"
+optional = true
+
+[dev-dependencies]
+portpicker = "0.1"
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3"
+
+[[bench]]
+name = "codec_bench"
+harness = false
+
+[[bench]]
+name = "srtp_bench"
+harness = false
+
+[[bench]]
+name = "routing_bench"
+harness = false
+
+[[bench]]
+name = "pcap_bench"
+harness = false
+
+[profile.release]
+lto = "thin"
+strip = "symbols"

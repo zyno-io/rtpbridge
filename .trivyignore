@@ -1,0 +1,8 @@
+# Debian bookworm base image CVEs with no upstream fix available.
+# Review periodically and remove once patched.
+
+# zlib: integer overflow in MiniZip — will_not_fix in bookworm
+CVE-2023-45853
+
+# glibc: integer overflow in memalign — no fix available yet
+CVE-2026-0861

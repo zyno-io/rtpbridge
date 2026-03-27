@@ -1,0 +1,179 @@
+# rtpbridge — Example Configuration
+#
+# Copy this file to rtpbridge.toml and adjust for your environment.
+# All values shown are the defaults unless otherwise noted.
+# Uncommented lines demonstrate a production-like setup.
+#
+# Usage:
+#   rtpbridge --config rtpbridge.toml
+#
+# CLI flags (--listen, --media-ip, --log-level) override values set here.
+
+# ---------------------------------------------------------------------------
+# Control Plane
+# ---------------------------------------------------------------------------
+
+# WebSocket JSON control plane listen address.
+# Clients connect here to create sessions, add endpoints, and control routing.
+# listen = "0.0.0.0:9100"
+
+# ---------------------------------------------------------------------------
+# Media Plane
+# ---------------------------------------------------------------------------
+
+# IP address for all RTP and WebRTC UDP sockets.
+# This appears in SDP c= lines and ICE host candidates.
+# Use a separate interface from the control plane for split-network deployments
+# (e.g., control on a private management VLAN, media on a public-facing IP).
+media_ip = "203.0.113.10"
+
+# UDP port range for plain RTP endpoint socket allocation (inclusive).
+# WebRTC endpoints ignore this and use OS-assigned ports.
+# Size the range for your expected concurrent RTP streams — each endpoint
+# binds a pair of ports (even for RTP, odd for RTCP) from this pool.
+rtp_port_range = [30000, 39999]
+
+# ---------------------------------------------------------------------------
+# Session Lifecycle
+# ---------------------------------------------------------------------------
+
+# Seconds to keep a session alive after its WebSocket disconnects.
+# During this window a reconnecting client can call session.attach to reclaim
+# the session. Set higher in environments with flaky control-plane links.
+disconnect_timeout_secs = 30
+
+# Maximum time (seconds) to wait for active sessions to drain during shutdown.
+# Default: 300 (5 minutes). In Kubernetes, set this equal to or slightly below
+# your pod's terminationGracePeriodSeconds. For long-lived call sessions,
+# consider a much higher value (e.g., 86400 for 24h).
+shutdown_max_wait_secs = 300
+
+# ---------------------------------------------------------------------------
+# File Playback
+# ---------------------------------------------------------------------------
+
+# Base directory for local audio file playback.
+# All local file paths requested via the control plane must resolve within
+# this directory (path traversal outside it is rejected).
+# If unset, local file playback is disabled — only URL-based playback works.
+# media_dir = "/var/lib/rtpbridge/media"
+
+# Directory for downloaded URL files used in file playback.
+# Files are cached here to avoid re-downloading on repeated plays.
+cache_dir = "/tmp/rtpbridge-cache"
+
+# How often (seconds) the cache cleaner runs to purge stale downloads.
+cache_cleanup_interval_secs = 300
+
+# Maximum concurrent HTTP downloads for URL-based file playback.
+# Limits file descriptor usage when many sessions start URL playback at once.
+# max_concurrent_downloads = 16
+
+# ---------------------------------------------------------------------------
+# Recordings
+# ---------------------------------------------------------------------------
+
+# Base directory for PCAP recordings.
+# Recorded files are also served over HTTP from this path.
+recording_dir = "/var/lib/rtpbridge/recordings"
+
+# ---------------------------------------------------------------------------
+# Limits
+# ---------------------------------------------------------------------------
+
+# Maximum number of concurrent sessions (0 = unlimited).
+# Set a hard cap to protect against runaway resource consumption.
+max_sessions = 10000
+
+# Maximum endpoints per session (0 = unlimited).
+# Useful as a safety valve against misbehaving control-plane clients.
+max_endpoints_per_session = 20
+
+# Maximum concurrent PCAP recordings per session.
+max_recordings_per_session = 100
+
+# Seconds to wait for recording tasks to flush to disk before aborting.
+# Increase if recordings are on slow storage (NFS, EBS).
+recording_flush_timeout_secs = 10
+
+# Maximum WebSocket message size in KB.
+# Tighten for constrained deployments; increase if control messages are large.
+# ws_max_message_size_kb = 256
+
+# Maximum SDP size in KB.
+# Rejects oversized SDP offers/answers to prevent memory exhaustion.
+# 64KB is generous for any real SDP; tighten under high-concurrency load.
+# max_sdp_size_kb = 64
+
+# Session idle timeout in seconds (0 = disabled).
+# Auto-destroys sessions with no media or control activity for this duration.
+# Prevents resource leaks from clients that stay connected but go silent.
+# session_idle_timeout_secs = 0
+
+# Empty session timeout (0 = disabled)
+# empty_session_timeout_secs = 0
+
+# Media timeout in seconds. An endpoint.media_timeout event is emitted when
+# no RTP packets are received from a remote endpoint for this duration.
+# Range: 1-300 (5 minutes). Lower values detect faster but may false-alarm
+# during normal RTP silence suppression.
+# media_timeout_secs = 5
+
+# Maximum concurrent WebSocket connections (0 = unlimited).
+# Prevents file descriptor / memory exhaustion from too many control-plane clients.
+# max_connections = 1000
+
+# WebSocket ping interval in seconds.
+# Detects dead connections behind NATs/load balancers. Lower values detect
+# faster but increase keepalive traffic.
+# ws_ping_interval_secs = 30
+
+# Event channel buffer sizes. Normal events are best-effort (dropped under
+# back-pressure with client notification). Critical events (e.g., session.orphaned)
+# get priority delivery.
+# event_channel_size = 256
+# critical_event_channel_size = 64
+
+# Maximum entries in the per-session transcode pipeline cache.
+# Higher values use more memory but avoid re-creating transcoders.
+# transcode_cache_size = 64
+
+# Maximum file download size in bytes for URL-based file playback.
+# max_file_download_bytes = 104857600   # 100 MB
+
+# Maximum recording download size in bytes for HTTP GET /recordings/{path}.
+# max_recording_download_bytes = 536870912   # 512 MB
+
+# Buffer size (packets) for the channel between session task and recording writer.
+# Increase if recordings frequently drop packets under high media load.
+# recording_channel_size = 1000
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+# Log level: trace, debug, info, warn, error.
+# Can also be set via --log-level on the command line (CLI wins).
+# log_level = "info"
+
+# ---------------------------------------------------------------------------
+# Kubernetes Deployment Notes
+# ---------------------------------------------------------------------------
+#
+# Log rotation: Not needed. Logs go to stdout, captured by kubelet. Configure
+# log rotation at the cluster level (e.g., --container-log-max-size).
+#
+# File descriptors: Each RTP endpoint uses 1-2 UDP sockets. Size the fd limit
+# for your expected concurrency. Example for 5000 sessions with 2 endpoints
+# each: ~20,000 fds + headroom. Set in your pod spec:
+#
+#   securityContext:
+#     sysctls:
+#       - name: fs.file-max
+#         value: "65536"
+#
+# Or use ulimit in your container entrypoint:
+#   ulimit -n 65536
+#
+# Graceful shutdown: Set terminationGracePeriodSeconds >= shutdown_max_wait_secs
+# so the application can drain active sessions before the kubelet sends SIGKILL.

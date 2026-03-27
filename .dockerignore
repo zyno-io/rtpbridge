@@ -1,0 +1,15 @@
+target/
+.git/
+.github/
+.gitlab-ci.yml
+docs/
+tests/
+benches/
+*.md
+!README.md
+libnull.rlib
+deny.toml
+rtpbridge.toml.example
+AGENTS.md
+CLAUDE.md
+PLAN.md

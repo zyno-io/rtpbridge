@@ -1,0 +1,201 @@
+default:
+  interruptible: true
+
+stages:
+  - lint
+  - test
+  - build
+  - mirror
+
+.rust-base:
+  image: rust:1.88-bookworm
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq libopus-dev > /dev/null
+    - rustup component add clippy rustfmt
+
+.skip-tags:
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never
+    - if: $CI_COMMIT_TITLE =~ /^v\d+\.\d+\.\d+$/
+      when: never
+    - when: always
+
+lint:fmt:
+  extends:
+    - .rust-base
+    - .skip-tags
+  stage: lint
+  script: cargo fmt -- --check
+
+lint:clippy:
+  extends:
+    - .rust-base
+    - .skip-tags
+  stage: lint
+  script: cargo clippy -- -D warnings
+
+audit:
+  extends:
+    - .rust-base
+    - .skip-tags
+  stage: test
+  script:
+    - cargo install cargo-audit --locked
+    - cargo audit
+
+test:unit:
+  extends:
+    - .rust-base
+    - .skip-tags
+  stage: test
+  variables:
+    RTPBRIDGE_TEST_TIMEOUT_MULT: "2"
+  script:
+    - useradd -m ci
+    - chown -R ci:ci . ${CARGO_HOME:-/usr/local/cargo} ${RUSTUP_HOME:-/usr/local/rustup}
+    - runuser -u ci -- cargo test --lib -- --test-threads=1
+
+test:integration:
+  extends:
+    - .rust-base
+    - .skip-tags
+  stage: test
+  variables:
+    RTPBRIDGE_TEST_TIMEOUT_MULT: "2"
+  script:
+    - useradd -m ci
+    - chown -R ci:ci . ${CARGO_HOME:-/usr/local/cargo} ${RUSTUP_HOME:-/usr/local/rustup}
+    - runuser -u ci -- cargo test --test '*' -- --test-threads=1
+
+bench:baseline:
+  extends: .rust-base
+  stage: test
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never
+    - if: $CI_COMMIT_TITLE =~ /^v\d+\.\d+\.\d+$/
+      when: never
+    - if: $CI_COMMIT_BRANCH == "main"
+  cache:
+    key: bench-baseline
+    paths:
+      - .bench-cache/
+    policy: push
+  script:
+    - cargo bench --bench '*' -- --save-baseline main
+    - rm -rf .bench-cache
+    - cp -r target/criterion .bench-cache
+
+bench:regression:
+  extends: .rust-base
+  stage: test
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never
+    - if: $CI_COMMIT_TITLE =~ /^v\d+\.\d+\.\d+$/
+      when: never
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: never
+    - when: always
+  cache:
+    key: bench-baseline
+    paths:
+      - .bench-cache/
+    policy: pull
+  script:
+    - |
+      if [ ! -d .bench-cache ]; then
+        echo "No baseline found — run benchmarks without comparison"
+        cargo bench --bench '*'
+        exit 0
+      fi
+    - mkdir -p target
+    - cp -r .bench-cache target/criterion
+    - cargo bench --bench '*' -- --baseline main 2>&1 | tee bench-output.txt
+    - |
+      if grep -q "Performance has regressed" bench-output.txt; then
+        echo ""
+        echo "========== BENCHMARK REGRESSIONS DETECTED =========="
+        grep -B 4 "Performance has regressed" bench-output.txt
+        exit 1
+      fi
+
+.build-base:
+  stage: build
+  dependencies: []
+  image: quay.io/containers/buildah
+  before_script:
+    - |
+      export BUILDAH_ISOLATION=chroot
+      export STORAGE_DRIVER=vfs
+
+      buildah login \
+        --username=${CI_REGISTRY_USER} \
+        --password=${CI_REGISTRY_PASSWORD} \
+        ${CI_REGISTRY}
+
+build:canary:
+  extends: .build-base
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never
+    - if: $CI_COMMIT_TITLE =~ /^v\d+\.\d+\.\d+$/
+      when: never
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: never
+    - if: $CI_COMMIT_BRANCH
+  script: |
+    buildah bud \
+      -t ${CI_REGISTRY_IMAGE}:canary \
+      .
+    buildah push ${CI_REGISTRY_IMAGE}:canary
+
+build:main:
+  extends: .build-base
+  rules:
+    - if: $CI_COMMIT_TITLE =~ /^v\d+\.\d+\.\d+$/
+      when: never
+    - if: $CI_COMMIT_BRANCH == "main"
+  script: |
+    buildah bud \
+      -t ${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHA} \
+      -t ${CI_REGISTRY_IMAGE}:main \
+      .
+    buildah push ${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHA}
+    buildah push ${CI_REGISTRY_IMAGE}:main
+
+build:release:
+  extends: .build-base
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v/
+  script: |
+    buildah bud \
+      -t ${CI_REGISTRY_IMAGE}:${CI_COMMIT_TAG} \
+      -t ${CI_REGISTRY_IMAGE}:latest \
+      .
+    buildah push ${CI_REGISTRY_IMAGE}:${CI_COMMIT_TAG}
+    buildah push ${CI_REGISTRY_IMAGE}:latest
+
+mirror:
+  stage: mirror
+  rules:
+    - if: $CI_COMMIT_MESSAGE =~ /\[skip mirror\]/
+      when: never
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_TAG =~ /^v/
+  image:
+    name: alpine/git
+    entrypoint: ['']
+  script: |
+    git config --global --add safe.directory "$CI_PROJECT_DIR"
+    export GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no"
+    mkdir ~/.ssh
+    echo $GITHUB_SSH_KEY_B64 | base64 -d > ~/.ssh/id_ed25519
+    chmod 600 ~/.ssh/id_ed25519
+    git remote add github git@github.com:zyno-io/rtpbridge.git
+    if [ -n "$CI_COMMIT_TAG" ]; then
+      git push github "$CI_COMMIT_TAG"
+    else
+      git push -u github HEAD:refs/heads/main --force
+    fi

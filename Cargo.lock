@@ -1594,9 +1594,6 @@ name = "opusic-sys"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc3280fe5b6f97ac1a35a0ac003e2fb0b92f8e4bdf2b2057e1bf9b87acca5696"
-dependencies = [
- "cmake",
-]
 
 [[package]]
 name = "parking_lot"

@@ -23,7 +23,7 @@ Create a send-only endpoint that plays audio from a local file or URL.
 |-------|------|---------|-------------|
 | `source` | string | required | File path or HTTP(S) URL |
 | `start_ms` | u64 | `0` | Start playback at this position |
-| `loop_count` | u32 or null | `null` | Number of additional replays: `0` = play once, `1` = play twice, `null` = loop infinitely. Maximum: 10000 |
+| `loop_count` | u32 or null | `0` | Number of additional replays: `0` = play once, `1` = play twice, `null` = loop infinitely. Maximum: 10000 |
 | `cache_ttl_secs` | u32 | `300` | For URLs: cache lifetime in seconds. `0` = delete after use |
 | `shared` | bool | `false` | Share decode pipeline across sessions |
 | `timeout_ms` | u32 | `10000` | Max milliseconds to wait for download (URL sources only; ignored for local files). Min: 1, max: 60000 |

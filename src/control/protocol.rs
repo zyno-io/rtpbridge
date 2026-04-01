@@ -180,7 +180,7 @@ pub struct EndpointCreateWithFileParams {
     pub source: String,
     #[serde(default)]
     pub start_ms: u64,
-    #[serde(default)]
+    #[serde(default = "default_loop_count")]
     pub loop_count: Option<u32>,
     #[serde(default = "default_cache_ttl")]
     pub cache_ttl_secs: u32,
@@ -213,6 +213,10 @@ pub struct EndpointCreateToneResult {
 
 fn default_timeout_ms() -> u32 {
     10000
+}
+
+fn default_loop_count() -> Option<u32> {
+    Some(0)
 }
 
 fn default_cache_ttl() -> u32 {
@@ -655,8 +659,15 @@ mod tests {
     }
 
     #[test]
-    fn file_params_loop_count_none_by_default() {
+    fn file_params_loop_count_play_once_by_default() {
         let json = r#"{"source":"test.wav"}"#;
+        let params: EndpointCreateWithFileParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.loop_count, Some(0));
+    }
+
+    #[test]
+    fn file_params_loop_count_null_means_infinite() {
+        let json = r#"{"source":"test.wav","loop_count":null}"#;
         let params: EndpointCreateWithFileParams = serde_json::from_str(json).unwrap();
         assert!(params.loop_count.is_none());
     }

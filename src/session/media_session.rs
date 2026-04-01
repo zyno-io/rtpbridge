@@ -1095,6 +1095,7 @@ impl SessionState {
         };
 
         if let Some(e) = init_err {
+            warn!(endpoint_id = %endpoint_id, error = %e, "file playback failed");
             let was_present = self.endpoints.remove(&endpoint_id).is_some();
             if was_present {
                 self.cleanup_endpoint_state(endpoint_id).await;

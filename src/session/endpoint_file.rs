@@ -441,6 +441,19 @@ type AudioFileComponents = (
     u32,
 );
 
+/// Codec registry with all default symphonia codecs plus Opus (via libopus).
+fn get_codecs() -> &'static symphonia::core::codecs::CodecRegistry {
+    use std::sync::LazyLock;
+    use symphonia::core::codecs::CodecRegistry;
+    static REGISTRY: LazyLock<CodecRegistry> = LazyLock::new(|| {
+        let mut registry = CodecRegistry::new();
+        symphonia::default::register_enabled_codecs(&mut registry);
+        registry.register_all::<symphonia_adapter_libopus::OpusDecoder>();
+        registry
+    });
+    &REGISTRY
+}
+
 /// Open a local audio file for symphonia decode
 fn open_audio_file(path: &str) -> anyhow::Result<AudioFileComponents> {
     let file = File::open(path)?;
@@ -472,8 +485,7 @@ fn open_audio_file(path: &str) -> anyhow::Result<AudioFileComponents> {
         .sample_rate
         .ok_or_else(|| anyhow::anyhow!("Unknown sample rate"))?;
 
-    let decoder =
-        symphonia::default::get_codecs().make(&track.codec_params, &DecoderOptions::default())?;
+    let decoder = get_codecs().make(&track.codec_params, &DecoderOptions::default())?;
 
     Ok((reader, decoder, track_id, sample_rate))
 }

@@ -47,6 +47,7 @@ opus = "0.3"
 
 # Audio file decode
 symphonia = { version = "0.5", features = ["mp3", "ogg", "wav", "flac", "pcm", "vorbis"] }
+symphonia-adapter-libopus = "0.2"
 reqwest = { version = "0.12", features = ["stream"] }
 
 # Recording

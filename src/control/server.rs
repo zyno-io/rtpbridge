@@ -566,20 +566,18 @@ async fn collect_pcap_files(
             {
                 results.append(&mut sub);
             }
-        } else if file_type.is_file() {
-            if let Some(ext) = path.extension() {
-                if ext == "pcap" {
-                    if let Ok(rel) = path.strip_prefix(base_dir) {
-                        let rel_str = rel.to_string_lossy().to_string();
-                        if let Some(prefix) = starts_with {
-                            if !rel_str.starts_with(prefix.as_str()) {
-                                continue;
-                            }
-                        }
-                        results.push(rel_str);
-                    }
-                }
+        } else if file_type.is_file()
+            && let Some(ext) = path.extension()
+            && ext == "pcap"
+            && let Ok(rel) = path.strip_prefix(base_dir)
+        {
+            let rel_str = rel.to_string_lossy().to_string();
+            if let Some(prefix) = starts_with
+                && !rel_str.starts_with(prefix.as_str())
+            {
+                continue;
             }
+            results.push(rel_str);
         }
     }
 

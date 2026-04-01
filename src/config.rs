@@ -248,7 +248,7 @@ impl Config {
                 self.rtp_port_range.0
             );
         }
-        if self.rtp_port_range.0 % 2 != 0 {
+        if !self.rtp_port_range.0.is_multiple_of(2) {
             anyhow::bail!(
                 "rtp_port_range start ({}) must be even (RTP uses even/odd port pairs)",
                 self.rtp_port_range.0
@@ -295,19 +295,19 @@ impl Config {
         if self.max_sdp_size_kb > 10_000 {
             anyhow::bail!("max_sdp_size_kb must be <= 10000 (10 MB)");
         }
-        if let Some(ref dir) = self.media_dir {
-            if !dir.is_dir() {
-                anyhow::bail!("media_dir {dir:?} does not exist or is not a directory");
-            }
+        if let Some(ref dir) = self.media_dir
+            && !dir.is_dir()
+        {
+            anyhow::bail!("media_dir {dir:?} does not exist or is not a directory");
         }
         // Validate recording_dir parent if it's not the default
         // (defaults may not exist yet; they'll be created on first use)
-        if self.recording_dir != default_recording_dir() {
-            if let Some(parent) = self.recording_dir.parent() {
-                if !parent.as_os_str().is_empty() && !parent.exists() {
-                    anyhow::bail!("recording_dir parent {parent:?} does not exist");
-                }
-            }
+        if self.recording_dir != default_recording_dir()
+            && let Some(parent) = self.recording_dir.parent()
+            && !parent.as_os_str().is_empty()
+            && !parent.exists()
+        {
+            anyhow::bail!("recording_dir parent {parent:?} does not exist");
         }
         // Verify recording_dir is writable if it already exists
         if self.recording_dir.exists() && !is_dir_writable(&self.recording_dir) {
@@ -339,12 +339,12 @@ impl Config {
         }
         // Validate cache_dir parent if it's not the default
         let default_cache = PathBuf::from("/tmp/rtpbridge-cache");
-        if self.cache_dir != default_cache {
-            if let Some(parent) = self.cache_dir.parent() {
-                if !parent.as_os_str().is_empty() && !parent.exists() {
-                    anyhow::bail!("cache_dir parent {parent:?} does not exist");
-                }
-            }
+        if self.cache_dir != default_cache
+            && let Some(parent) = self.cache_dir.parent()
+            && !parent.as_os_str().is_empty()
+            && !parent.exists()
+        {
+            anyhow::bail!("cache_dir parent {parent:?} does not exist");
         }
         // Verify cache_dir is writable if it already exists
         if self.cache_dir.exists() && !is_dir_writable(&self.cache_dir) {

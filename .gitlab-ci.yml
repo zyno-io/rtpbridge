@@ -8,7 +8,7 @@ stages:
   - mirror
 
 .rust-base:
-  image: rust:1.89-bookworm
+  image: rust:1.94-bookworm
   before_script:
     - apt-get update -qq && apt-get install -y -qq libopus-dev > /dev/null
     - rustup component add clippy rustfmt

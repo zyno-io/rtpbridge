@@ -186,10 +186,10 @@ impl FileCache {
 
             // Check content length if available
             let max_size = max_dl_bytes;
-            if let Some(len) = response.content_length() {
-                if len > max_size {
-                    anyhow::bail!("File too large: {len} bytes (max {max_size})");
-                }
+            if let Some(len) = response.content_length()
+                && len > max_size
+            {
+                anyhow::bail!("File too large: {len} bytes (max {max_size})");
             }
 
             // Stream the body with a size limit to prevent OOM when Content-Length is absent.

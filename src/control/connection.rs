@@ -229,11 +229,10 @@ async fn handle_connection_inner(
                         "events.dropped",
                         serde_json::json!({ "count": dropped }),
                     );
-                    if let Ok(json) = serde_json::to_string(&drop_event) {
-                        if ws_tx.send(Message::Text(json.into())).await.is_err() {
+                    if let Ok(json) = serde_json::to_string(&drop_event)
+                        && ws_tx.send(Message::Text(json.into())).await.is_err() {
                             break;
                         }
-                    }
                 }
 
                 let json = serde_json::to_string(&event).unwrap_or_else(|e| {
@@ -284,10 +283,10 @@ async fn drain_pending_events(
         );
         let drop_event =
             super::protocol::Event::new("events.dropped", serde_json::json!({ "count": dropped }));
-        if let Ok(json) = serde_json::to_string(&drop_event) {
-            if ws_tx.send(Message::Text(json.into())).await.is_err() {
-                return false;
-            }
+        if let Ok(json) = serde_json::to_string(&drop_event)
+            && ws_tx.send(Message::Text(json.into())).await.is_err()
+        {
+            return false;
         }
     }
 

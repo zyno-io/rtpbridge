@@ -130,19 +130,19 @@ impl DtmfDetector {
 
     /// If the current event has been alive longer than DTMF_TIMEOUT, emit it and clear state.
     fn drain_if_timed_out(&mut self, clock_rate: u32) -> Option<DtmfEvent> {
-        if let Some((cur_id, cur_vol, cur_dur, _, started)) = &self.current {
-            if started.elapsed() > DTMF_TIMEOUT {
-                let id = *cur_id;
-                let vol = *cur_vol;
-                let dur = *cur_dur;
-                self.current = None;
-                let rate = if clock_rate > 0 { clock_rate } else { 8000 };
-                return event_id_to_digit(id).map(|d| DtmfEvent {
-                    digit: d,
-                    duration_ms: ((dur as u64 * 1000) / rate as u64) as u32,
-                    volume: vol,
-                });
-            }
+        if let Some((cur_id, cur_vol, cur_dur, _, started)) = &self.current
+            && started.elapsed() > DTMF_TIMEOUT
+        {
+            let id = *cur_id;
+            let vol = *cur_vol;
+            let dur = *cur_dur;
+            self.current = None;
+            let rate = if clock_rate > 0 { clock_rate } else { 8000 };
+            return event_id_to_digit(id).map(|d| DtmfEvent {
+                digit: d,
+                duration_ms: ((dur as u64 * 1000) / rate as u64) as u32,
+                volume: vol,
+            });
         }
         None
     }

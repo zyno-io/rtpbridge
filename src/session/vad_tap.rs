@@ -103,33 +103,33 @@ pub fn process_vad(
             None => None,
         };
 
-        if let Some(pcm) = pcm {
-            if let Some(vad) = vad_monitors.get_mut(&pkt.source_endpoint_id) {
-                for vad_event in vad.process(&pcm) {
-                    match vad_event {
-                        crate::media::vad::VadEvent::SpeechStarted => {
-                            super::media_session::emit_event(
-                                event_tx,
-                                "vad.speech_started",
-                                VadSpeechStartedData {
-                                    endpoint_id: pkt.source_endpoint_id,
-                                },
-                                dropped_events,
-                                metrics,
-                            );
-                        }
-                        crate::media::vad::VadEvent::Silence { duration_ms } => {
-                            super::media_session::emit_event(
-                                event_tx,
-                                "vad.silence",
-                                VadSilenceData {
-                                    endpoint_id: pkt.source_endpoint_id,
-                                    silence_duration_ms: duration_ms,
-                                },
-                                dropped_events,
-                                metrics,
-                            );
-                        }
+        if let Some(pcm) = pcm
+            && let Some(vad) = vad_monitors.get_mut(&pkt.source_endpoint_id)
+        {
+            for vad_event in vad.process(&pcm) {
+                match vad_event {
+                    crate::media::vad::VadEvent::SpeechStarted => {
+                        super::media_session::emit_event(
+                            event_tx,
+                            "vad.speech_started",
+                            VadSpeechStartedData {
+                                endpoint_id: pkt.source_endpoint_id,
+                            },
+                            dropped_events,
+                            metrics,
+                        );
+                    }
+                    crate::media::vad::VadEvent::Silence { duration_ms } => {
+                        super::media_session::emit_event(
+                            event_tx,
+                            "vad.silence",
+                            VadSilenceData {
+                                endpoint_id: pkt.source_endpoint_id,
+                                silence_duration_ms: duration_ms,
+                            },
+                            dropped_events,
+                            metrics,
+                        );
                     }
                 }
             }

@@ -807,17 +807,17 @@ impl RtpEndpoint {
 
     /// If the rekey switchover deadline has passed, force-promote the new RX context.
     fn check_rekey_switchover(&mut self) {
-        if let Some(deadline) = self.rekey_switchover {
-            if Instant::now() >= deadline {
-                if self.srtp_rx_new.is_some() {
-                    debug!(endpoint_id = %self.id, "SRTP rekey: switchover deadline reached, forcing new key");
-                    self.srtp_rx = self.srtp_rx_new.take();
-                }
-                if self.srtcp_rx_new.is_some() {
-                    self.srtcp_rx = self.srtcp_rx_new.take();
-                }
-                self.rekey_switchover = None;
+        if let Some(deadline) = self.rekey_switchover
+            && Instant::now() >= deadline
+        {
+            if self.srtp_rx_new.is_some() {
+                debug!(endpoint_id = %self.id, "SRTP rekey: switchover deadline reached, forcing new key");
+                self.srtp_rx = self.srtp_rx_new.take();
             }
+            if self.srtcp_rx_new.is_some() {
+                self.srtcp_rx = self.srtcp_rx_new.take();
+            }
+            self.rekey_switchover = None;
         }
     }
 

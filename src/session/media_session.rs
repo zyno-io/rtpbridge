@@ -259,29 +259,29 @@ impl SessionState {
         debug!(event = name, "emitting event");
         if let Some(tx) = &self.event_tx {
             let event = Event::new(name, data);
-            if CRITICAL_EVENTS.contains(&name) {
-                if let Some(critical_tx) = &self.critical_event_tx {
-                    match critical_tx.try_send(event) {
-                        Ok(()) => return,
-                        Err(mpsc::error::TrySendError::Full(event)) => {
-                            // Critical channel full — fall through to normal channel
-                            if tx.try_send(event).is_err() {
-                                self.dropped_events.fetch_add(1, Ordering::Relaxed);
-                                self.metrics.events_dropped.inc();
-                                tracing::warn!(
-                                    event_name = name,
-                                    "critical event dropped: both channels full"
-                                );
-                            }
-                        }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
+            if CRITICAL_EVENTS.contains(&name)
+                && let Some(critical_tx) = &self.critical_event_tx
+            {
+                match critical_tx.try_send(event) {
+                    Ok(()) => return,
+                    Err(mpsc::error::TrySendError::Full(event)) => {
+                        // Critical channel full — fall through to normal channel
+                        if tx.try_send(event).is_err() {
                             self.dropped_events.fetch_add(1, Ordering::Relaxed);
                             self.metrics.events_dropped.inc();
-                            tracing::warn!(event_name = name, "event dropped: channel closed");
+                            tracing::warn!(
+                                event_name = name,
+                                "critical event dropped: both channels full"
+                            );
                         }
                     }
-                    return;
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        self.dropped_events.fetch_add(1, Ordering::Relaxed);
+                        self.metrics.events_dropped.inc();
+                        tracing::warn!(event_name = name, "event dropped: channel closed");
+                    }
                 }
+                return;
             }
             if tx.try_send(event).is_err() {
                 self.dropped_events.fetch_add(1, Ordering::Relaxed);
@@ -642,6 +642,7 @@ impl SessionState {
         Ok((id, offer))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_create_with_file(
         &mut self,
         source: &str,
@@ -792,10 +793,10 @@ impl SessionState {
         let mut removed = self.endpoints.remove(&endpoint_id);
         // Explicitly clean up shared playback subscriber before general cleanup,
         // so the async ref_count decrement happens reliably (not via Drop spawn).
-        if let Some(Endpoint::File(ref mut fep)) = removed {
-            if let Some(sub) = fep.shared_sub.take() {
-                sub.cleanup().await;
-            }
+        if let Some(Endpoint::File(ref mut fep)) = removed
+            && let Some(sub) = fep.shared_sub.take()
+        {
+            sub.cleanup().await;
         }
         // Auto-remove paired bridge endpoint in the other session
         if let Some(Endpoint::Bridge(ref bep)) = removed {
@@ -1361,24 +1362,21 @@ impl SessionState {
 
         // Create mixers for new multi-source destinations
         for &dest_id in &multi {
-            if !self.mixers.contains_key(&dest_id) {
-                if let Some(ep) = self.endpoints.get(&dest_id) {
-                    if let (Some(codec), Some(pt)) =
-                        (endpoint_audio_codec(ep), endpoint_send_pt(ep))
-                    {
-                        match super::mixer::DestinationMixer::new(codec, pt) {
-                            Ok(mut mixer) => {
-                                // Seed timestamp from the endpoint's last outbound
-                                // timestamp for seamless passthrough→mixer transition.
-                                if let Some(last_ts) = endpoint_last_rtp_timestamp(ep) {
-                                    mixer.continue_from_timestamp(last_ts);
-                                }
-                                self.mixers.insert(dest_id, mixer);
-                            }
-                            Err(e) => {
-                                warn!(dest = %dest_id, error = %e, "failed to create mixer");
-                            }
+            if !self.mixers.contains_key(&dest_id)
+                && let Some(ep) = self.endpoints.get(&dest_id)
+                && let (Some(codec), Some(pt)) = (endpoint_audio_codec(ep), endpoint_send_pt(ep))
+            {
+                match super::mixer::DestinationMixer::new(codec, pt) {
+                    Ok(mut mixer) => {
+                        // Seed timestamp from the endpoint's last outbound
+                        // timestamp for seamless passthrough→mixer transition.
+                        if let Some(last_ts) = endpoint_last_rtp_timestamp(ep) {
+                            mixer.continue_from_timestamp(last_ts);
                         }
+                        self.mixers.insert(dest_id, mixer);
+                    }
+                    Err(e) => {
+                        warn!(dest = %dest_id, error = %e, "failed to create mixer");
                     }
                 }
             }
@@ -1568,11 +1566,10 @@ pub async fn run_media_session(
             _ = tokio::time::sleep(sleep_duration) => {
                 let now = Instant::now();
                 for ep in state.endpoints.values_mut() {
-                    if let Endpoint::WebRtc(wep) = ep {
-                        if let Err(e) = wep.handle_timeout(now) {
+                    if let Endpoint::WebRtc(wep) = ep
+                        && let Err(e) = wep.handle_timeout(now) {
                             warn!(endpoint_id = %wep.id, error = %e, "timeout error");
                         }
-                    }
                 }
             }
         }
@@ -1613,10 +1610,10 @@ pub async fn run_media_session(
         }
 
         // Drain pending DTMF injection one packet at a time (non-blocking)
-        if let Some(ref mut inj) = state.dtmf_injection {
-            if super::session_dtmf::drain_dtmf_injection(inj, &mut state.endpoints).await {
-                state.dtmf_injection = None;
-            }
+        if let Some(ref mut inj) = state.dtmf_injection
+            && super::session_dtmf::drain_dtmf_injection(inj, &mut state.endpoints).await
+        {
+            state.dtmf_injection = None;
         }
 
         let needs_routing_rebuild;
@@ -1671,42 +1668,42 @@ pub async fn run_media_session(
         }
 
         // Session-level idle timeout: auto-destroy if no activity for the configured duration
-        if let Some(idle_dur) = idle_timeout {
-            if last_activity.elapsed() >= idle_dur {
-                warn!(session_id = %session_id, idle_secs = idle_dur.as_secs(),
+        if let Some(idle_dur) = idle_timeout
+            && last_activity.elapsed() >= idle_dur
+        {
+            warn!(session_id = %session_id, idle_secs = idle_dur.as_secs(),
                       "session idle timeout expired, destroying");
-                state.send_event(
-                    "session.idle_timeout",
-                    serde_json::json!({
-                        "session_id": session_id.to_string(),
-                        "idle_timeout_secs": idle_dur.as_secs(),
-                    }),
-                );
-                break;
-            }
+            state.send_event(
+                "session.idle_timeout",
+                serde_json::json!({
+                    "session_id": session_id.to_string(),
+                    "idle_timeout_secs": idle_dur.as_secs(),
+                }),
+            );
+            break;
         }
 
         // Empty session timeout: auto-destroy if no endpoints for the configured duration
-        if let (Some(empty_dur), Some(empty_since)) = (empty_timeout, state.empty_since) {
-            if empty_since.elapsed() >= empty_dur {
-                warn!(session_id = %session_id, empty_secs = empty_dur.as_secs(),
+        if let (Some(empty_dur), Some(empty_since)) = (empty_timeout, state.empty_since)
+            && empty_since.elapsed() >= empty_dur
+        {
+            warn!(session_id = %session_id, empty_secs = empty_dur.as_secs(),
                       "session empty timeout expired, destroying");
-                state.send_event(
-                    "session.empty_timeout",
-                    serde_json::json!({
-                        "session_id": session_id.to_string(),
-                        "empty_timeout_secs": empty_dur.as_secs(),
-                    }),
-                );
-                break;
-            }
+            state.send_event(
+                "session.empty_timeout",
+                serde_json::json!({
+                    "session_id": session_id.to_string(),
+                    "empty_timeout_secs": empty_dur.as_secs(),
+                }),
+            );
+            break;
         }
 
-        if let Some(interval) = state.stats_interval {
-            if state.last_stats_emit.elapsed() >= interval {
-                state.last_stats_emit = Instant::now();
-                state.emit_stats();
-            }
+        if let Some(interval) = state.stats_interval
+            && state.last_stats_emit.elapsed() >= interval
+        {
+            state.last_stats_emit = Instant::now();
+            state.emit_stats();
         }
 
         for ep in state.endpoints.values_mut() {
@@ -1758,10 +1755,10 @@ pub async fn run_media_session(
     // Explicitly clean up shared playback subscribers before dropping endpoints,
     // so async ref_count decrement happens reliably.
     for ep in state.endpoints.values_mut() {
-        if let Endpoint::File(fep) = ep {
-            if let Some(sub) = fep.shared_sub.take() {
-                sub.cleanup().await;
-            }
+        if let Endpoint::File(fep) = ep
+            && let Some(sub) = fep.shared_sub.take()
+        {
+            sub.cleanup().await;
         }
     }
 
@@ -2018,15 +2015,15 @@ async fn poll_and_route(
             for (dest_id, dest_codec, dest_pt, dest_clock) in dest_info {
                 // Multi-source destinations: feed to mixer (decoded to PCM internally)
                 if let Some(mixer) = mixers.get_mut(&dest_id) {
-                    if let Some(sc) = src_codec {
-                        if let Err(e) = mixer.feed(pkt.source_endpoint_id, sc, &pkt.payload) {
-                            debug!(
-                                src = %pkt.source_endpoint_id,
-                                dst = %dest_id,
-                                error = %e,
-                                "mixer feed error, dropping packet"
-                            );
-                        }
+                    if let Some(sc) = src_codec
+                        && let Err(e) = mixer.feed(pkt.source_endpoint_id, sc, &pkt.payload)
+                    {
+                        debug!(
+                            src = %pkt.source_endpoint_id,
+                            dst = %dest_id,
+                            error = %e,
+                            "mixer feed error, dropping packet"
+                        );
                     }
                     continue;
                 }
@@ -2059,14 +2056,13 @@ async fn poll_and_route(
                             Ok(p) => {
                                 // Evict oldest entry if cache is at capacity
                                 // O(n) LRU scan; acceptable for typical cache sizes (≤ 100 entries)
-                                if transcode_cache.len() >= transcode_cache_size {
-                                    if let Some(oldest_key) = transcode_cache
+                                if transcode_cache.len() >= transcode_cache_size
+                                    && let Some(oldest_key) = transcode_cache
                                         .iter()
                                         .min_by_key(|(_, v)| v.last_used)
                                         .map(|(k, _)| *k)
-                                    {
-                                        transcode_cache.remove(&oldest_key);
-                                    }
+                                {
+                                    transcode_cache.remove(&oldest_key);
                                 }
                                 transcode_cache.insert(
                                     cache_key,
@@ -2233,29 +2229,29 @@ pub(super) fn emit_event_with_priority(
     if let Some(tx) = event_tx {
         let event = Event::new(name, data);
         // Route critical events to the priority channel first
-        if CRITICAL_EVENTS.contains(&name) {
-            if let Some(critical_tx) = critical_event_tx {
-                match critical_tx.try_send(event) {
-                    Ok(()) => return,
-                    Err(mpsc::error::TrySendError::Full(event)) => {
-                        // Fall through to normal channel
-                        if tx.try_send(event).is_err() {
-                            dropped_events.fetch_add(1, Ordering::Relaxed);
-                            metrics.events_dropped.inc();
-                            tracing::warn!(
-                                event_name = name,
-                                "critical event dropped: both channels full"
-                            );
-                        }
-                    }
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
+        if CRITICAL_EVENTS.contains(&name)
+            && let Some(critical_tx) = critical_event_tx
+        {
+            match critical_tx.try_send(event) {
+                Ok(()) => return,
+                Err(mpsc::error::TrySendError::Full(event)) => {
+                    // Fall through to normal channel
+                    if tx.try_send(event).is_err() {
                         dropped_events.fetch_add(1, Ordering::Relaxed);
                         metrics.events_dropped.inc();
-                        tracing::warn!(event_name = name, "event dropped: channel closed");
+                        tracing::warn!(
+                            event_name = name,
+                            "critical event dropped: both channels full"
+                        );
                     }
                 }
-                return;
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    dropped_events.fetch_add(1, Ordering::Relaxed);
+                    metrics.events_dropped.inc();
+                    tracing::warn!(event_name = name, "event dropped: channel closed");
+                }
             }
+            return;
         }
         if tx.try_send(event).is_err() {
             dropped_events.fetch_add(1, Ordering::Relaxed);

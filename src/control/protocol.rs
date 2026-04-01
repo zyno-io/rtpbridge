@@ -85,6 +85,7 @@ impl Event {
 // ── Session Lifecycle ───────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct SessionCreateParams {}
 
 #[derive(Debug, Serialize)]
@@ -98,9 +99,11 @@ pub struct SessionAttachParams {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct SessionDestroyParams {}
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct SessionInfoParams {}
 
 #[derive(Debug, Serialize)]
@@ -114,6 +117,7 @@ pub struct SessionInfoResult {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct SessionListParams {}
 
 #[derive(Debug, Serialize)]
@@ -366,6 +370,7 @@ fn default_stats_interval() -> u32 {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct StatsUnsubscribeParams {}
 
 #[derive(Debug, Serialize)]

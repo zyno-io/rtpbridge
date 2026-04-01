@@ -25,7 +25,7 @@ pub struct SocketPair {
 impl SocketPool {
     pub fn new(bind_ip: IpAddr, port_start: u16, port_end: u16) -> anyhow::Result<Self> {
         // Ensure start is even
-        let start = if port_start % 2 == 0 {
+        let start = if port_start.is_multiple_of(2) {
             port_start
         } else {
             port_start.checked_add(1).ok_or_else(|| {
@@ -34,7 +34,7 @@ impl SocketPool {
         };
 
         // Ensure end is odd so the last pair (even RTP, odd RTCP) fits within the range
-        let port_end = if port_end % 2 == 0 {
+        let port_end = if port_end.is_multiple_of(2) {
             port_end
                 .checked_sub(1)
                 .ok_or_else(|| anyhow::anyhow!("port_end {port_end} too low to round to odd"))?

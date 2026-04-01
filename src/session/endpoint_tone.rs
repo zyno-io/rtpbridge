@@ -114,11 +114,11 @@ impl ToneEndpoint {
         }
 
         // Check duration limit
-        if let Some(limit) = self.duration_ms {
-            if self.elapsed_ms >= limit {
-                self.state = EndpointState::Finished;
-                return None;
-            }
+        if let Some(limit) = self.duration_ms
+            && self.elapsed_ms >= limit
+        {
+            self.state = EndpointState::Finished;
+            return None;
         }
 
         let in_on_phase = match &self.cadence {

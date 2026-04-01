@@ -155,21 +155,21 @@ pub fn parse_sdp(sdp: &str) -> ParsedSdp {
         } else if let Some(rest) = line.strip_prefix("a=rtpmap:") {
             // e.g., "111 opus/48000/2"
             let parts: Vec<&str> = rest.splitn(2, ' ').collect();
-            if parts.len() == 2 {
-                if let Ok(pt) = parts[0].parse::<u8>() {
-                    let codec_parts: Vec<&str> = parts[1].split('/').collect();
-                    let name = codec_parts[0];
-                    let clock_rate = codec_parts
-                        .get(1)
-                        .and_then(|s| s.parse::<u32>().ok())
-                        .unwrap_or(0);
-                    let channels = codec_parts.get(2).and_then(|s| s.parse::<u8>().ok());
-                    if rtpmap.len() < 32 {
-                        rtpmap.insert(pt, (name.to_string(), clock_rate, channels));
-                    }
-                    if name.eq_ignore_ascii_case("telephone-event") {
-                        result.telephone_event_pt = Some(pt);
-                    }
+            if parts.len() == 2
+                && let Ok(pt) = parts[0].parse::<u8>()
+            {
+                let codec_parts: Vec<&str> = parts[1].split('/').collect();
+                let name = codec_parts[0];
+                let clock_rate = codec_parts
+                    .get(1)
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .unwrap_or(0);
+                let channels = codec_parts.get(2).and_then(|s| s.parse::<u8>().ok());
+                if rtpmap.len() < 32 {
+                    rtpmap.insert(pt, (name.to_string(), clock_rate, channels));
+                }
+                if name.eq_ignore_ascii_case("telephone-event") {
+                    result.telephone_event_pt = Some(pt);
                 }
             }
         } else if let Some(rest) = line.strip_prefix("a=crypto:") {
@@ -257,12 +257,12 @@ pub fn parse_sdp(sdp: &str) -> ParsedSdp {
     // Detect OSRTP (RFC 8643): RTP/AVP profile with a=crypto present.
     // The client offers plain RTP but includes SRTP keys opportunistically.
     // We should use SRTP if the keys are present.
-    if result.crypto.is_some() && !result.is_webrtc {
-        if let Some(ref proto) = result.media_protocol {
-            if proto == "RTP/AVP" {
-                result.is_osrtp = true;
-            }
-        }
+    if result.crypto.is_some()
+        && !result.is_webrtc
+        && let Some(ref proto) = result.media_protocol
+        && proto == "RTP/AVP"
+    {
+        result.is_osrtp = true;
     }
 
     result

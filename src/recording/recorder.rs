@@ -157,10 +157,10 @@ impl RecordingManager {
             .ok_or_else(|| anyhow::anyhow!("Recording not found"))?;
 
         // Remove from endpoint tracking
-        if let Some(eid) = recording.endpoint_id {
-            if let Some(recs) = self.endpoint_recordings.get_mut(&eid) {
-                recs.retain(|id| id != recording_id);
-            }
+        if let Some(eid) = recording.endpoint_id
+            && let Some(recs) = self.endpoint_recordings.get_mut(&eid)
+        {
+            recs.retain(|id| id != recording_id);
         }
 
         // Drop sender to signal the task to drain remaining packets and finish.
@@ -278,10 +278,10 @@ impl RecordingManager {
             if let Some(recording) = self.recordings.remove(&rec_id) {
                 warn!(recording_id = %rec_id, path = %recording.file_path, "recording task died (write error), removing");
                 // Remove from endpoint tracking
-                if let Some(eid) = recording.endpoint_id {
-                    if let Some(recs) = self.endpoint_recordings.get_mut(&eid) {
-                        recs.retain(|id| *id != rec_id);
-                    }
+                if let Some(eid) = recording.endpoint_id
+                    && let Some(recs) = self.endpoint_recordings.get_mut(&eid)
+                {
+                    recs.retain(|id| *id != rec_id);
                 }
                 stopped.push(StoppedRecordingInfo {
                     recording_id: rec_id,

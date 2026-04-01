@@ -1,5 +1,5 @@
 # Pin Rust version to match rust-version in Cargo.toml
-FROM rust:1.89-bookworm AS builder
+FROM rust:1.94-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends libopus-dev && rm -rf /var/lib/apt/lists/*
 

@@ -809,10 +809,10 @@ async fn handle_create_with_file(
             "timeout_ms must be at most 60000 (1 minute)",
         );
     }
-    if let Some(count) = params.loop_count {
-        if count > 10_000 {
-            return Response::err(id, "INVALID_PARAMS", "loop_count must be at most 10000");
-        }
+    if let Some(count) = params.loop_count
+        && count > 10_000
+    {
+        return Response::err(id, "INVALID_PARAMS", "loop_count must be at most 10000");
     }
 
     let (reply_tx, reply_rx) = oneshot::channel();
@@ -854,10 +854,10 @@ async fn handle_create_tone(
         Err(e) => return Response::err(id, "INVALID_PARAMS", e.to_string()),
     };
 
-    if let Some(freq) = params.frequency {
-        if !(20.0..=20000.0).contains(&freq) {
-            return Response::err(id, "INVALID_PARAMS", "frequency must be 20-20000 Hz");
-        }
+    if let Some(freq) = params.frequency
+        && !(20.0..=20000.0).contains(&freq)
+    {
+        return Response::err(id, "INVALID_PARAMS", "frequency must be 20-20000 Hz");
     }
 
     let tone_type = params.tone;

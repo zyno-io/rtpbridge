@@ -826,6 +826,7 @@ async fn handle_create_with_file(
             cache_ttl_secs: params.cache_ttl_secs,
             timeout_ms: params.timeout_ms,
             shared: params.shared,
+            headers: params.headers,
         },
         reply_rx,
         &id,

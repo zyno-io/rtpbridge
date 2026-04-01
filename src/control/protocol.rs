@@ -188,6 +188,8 @@ pub struct EndpointCreateWithFileParams {
     pub shared: bool,
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u32,
+    #[serde(default)]
+    pub headers: Option<std::collections::HashMap<String, String>>,
 }
 
 #[derive(Debug, Serialize)]

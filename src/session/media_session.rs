@@ -120,6 +120,7 @@ pub enum SessionCommand {
         cache_ttl_secs: u32,
         timeout_ms: u32,
         shared: bool,
+        headers: Option<std::collections::HashMap<String, String>>,
     },
     CreateWithTone {
         reply: oneshot::Sender<anyhow::Result<EndpointId>>,
@@ -420,6 +421,7 @@ impl SessionState {
                 cache_ttl_secs,
                 timeout_ms,
                 shared,
+                headers,
             } => {
                 let result = self
                     .handle_create_with_file(
@@ -429,6 +431,7 @@ impl SessionState {
                         cache_ttl_secs,
                         timeout_ms,
                         shared,
+                        headers,
                     )
                     .await;
                 if result.is_ok() {
@@ -647,6 +650,7 @@ impl SessionState {
         cache_ttl_secs: u32,
         timeout_ms: u32,
         shared: bool,
+        headers: Option<std::collections::HashMap<String, String>>,
     ) -> anyhow::Result<EndpointId> {
         if self.max_endpoints > 0 && self.endpoints.len() >= self.max_endpoints {
             anyhow::bail!("MAX_ENDPOINTS_REACHED");
@@ -667,7 +671,9 @@ impl SessionState {
             let ttl = cache_ttl_secs;
             let timeout = timeout_ms;
             tokio::spawn(async move {
-                let result = cache.get_or_download(&url, ttl, timeout).await;
+                let result = cache
+                    .get_or_download(&url, ttl, timeout, headers.as_ref())
+                    .await;
                 let download_ok = result.is_ok();
                 if cmd_tx
                     .send(SessionCommand::FileReady {
@@ -2734,6 +2740,7 @@ mod tests {
                     cache_ttl_secs: 600,
                     timeout_ms: 15000,
                     shared: false,
+                    headers: None,
                 },
                 &packet_tx,
             )

@@ -87,13 +87,17 @@ impl FileCache {
 
     /// Get a cached file path for a URL, downloading if necessary.
     /// Returns the local file path.
+    ///
+    /// Optional `headers` are sent with the HTTP request and included in the
+    /// cache key so that requests with different credentials are cached separately.
     pub async fn get_or_download(
         &self,
         url: &str,
         cache_ttl_secs: u32,
         timeout_ms: u32,
+        headers: Option<&std::collections::HashMap<String, String>>,
     ) -> anyhow::Result<PathBuf> {
-        let key = url_hash(url);
+        let key = cache_key_hash(url, headers);
 
         // Check if already cached or in-flight
         let maybe_rx = {
@@ -163,10 +167,15 @@ impl FileCache {
         // to prevent slow/dribbling servers from blocking indefinitely.
         let max_dl_bytes = self.max_download_bytes;
         let timeout = Duration::from_millis(timeout_ms as u64);
+        let headers = headers.cloned();
         let result = tokio::time::timeout(timeout, async {
-            let mut response = self
-                .http_client
-                .get(url)
+            let mut request = self.http_client.get(url);
+            if let Some(ref hdrs) = headers {
+                for (name, value) in hdrs {
+                    request = request.header(name, value);
+                }
+            }
+            let mut response = request
                 .send()
                 .await
                 .map_err(|e| anyhow::anyhow!("Download failed: {e}"))?;
@@ -345,6 +354,30 @@ fn url_hash(url: &str) -> String {
     format!("{hash:040x}")
 }
 
+/// Cache key that incorporates both URL and optional headers.
+/// When headers are present (e.g. Authorization), requests with different
+/// headers are cached separately to avoid serving wrong content.
+fn cache_key_hash(
+    url: &str,
+    headers: Option<&std::collections::HashMap<String, String>>,
+) -> String {
+    use sha1::Digest;
+    let mut hasher = sha1::Sha1::new();
+    hasher.update(url.as_bytes());
+    if let Some(hdrs) = headers {
+        // Sort keys for deterministic hashing
+        let mut pairs: Vec<_> = hdrs.iter().collect();
+        pairs.sort_by_key(|(k, _)| *k);
+        for (k, v) in pairs {
+            hasher.update(b"\x00");
+            hasher.update(k.as_bytes());
+            hasher.update(b"\x00");
+            hasher.update(v.as_bytes());
+        }
+    }
+    format!("{:040x}", hasher.finalize())
+}
+
 fn url_extension(url: &str) -> String {
     // Extract extension from URL path (before query params)
     let path = url.split(['?', '#']).next().unwrap_or(url);
@@ -438,7 +471,7 @@ mod tests {
             let c = Arc::clone(&cache);
             let u = url.clone();
             handles.push(tokio::spawn(async move {
-                c.get_or_download(&u, 60, 5000).await
+                c.get_or_download(&u, 60, 5000, None).await
             }));
         }
 
@@ -610,7 +643,7 @@ mod tests {
         let cache = FileCache::new(cache_dir.clone()).unwrap();
         let url = format!("http://{}/missing.wav", addr);
 
-        let result = cache.get_or_download(&url, 60, 5000).await;
+        let result = cache.get_or_download(&url, 60, 5000, None).await;
         assert!(result.is_err(), "HTTP 404 should return error");
         assert!(
             result.unwrap_err().to_string().contains("404"),
@@ -640,7 +673,7 @@ mod tests {
         let cache = FileCache::new(cache_dir.clone()).unwrap();
         let url = format!("http://{}/slow.wav", addr);
 
-        let result = cache.get_or_download(&url, 60, 500).await; // 500ms timeout
+        let result = cache.get_or_download(&url, 60, 500, None).await; // 500ms timeout
         assert!(result.is_err(), "timeout should return error");
 
         server.abort();
@@ -668,7 +701,7 @@ mod tests {
         let cache = FileCache::new(cache_dir.clone()).unwrap();
         let url = format!("http://{}/huge.wav", addr);
 
-        let result = cache.get_or_download(&url, 60, 5000).await;
+        let result = cache.get_or_download(&url, 60, 5000, None).await;
         assert!(result.is_err(), "oversized file should return error");
         assert!(
             result.unwrap_err().to_string().contains("too large"),
@@ -709,7 +742,7 @@ mod tests {
             let c = Arc::clone(&cache);
             let u = url.clone();
             handles.push(tokio::spawn(async move {
-                c.get_or_download(&u, 60, 5000).await
+                c.get_or_download(&u, 60, 5000, None).await
             }));
         }
 
@@ -750,7 +783,7 @@ mod tests {
         let cache = FileCache::new(cache_dir.clone()).unwrap();
         let url = format!("http://{}/error.wav", addr);
 
-        let result = cache.get_or_download(&url, 60, 5000).await;
+        let result = cache.get_or_download(&url, 60, 5000, None).await;
         assert!(result.is_err(), "HTTP 500 should return error");
         assert!(
             result.unwrap_err().to_string().contains("500"),

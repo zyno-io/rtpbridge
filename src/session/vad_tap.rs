@@ -44,6 +44,46 @@ pub fn vad_stop(
         .ok_or_else(|| anyhow::anyhow!("VAD not active for endpoint"))
 }
 
+/// Check VAD monitors for timeout-based speech→silence transitions.
+/// Call periodically (e.g. every second) to handle the case where an endpoint
+/// stops sending packets while the VAD is in the speaking state.
+pub fn check_vad_timeouts(
+    vad_monitors: &mut HashMap<EndpointId, VadMonitor>,
+    event_tx: &Option<mpsc::Sender<Event>>,
+    dropped_events: &AtomicU64,
+    metrics: &crate::metrics::Metrics,
+) {
+    for (endpoint_id, vad) in vad_monitors.iter_mut() {
+        for vad_event in vad.check_timeout() {
+            match vad_event {
+                crate::media::vad::VadEvent::SpeechStarted => {
+                    super::media_session::emit_event(
+                        event_tx,
+                        "vad.speech_started",
+                        VadSpeechStartedData {
+                            endpoint_id: *endpoint_id,
+                        },
+                        dropped_events,
+                        metrics,
+                    );
+                }
+                crate::media::vad::VadEvent::Silence { duration_ms } => {
+                    super::media_session::emit_event(
+                        event_tx,
+                        "vad.silence",
+                        VadSilenceData {
+                            endpoint_id: *endpoint_id,
+                            silence_duration_ms: duration_ms,
+                        },
+                        dropped_events,
+                        metrics,
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Feed decoded PCM to VAD monitors for all routed audio packets.
 pub fn process_vad(
     packets: &[RoutedRtpPacket],

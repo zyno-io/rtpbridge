@@ -1650,6 +1650,12 @@ pub async fn run_media_session(
             );
             state.last_timeout_check = Instant::now();
         }
+        vad_tap::check_vad_timeouts(
+            &mut state.vad_monitors,
+            &state.event_tx,
+            &state.dropped_events,
+            &state.metrics,
+        );
         super::session_dtmf::check_dtmf_timeouts(
             &mut state.dtmf_state,
             &state.endpoints,

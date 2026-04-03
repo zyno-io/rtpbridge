@@ -12,6 +12,8 @@ pub enum ToneType {
     Ringing,
     /// US busy: 480Hz + 620Hz, 0.5s on / 0.5s off
     Busy,
+    /// Voicemail-style beep: 1000Hz, continuous (use duration_ms to control length)
+    Beep,
     /// Custom single-frequency continuous tone
     Sine,
 }
@@ -28,6 +30,7 @@ impl ToneType {
             ToneType::Ringback => (440.0, Some(480.0)),
             ToneType::Ringing => (440.0, Some(480.0)),
             ToneType::Busy => (480.0, Some(620.0)),
+            ToneType::Beep => (1000.0, None),
             ToneType::Sine => (custom_freq.unwrap_or(440.0), None),
         }
     }
@@ -42,7 +45,7 @@ impl ToneType {
                 on_ms: 500,
                 off_ms: 500,
             }),
-            ToneType::Ringing | ToneType::Sine => None, // continuous
+            ToneType::Ringing | ToneType::Beep | ToneType::Sine => None, // continuous
         }
     }
 }
@@ -241,6 +244,22 @@ mod tests {
             let pcm = ep.next_pcm(160).expect("should produce PCM");
             assert!(pcm.iter().all(|&s| s == 0), "busy off-phase");
         }
+    }
+
+    #[test]
+    fn test_beep_tone() {
+        let mut ep = ToneEndpoint::new(EndpointId::new_v4(), ToneType::Beep, None, Some(500));
+        // Continuous 1000Hz tone for 500ms = 25 frames
+        for _ in 0..25 {
+            let pcm = ep.next_pcm(160).expect("should produce PCM");
+            assert!(pcm.iter().any(|&s| s != 0), "beep should be continuous");
+        }
+        // Should finish after duration
+        assert!(
+            ep.next_pcm(160).is_none(),
+            "beep should finish after duration"
+        );
+        assert_eq!(ep.state, EndpointState::Finished);
     }
 
     #[test]

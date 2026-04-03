@@ -1,6 +1,12 @@
+use std::time::Instant;
+
 use earshot::{DefaultPredictor, Detector};
 
 use super::resample::Resampler;
+
+/// Number of consecutive non-speech frames required before committing to
+/// a speech→silence transition. At 16ms per frame this is ~320ms.
+const HANGOVER_FRAMES: u32 = 20;
 
 /// VAD monitor for a single endpoint. Decodes RTP audio to PCM,
 /// resamples to 16kHz, feeds 256-sample frames to earshot.
@@ -25,6 +31,10 @@ pub struct VadMonitor {
     silence_samples: u64,
     /// 16kHz samples processed since last silence event was emitted
     samples_since_last_event: u64,
+    /// Consecutive non-speech frames while still in speaking state (hangover counter)
+    hangover_frames: u32,
+    /// Wall-clock time of last `process()` call (for timeout-based fallback)
+    last_process_time: Option<Instant>,
 }
 
 /// Events emitted by the VAD monitor
@@ -58,12 +68,15 @@ impl VadMonitor {
             in_silence: false,
             silence_samples: 0,
             samples_since_last_event: 0,
+            hangover_frames: 0,
+            last_process_time: None,
         }
     }
 
     /// Feed decoded PCM samples (at source sample rate).
     /// Returns any VAD events that should be emitted.
     pub fn process(&mut self, pcm: &[i16]) -> Vec<VadEvent> {
+        self.last_process_time = Some(Instant::now());
         // Resample to 16kHz if needed
         if let Some(resampler) = &mut self.resampler {
             resampler.process(pcm, &mut self.resample_buf);
@@ -83,19 +96,28 @@ impl VadMonitor {
 
             let is_speech = score >= self.speech_threshold;
 
-            if is_speech && !self.is_speaking {
-                // Transition: silence → speech
-                self.is_speaking = true;
-                self.in_silence = false;
-                self.silence_samples = 0;
-                self.samples_since_last_event = 0;
-                events.push(VadEvent::SpeechStarted);
-            } else if !is_speech && self.is_speaking {
-                // Transition: speech → silence
-                self.is_speaking = false;
-                self.in_silence = true;
-                self.silence_samples = 0;
-                self.samples_since_last_event = 0;
+            if is_speech {
+                self.hangover_frames = 0;
+                if !self.is_speaking {
+                    // Transition: silence → speech
+                    self.is_speaking = true;
+                    self.in_silence = false;
+                    self.silence_samples = 0;
+                    self.samples_since_last_event = 0;
+                    events.push(VadEvent::SpeechStarted);
+                }
+            } else if self.is_speaking {
+                // Non-speech frame during speaking: bump hangover counter.
+                // Require 20 consecutive non-speech frames (~320ms at 16kHz)
+                // before committing to the speech→silence transition.
+                self.hangover_frames += 1;
+                if self.hangover_frames >= HANGOVER_FRAMES {
+                    self.is_speaking = false;
+                    self.in_silence = true;
+                    self.silence_samples = 0;
+                    self.samples_since_last_event = 0;
+                    self.hangover_frames = 0;
+                }
             }
 
             // Accumulate silence samples and emit periodic events
@@ -117,6 +139,42 @@ impl VadMonitor {
         events
     }
 
+    /// Check for timeout-based speech→silence transition when packets stop arriving.
+    /// Should be called periodically (e.g. every second) from the session loop.
+    /// If the monitor is in the speaking state and no packets have arrived for
+    /// longer than the hangover duration, force the transition to silence.
+    pub fn check_timeout(&mut self) -> Vec<VadEvent> {
+        let hangover_duration = std::time::Duration::from_millis(HANGOVER_FRAMES as u64 * 16);
+        if self.is_speaking {
+            if let Some(last) = self.last_process_time {
+                if last.elapsed() >= hangover_duration {
+                    self.is_speaking = false;
+                    self.in_silence = true;
+                    self.silence_samples = 0;
+                    self.samples_since_last_event = 0;
+                    self.hangover_frames = 0;
+                    // Emit the first silence event immediately
+                    return vec![VadEvent::Silence { duration_ms: 0 }];
+                }
+            }
+        } else if self.in_silence {
+            // Also emit periodic silence events when packets have stopped
+            if let Some(last) = self.last_process_time {
+                let elapsed_ms = last.elapsed().as_millis() as u64;
+                let total_silence_ms = self.silence_samples * 1000 / 16000 + elapsed_ms;
+                let since_last_ms = self.samples_since_last_event * 1000 / 16000 + elapsed_ms;
+                if since_last_ms >= self.silence_interval_ms as u64 {
+                    self.samples_since_last_event = 0;
+                    self.last_process_time = Some(Instant::now());
+                    return vec![VadEvent::Silence {
+                        duration_ms: total_silence_ms,
+                    }];
+                }
+            }
+        }
+        Vec::new()
+    }
+
     /// Flush any remaining samples (<256) at stream end.
     /// Zero-pads to a full frame and processes it.
     #[allow(dead_code)] // used in tests
@@ -131,17 +189,24 @@ impl VadMonitor {
         let is_speech = score >= self.speech_threshold;
         let mut events = Vec::new();
 
-        if is_speech && !self.is_speaking {
-            self.is_speaking = true;
-            self.in_silence = false;
-            self.silence_samples = 0;
-            self.samples_since_last_event = 0;
-            events.push(VadEvent::SpeechStarted);
-        } else if !is_speech && self.is_speaking {
-            self.is_speaking = false;
-            self.in_silence = true;
-            self.silence_samples = 0;
-            self.samples_since_last_event = 0;
+        if is_speech {
+            self.hangover_frames = 0;
+            if !self.is_speaking {
+                self.is_speaking = true;
+                self.in_silence = false;
+                self.silence_samples = 0;
+                self.samples_since_last_event = 0;
+                events.push(VadEvent::SpeechStarted);
+            }
+        } else if self.is_speaking {
+            self.hangover_frames += 1;
+            if self.hangover_frames >= 20 {
+                self.is_speaking = false;
+                self.in_silence = true;
+                self.silence_samples = 0;
+                self.samples_since_last_event = 0;
+                self.hangover_frames = 0;
+            }
         }
 
         if !self.is_speaking && self.in_silence {
@@ -165,6 +230,8 @@ impl VadMonitor {
         self.in_silence = false;
         self.silence_samples = 0;
         self.samples_since_last_event = 0;
+        self.hangover_frames = 0;
+        self.last_process_time = None;
     }
 }
 
@@ -195,11 +262,9 @@ mod tests {
             vad.process(chunk);
         }
 
-        // Feed enough silence to exceed 50ms in audio time.
-        // First chunk triggers the speech→silence transition, subsequent chunks
-        // accumulate silence samples. We need >800 samples of silence after
-        // the transition frame to exceed the 50ms interval.
-        let silence = vec![0i16; 4096]; // 256ms of silence at 16kHz
+        // Feed enough silence to get past the hangover (20 frames × 256 = 5120
+        // samples at 16kHz = 320ms) plus enough to exceed the 50ms silence interval.
+        let silence = vec![0i16; 16000]; // 1s of silence at 16kHz
         let mut all_events = Vec::new();
         all_events.extend(vad.process(&silence));
 
@@ -256,8 +321,8 @@ mod tests {
             "expected SpeechStarted from speech input"
         );
 
-        // Feed enough silence to trigger Silence event (>50ms = >800 samples at 16kHz)
-        let silence = vec![0i16; 4096];
+        // Feed enough silence to get past hangover (320ms) plus exceed 50ms interval
+        let silence = vec![0i16; 16000]; // 1s at 16kHz
         let events = vad.process(&silence);
         let has_silence = events.iter().any(|e| matches!(e, VadEvent::Silence { .. }));
         assert!(
@@ -277,9 +342,9 @@ mod tests {
             vad.process(chunk);
         }
 
-        // Feed enough silence to exceed 50ms in audio time
-        // At 8kHz, 1600 samples = 200ms → resampled to 3200 samples at 16kHz
-        let silence = vec![0i16; 1600];
+        // Feed enough silence to get past hangover + exceed 50ms interval
+        // At 8kHz, 8000 samples = 1s → resampled to 16000 samples at 16kHz
+        let silence = vec![0i16; 8000];
         let events = vad.process(&silence);
         let has_silence = events.iter().any(|e| matches!(e, VadEvent::Silence { .. }));
         assert!(
@@ -299,9 +364,9 @@ mod tests {
             vad.process(chunk);
         }
 
-        // Feed enough silence to exceed 50ms in audio time
-        // At 48kHz, 9600 samples = 200ms → resampled to 3200 samples at 16kHz
-        let silence = vec![0i16; 9600];
+        // Feed enough silence to get past hangover + exceed 50ms interval
+        // At 48kHz, 48000 samples = 1s → resampled to 16000 samples at 16kHz
+        let silence = vec![0i16; 48000];
         let events = vad.process(&silence);
         let has_silence = events.iter().any(|e| matches!(e, VadEvent::Silence { .. }));
         assert!(
@@ -425,12 +490,11 @@ mod tests {
         }
 
         // Feed silence in small bursts — all processed instantly (no wall-clock delay).
-        // The detector may take a few frames to transition from speech to silence,
-        // so we feed plenty of silence and just verify the final event has a
-        // duration based on sample count, not wall-clock time.
+        // Need enough frames to pass the 20-frame hangover (~320ms) plus accumulate
+        // silence beyond the 200ms interval threshold.
         let mut all_events = Vec::new();
-        // Feed 8000 samples of silence = 500ms audio time in small chunks
-        for _ in 0..31 {
+        // Feed 16000 samples of silence = 1s audio time in small chunks
+        for _ in 0..62 {
             all_events.extend(vad.process(&vec![0i16; 256]));
         }
 

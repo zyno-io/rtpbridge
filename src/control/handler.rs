@@ -827,6 +827,7 @@ async fn handle_create_with_file(
             timeout_ms: params.timeout_ms,
             shared: params.shared,
             headers: params.headers,
+            gain_db: params.gain_db,
         },
         reply_rx,
         &id,

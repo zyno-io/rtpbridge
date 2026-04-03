@@ -220,7 +220,7 @@ async fn shared_decode_task(
     let source_str = source.to_string();
     let source_owned = source.to_string();
     let mut endpoint = match tokio::task::spawn_blocking(move || {
-        FileEndpoint::open(id, &source_owned, start_ms, loop_count)
+        FileEndpoint::open(id, &source_owned, start_ms, loop_count, 0.0)
     })
     .await
     {

@@ -242,7 +242,7 @@ mod tests {
     fn make_file_endpoint(path: &str) -> (Endpoint, EndpointId) {
         test_wav(path, 0.5);
         let id = EndpointId::new_v4();
-        let ep = FileEndpoint::open(id, path, 0, None).unwrap();
+        let ep = FileEndpoint::open(id, path, 0, None, 0.0).unwrap();
         (Endpoint::File(Box::new(ep)), id)
     }
 
@@ -309,7 +309,7 @@ mod tests {
     #[test]
     fn test_state_returns_buffering_for_buffering_file() {
         let id = EndpointId::new_v4();
-        let ep = Endpoint::File(Box::new(FileEndpoint::new_buffering(id)));
+        let ep = Endpoint::File(Box::new(FileEndpoint::new_buffering(id, 0.0)));
         assert_eq!(ep.state(), EndpointState::Buffering);
     }
 
@@ -320,7 +320,7 @@ mod tests {
         let path = "/tmp/rtpbridge-test-enum-answer-file.wav";
         test_wav(path, 0.5);
         let id = EndpointId::new_v4();
-        let file_ep = FileEndpoint::open(id, path, 0, None).unwrap();
+        let file_ep = FileEndpoint::open(id, path, 0, None, 0.0).unwrap();
         let mut ep = Endpoint::File(Box::new(file_ep));
 
         let result = ep.accept_answer("v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\n");

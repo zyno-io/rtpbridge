@@ -144,7 +144,7 @@ mod tests {
 
     fn make_file_endpoint(path: &str) -> (EndpointId, Endpoint) {
         let id = uuid::Uuid::new_v4();
-        let fep = FileEndpoint::open(id, path, 0, None).unwrap();
+        let fep = FileEndpoint::open(id, path, 0, None, 0.0).unwrap();
         (id, Endpoint::File(Box::new(fep)))
     }
 

@@ -121,6 +121,7 @@ pub enum SessionCommand {
         timeout_ms: u32,
         shared: bool,
         headers: Option<std::collections::HashMap<String, String>>,
+        gain_db: f32,
     },
     CreateWithTone {
         reply: oneshot::Sender<anyhow::Result<EndpointId>>,
@@ -422,6 +423,7 @@ impl SessionState {
                 timeout_ms,
                 shared,
                 headers,
+                gain_db,
             } => {
                 let result = self
                     .handle_create_with_file(
@@ -432,6 +434,7 @@ impl SessionState {
                         timeout_ms,
                         shared,
                         headers,
+                        gain_db,
                     )
                     .await;
                 if result.is_ok() {
@@ -652,6 +655,7 @@ impl SessionState {
         timeout_ms: u32,
         shared: bool,
         headers: Option<std::collections::HashMap<String, String>>,
+        gain_db: f32,
     ) -> anyhow::Result<EndpointId> {
         if self.max_endpoints > 0 && self.endpoints.len() >= self.max_endpoints {
             anyhow::bail!("MAX_ENDPOINTS_REACHED");
@@ -660,7 +664,7 @@ impl SessionState {
         let id = EndpointId::new_v4();
 
         if crate::playback::file_cache::is_url(source) {
-            let mut ep = FileEndpoint::new_buffering(id);
+            let mut ep = FileEndpoint::new_buffering(id, gain_db);
             ep.shared = shared;
             self.endpoints.insert(id, Endpoint::File(Box::new(ep)));
             self.rebuild_routing();
@@ -721,10 +725,10 @@ impl SessionState {
                     .shared_playback
                     .subscribe(source, 8000, start_ms, loop_count)
                     .await?;
-                let ep = FileEndpoint::new_shared(id, source, sub);
+                let ep = FileEndpoint::new_shared(id, source, sub, gain_db);
                 self.endpoints.insert(id, Endpoint::File(Box::new(ep)));
             } else {
-                let ep = FileEndpoint::open(id, source, start_ms, loop_count)?;
+                let ep = FileEndpoint::open(id, source, start_ms, loop_count, gain_db)?;
                 self.endpoints.insert(id, Endpoint::File(Box::new(ep)));
             }
             self.rebuild_routing();
@@ -947,7 +951,10 @@ impl SessionState {
         // We use std::mem::replace with a dummy that will be dropped
         let endpoint = std::mem::replace(
             &mut bundle.endpoint,
-            Endpoint::File(Box::new(FileEndpoint::new_buffering(EndpointId::nil()))),
+            Endpoint::File(Box::new(FileEndpoint::new_buffering(
+                EndpointId::nil(),
+                0.0,
+            ))),
         );
         self.endpoints.insert(endpoint_id, endpoint);
 
@@ -1048,6 +1055,8 @@ impl SessionState {
                     let path_str = path.to_string_lossy().to_string();
                     let is_shared = fep.shared;
 
+                    let gain_db = fep.gain_db();
+
                     let init_result = if is_shared {
                         // Shared playback: subscribe to the shared decode task
                         // instead of initializing a local decoder.
@@ -1057,7 +1066,8 @@ impl SessionState {
                             .await
                         {
                             Ok(sub) => {
-                                let new_ep = FileEndpoint::new_shared(endpoint_id, &path_str, sub);
+                                let new_ep =
+                                    FileEndpoint::new_shared(endpoint_id, &path_str, sub, gain_db);
                                 **fep = new_ep;
                                 Ok(())
                             }
@@ -2569,7 +2579,7 @@ mod tests {
 
         // Insert a file endpoint directly (must be in Playing state to be routable)
         let id = EndpointId::new_v4();
-        let mut ep = FileEndpoint::new_buffering(id);
+        let mut ep = FileEndpoint::new_buffering(id, 0.0);
         ep.state = EndpointState::Playing;
         state.endpoints.insert(id, Endpoint::File(Box::new(ep)));
         state.rebuild_routing();
@@ -2744,6 +2754,7 @@ mod tests {
                     timeout_ms: 15000,
                     shared: false,
                     headers: None,
+                    gain_db: 0.0,
                 },
                 &packet_tx,
             )
@@ -2962,7 +2973,7 @@ mod tests {
     fn test_dtmf_inject_file_endpoint_rejected() {
         let mut state = test_session_state();
         let eid = EndpointId::new_v4();
-        let ep = FileEndpoint::new_buffering(eid);
+        let ep = FileEndpoint::new_buffering(eid, 0.0);
         state.endpoints.insert(eid, Endpoint::File(Box::new(ep)));
 
         let result = state.handle_dtmf_inject(&eid, '5', 200, 10);

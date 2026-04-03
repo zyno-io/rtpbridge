@@ -15,6 +15,18 @@ use super::endpoint::EndpointConfig;
 use super::stats::EndpointStats;
 use crate::control::protocol::{EndpointDirection, EndpointId, EndpointState};
 
+/// Convert a dB gain value to a linear amplitude factor.
+fn db_to_linear(db: f32) -> f32 {
+    10f32.powf(db / 20.0)
+}
+
+/// Apply a linear gain factor to PCM samples with saturation clamping.
+fn apply_gain(samples: &mut [i16], factor: f32) {
+    for s in samples.iter_mut() {
+        *s = (*s as f32 * factor).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+    }
+}
+
 /// A file playback endpoint that decodes audio files to PCM.
 /// Always send-only. Produces PCM samples on a timer (ptime interval).
 pub struct FileEndpoint {
@@ -47,6 +59,9 @@ pub struct FileEndpoint {
     #[allow(dead_code)]
     pub needs_rewind: bool,
 
+    /// Linear gain factor (precomputed from dB value at creation time)
+    gain_factor: f32,
+
     /// Whether this endpoint uses shared playback
     pub shared: bool,
 
@@ -63,6 +78,7 @@ impl FileEndpoint {
         source_path: &str,
         start_ms: u64,
         loop_count: Option<u32>,
+        gain_db: f32,
     ) -> anyhow::Result<Self> {
         let (reader, decoder, track_id, sample_rate) = open_audio_file(source_path)?;
 
@@ -84,6 +100,7 @@ impl FileEndpoint {
             paused: false,
             source_path: source_path.to_string(),
             needs_rewind: false,
+            gain_factor: db_to_linear(gain_db),
             shared: false,
             shared_sub: None,
         };
@@ -97,7 +114,7 @@ impl FileEndpoint {
     }
 
     /// Create a FileEndpoint in Buffering state (for async URL downloads)
-    pub fn new_buffering(id: EndpointId) -> Self {
+    pub fn new_buffering(id: EndpointId, gain_db: f32) -> Self {
         Self {
             id,
             config: EndpointConfig {
@@ -116,6 +133,7 @@ impl FileEndpoint {
             paused: false,
             source_path: String::new(),
             needs_rewind: false,
+            gain_factor: db_to_linear(gain_db),
             shared: false,
             shared_sub: None,
         }
@@ -126,6 +144,7 @@ impl FileEndpoint {
         id: EndpointId,
         source_path: &str,
         sub: crate::playback::shared_playback::SharedPlaybackSubscriber,
+        gain_db: f32,
     ) -> Self {
         Self {
             id,
@@ -145,6 +164,7 @@ impl FileEndpoint {
             paused: false,
             source_path: source_path.to_string(),
             needs_rewind: false,
+            gain_factor: db_to_linear(gain_db),
             shared: true,
             shared_sub: Some(sub),
         }
@@ -153,6 +173,11 @@ impl FileEndpoint {
     /// Source path for this file endpoint.
     pub fn source_path(&self) -> &str {
         &self.source_path
+    }
+
+    /// Return the gain in dB (reconstructed from the linear factor).
+    pub fn gain_db(&self) -> f32 {
+        20.0 * self.gain_factor.log10()
     }
 
     /// Initialize a buffering endpoint with a downloaded file, transitioning to Playing state.
@@ -194,14 +219,22 @@ impl FileEndpoint {
             match sub.rx.try_recv() {
                 Ok(pcm) => {
                     self.stats.record_outbound(pcm.len() * 2);
-                    return Some(pcm.as_ref().clone());
+                    let mut samples = pcm.as_ref().clone();
+                    if self.gain_factor != 1.0 {
+                        apply_gain(&mut samples, self.gain_factor);
+                    }
+                    return Some(samples);
                 }
                 Err(broadcast::error::TryRecvError::Lagged(_)) => {
                     // Slow consumer — skip ahead and try again
                     match sub.rx.try_recv() {
                         Ok(pcm) => {
                             self.stats.record_outbound(pcm.len() * 2);
-                            return Some(pcm.as_ref().clone());
+                            let mut samples = pcm.as_ref().clone();
+                            if self.gain_factor != 1.0 {
+                                apply_gain(&mut samples, self.gain_factor);
+                            }
+                            return Some(samples);
                         }
                         _ => return None,
                     }
@@ -247,13 +280,17 @@ impl FileEndpoint {
         // Extract requested samples
         let available = self.pcm_buffer.len() - self.pcm_pos;
         let take = target_samples.min(available);
-        let samples = self.pcm_buffer[self.pcm_pos..self.pcm_pos + take].to_vec();
+        let mut samples = self.pcm_buffer[self.pcm_pos..self.pcm_pos + take].to_vec();
         self.pcm_pos += take;
 
         // Compact buffer periodically
         if self.pcm_pos > 8192 {
             self.pcm_buffer.drain(..self.pcm_pos);
             self.pcm_pos = 0;
+        }
+
+        if self.gain_factor != 1.0 {
+            apply_gain(&mut samples, self.gain_factor);
         }
 
         self.stats.record_outbound(take * 2);
@@ -525,7 +562,7 @@ mod tests {
     #[test]
     fn test_file_endpoint_buffering_to_playing() {
         let id = uuid::Uuid::new_v4();
-        let mut ep = FileEndpoint::new_buffering(id);
+        let mut ep = FileEndpoint::new_buffering(id, 0.0);
         assert_eq!(ep.state, EndpointState::Buffering);
 
         // While buffering, next_pcm should return None
@@ -548,7 +585,7 @@ mod tests {
     fn test_file_endpoint_pause_resume() {
         let path = "/tmp/rtpbridge-test-pause.wav";
         test_wav(path, 1.0);
-        let mut ep = FileEndpoint::open(uuid::Uuid::new_v4(), path, 0, None).unwrap();
+        let mut ep = FileEndpoint::open(uuid::Uuid::new_v4(), path, 0, None, 0.0).unwrap();
 
         // Should produce PCM initially
         assert!(ep.next_pcm(160).is_some());
@@ -572,7 +609,7 @@ mod tests {
         test_wav(path, 0.1); // very short file
 
         // loop_count = Some(0) means play once then finish
-        let mut ep = FileEndpoint::open(uuid::Uuid::new_v4(), path, 0, Some(0)).unwrap();
+        let mut ep = FileEndpoint::open(uuid::Uuid::new_v4(), path, 0, Some(0), 0.0).unwrap();
 
         // Drain all PCM until finished
         let mut total_samples = 0usize;
@@ -596,7 +633,7 @@ mod tests {
     fn test_file_endpoint_seek() {
         let path = "/tmp/rtpbridge-test-seek.wav";
         test_wav(path, 1.0); // 1 second
-        let mut ep = FileEndpoint::open(uuid::Uuid::new_v4(), path, 0, None).unwrap();
+        let mut ep = FileEndpoint::open(uuid::Uuid::new_v4(), path, 0, None, 0.0).unwrap();
 
         // Read some samples from the beginning
         let first = ep.next_pcm(160).unwrap();
@@ -622,6 +659,7 @@ mod tests {
             "/tmp/rtpbridge-nonexistent-file.wav",
             0,
             None,
+            0.0,
         );
         assert!(
             result.is_err(),
@@ -633,7 +671,7 @@ mod tests {
     fn test_open_invalid_format() {
         let path = "/tmp/rtpbridge-test-invalid.wav";
         std::fs::write(path, b"this is not audio").unwrap();
-        let result = FileEndpoint::open(uuid::Uuid::new_v4(), path, 0, None);
+        let result = FileEndpoint::open(uuid::Uuid::new_v4(), path, 0, None, 0.0);
         assert!(
             result.is_err(),
             "opening a file with garbage content should return Err"
@@ -645,7 +683,7 @@ mod tests {
     fn test_open_empty_file() {
         let path = "/tmp/rtpbridge-test-empty.wav";
         std::fs::File::create(path).unwrap();
-        let result = FileEndpoint::open(uuid::Uuid::new_v4(), path, 0, None);
+        let result = FileEndpoint::open(uuid::Uuid::new_v4(), path, 0, None, 0.0);
         assert!(result.is_err(), "opening an empty file should return Err");
         std::fs::remove_file(path).ok();
     }
@@ -656,7 +694,7 @@ mod tests {
         test_wav(path, 0.1); // 0.1s = 800 samples at 8kHz
 
         // loop_count=Some(1) means play once, then loop once = 2 total passes
-        let mut ep = FileEndpoint::open(uuid::Uuid::new_v4(), path, 0, Some(1)).unwrap();
+        let mut ep = FileEndpoint::open(uuid::Uuid::new_v4(), path, 0, Some(1), 0.0).unwrap();
 
         let mut total_samples = 0usize;
         loop {
@@ -707,7 +745,7 @@ mod tests {
 
         // Symphonia should open the file (header is valid), but decoding should
         // hit EOF early. The endpoint should transition to Finished gracefully.
-        let result = FileEndpoint::open(uuid::Uuid::new_v4(), path, 0, Some(0));
+        let result = FileEndpoint::open(uuid::Uuid::new_v4(), path, 0, Some(0), 0.0);
         match result {
             Ok(mut ep) => {
                 // Drain all samples — should finish without panic
@@ -741,7 +779,7 @@ mod tests {
             b"This is definitely not an OGG audio file.\nJust plain text.",
         )
         .unwrap();
-        let result = FileEndpoint::open(uuid::Uuid::new_v4(), path, 0, None);
+        let result = FileEndpoint::open(uuid::Uuid::new_v4(), path, 0, None, 0.0);
         assert!(
             result.is_err(),
             "opening a non-audio file should return Err"
@@ -755,7 +793,7 @@ mod tests {
         let path = "/tmp/rtpbridge-test-garbage.wav";
         let garbage: Vec<u8> = (0..256).map(|i| (i * 37 % 256) as u8).collect();
         std::fs::write(path, &garbage).unwrap();
-        let result = FileEndpoint::open(uuid::Uuid::new_v4(), path, 0, None);
+        let result = FileEndpoint::open(uuid::Uuid::new_v4(), path, 0, None, 0.0);
         assert!(
             result.is_err(),
             "opening garbage binary data should return Err"
@@ -769,7 +807,7 @@ mod tests {
         test_wav(path, 0.1); // 0.1s file
 
         // loop_count=None means infinite looping
-        let mut ep = FileEndpoint::open(uuid::Uuid::new_v4(), path, 0, None).unwrap();
+        let mut ep = FileEndpoint::open(uuid::Uuid::new_v4(), path, 0, None, 0.0).unwrap();
 
         // Read 50 chunks of 160 samples = 8000 samples = 1 second of audio
         // This is 10x the file length, so loops must be working

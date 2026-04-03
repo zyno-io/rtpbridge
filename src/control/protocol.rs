@@ -194,6 +194,9 @@ pub struct EndpointCreateWithFileParams {
     pub timeout_ms: u32,
     #[serde(default)]
     pub headers: Option<std::collections::HashMap<String, String>>,
+    /// Audio gain in dB (e.g. -6.0 to halve volume, +6.0 to double). Default 0.0.
+    #[serde(default)]
+    pub gain_db: f32,
 }
 
 #[derive(Debug, Serialize)]

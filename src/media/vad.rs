@@ -146,30 +146,28 @@ impl VadMonitor {
     pub fn check_timeout(&mut self) -> Vec<VadEvent> {
         let hangover_duration = std::time::Duration::from_millis(HANGOVER_FRAMES as u64 * 16);
         if self.is_speaking {
-            if let Some(last) = self.last_process_time {
-                if last.elapsed() >= hangover_duration {
-                    self.is_speaking = false;
-                    self.in_silence = true;
-                    self.silence_samples = 0;
-                    self.samples_since_last_event = 0;
-                    self.hangover_frames = 0;
-                    // Emit the first silence event immediately
-                    return vec![VadEvent::Silence { duration_ms: 0 }];
-                }
+            if let Some(last) = self.last_process_time
+                && last.elapsed() >= hangover_duration
+            {
+                self.is_speaking = false;
+                self.in_silence = true;
+                self.silence_samples = 0;
+                self.samples_since_last_event = 0;
+                self.hangover_frames = 0;
+                return vec![VadEvent::Silence { duration_ms: 0 }];
             }
-        } else if self.in_silence {
-            // Also emit periodic silence events when packets have stopped
-            if let Some(last) = self.last_process_time {
-                let elapsed_ms = last.elapsed().as_millis() as u64;
-                let total_silence_ms = self.silence_samples * 1000 / 16000 + elapsed_ms;
-                let since_last_ms = self.samples_since_last_event * 1000 / 16000 + elapsed_ms;
-                if since_last_ms >= self.silence_interval_ms as u64 {
-                    self.samples_since_last_event = 0;
-                    self.last_process_time = Some(Instant::now());
-                    return vec![VadEvent::Silence {
-                        duration_ms: total_silence_ms,
-                    }];
-                }
+        } else if self.in_silence
+            && let Some(last) = self.last_process_time
+        {
+            let elapsed_ms = last.elapsed().as_millis() as u64;
+            let total_silence_ms = self.silence_samples * 1000 / 16000 + elapsed_ms;
+            let since_last_ms = self.samples_since_last_event * 1000 / 16000 + elapsed_ms;
+            if since_last_ms >= self.silence_interval_ms as u64 {
+                self.samples_since_last_event = 0;
+                self.last_process_time = Some(Instant::now());
+                return vec![VadEvent::Silence {
+                    duration_ms: total_silence_ms,
+                }];
             }
         }
         Vec::new()

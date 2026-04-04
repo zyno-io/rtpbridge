@@ -111,9 +111,7 @@ async function prepare() {
 
 async function build() {
   console.log('\n>>> Building rtpbridge (amd64)');
-  const code = await spawnp('cargo', ['zigbuild', '--release', '--target', TARGET, '--features', 'vendored-openssl', '-v'], {
-    env: { ...process.env, CMAKE_POLICY_VERSION_MINIMUM: '3.5' },
-  });
+  const code = await spawnp('cross', ['build', '--release', '--target', TARGET]);
   if (code !== 0) throw new Error(`build failed (exit ${code})`);
   console.log('>>> Build complete\n');
 }

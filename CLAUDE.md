@@ -49,5 +49,5 @@ Full plan at `~/.claude/plans/happy-finding-abelson.md`. Progress tracked in Cla
 - `session.bridge` creates paired bridge endpoints for cross-session audio (PCM L16 at 48kHz)
 - Transfer events: `endpoint.transferred_out`, `endpoint.transferred_in`
 - Empty session event: `session.empty_timeout` (fired when `empty_session_timeout_secs` triggers)
-- `endpoint.create_tone` creates a tone generator (sendonly): `tone` = `ringback`/`ringing`/`busy`/`sine`, optional `frequency` (for sine), optional `duration_ms`
+- `endpoint.create_tone` creates a tone generator (sendonly): `tone` = `ringback`/`ringing`/`busy`/`beep`/`sine`, optional `frequency` (for sine), optional `duration_ms`
 - Tone finished event: `endpoint.tone.finished` (fired when `duration_ms` expires)

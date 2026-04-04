@@ -6,3 +6,9 @@ CVE-2023-45853
 
 # glibc: integer overflow in memalign — no fix available yet
 CVE-2026-0861
+
+# systemd: arbitrary code execution via spurious IPC — no fix in bookworm
+CVE-2026-29111
+
+# ncurses: buffer overflow — no fix in bookworm
+CVE-2025-69720

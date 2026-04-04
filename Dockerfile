@@ -1,5 +1,5 @@
 # Pin Rust version to match rust-version in Cargo.toml
-FROM rust:1.94-bookworm AS builder
+FROM rust:1.94-trixie AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends libopus-dev && rm -rf /var/lib/apt/lists/*
 
@@ -18,8 +18,8 @@ RUN mkdir -p src benches \
 COPY . .
 RUN touch src/main.rs && cargo build --release
 
-FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends libopus0 libssl3 ca-certificates && rm -rf /var/lib/apt/lists/* \
+FROM debian:trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends libopus0 libssl3t64 ca-certificates && rm -rf /var/lib/apt/lists/* \
     && useradd -r -s /sbin/nologin rtpbridge \
     && mkdir -p /var/lib/rtpbridge/recordings /var/lib/rtpbridge/media /var/lib/rtpbridge/cache \
     && chown -R rtpbridge:rtpbridge /var/lib/rtpbridge

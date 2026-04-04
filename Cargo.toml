@@ -2,7 +2,7 @@
 name = "rtpbridge"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.94"
 description = "High-performance RTP media routing server"
 license = "MIT"
 repository = "https://github.com/zyno-io/rtpbridge"
@@ -38,7 +38,7 @@ anyhow = "1"
 rand = "0.9"
 
 # WebRTC
-str0m = "0.17"
+str0m = { version = "0.17", default-features = false, features = ["openssl", "vendored"] }
 
 # Codecs
 xlaw = "0.0.3"

@@ -70,6 +70,13 @@ impl Endpoint {
         }
     }
 
+    pub fn update_remote_sdp(&mut self, sdp: &str) -> anyhow::Result<String> {
+        match self {
+            Endpoint::Rtp(ep) => ep.update_remote_sdp(sdp),
+            _ => anyhow::bail!("update_remote_sdp only supported on RTP endpoints"),
+        }
+    }
+
     pub fn telephone_event_pt(&self) -> Option<u8> {
         match self {
             Endpoint::WebRtc(_) => Some(101),
@@ -355,6 +362,64 @@ mod tests {
         assert!(
             result.is_ok(),
             "accept_answer should succeed for RTP endpoint"
+        );
+    }
+
+    #[test]
+    fn test_update_remote_sdp_returns_error_for_file() {
+        let path = "/tmp/rtpbridge-test-enum-update-remote-file.wav";
+        test_wav(path, 0.5);
+        let id = EndpointId::new_v4();
+        let file_ep = FileEndpoint::open(id, path, 0, None, 0.0).unwrap();
+        let mut ep = Endpoint::File(Box::new(file_ep));
+
+        let result = ep.update_remote_sdp("v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\n");
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("only supported on RTP endpoints"),
+            "error message should indicate only RTP endpoints are supported"
+        );
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_update_remote_sdp_succeeds_for_rtp() {
+        let (mut ep, _) = make_rtp_endpoint(EndpointDirection::SendRecv).await;
+
+        // First establish an initial answer
+        let answer_sdp = "\
+            v=0\r\n\
+            o=- 123 1 IN IP4 10.0.0.1\r\n\
+            s=-\r\n\
+            c=IN IP4 10.0.0.1\r\n\
+            t=0 0\r\n\
+            m=audio 20000 RTP/AVP 0 101\r\n\
+            a=rtpmap:0 PCMU/8000\r\n\
+            a=rtpmap:101 telephone-event/8000\r\n\
+            a=sendrecv\r\n";
+        ep.accept_answer(answer_sdp).unwrap();
+
+        // Now update with a re-INVITE SDP
+        let reinvite_sdp = "\
+            v=0\r\n\
+            o=- 123 2 IN IP4 10.0.0.1\r\n\
+            s=-\r\n\
+            c=IN IP4 10.0.0.1\r\n\
+            t=0 0\r\n\
+            m=audio 30000 RTP/AVP 0 101\r\n\
+            a=rtpmap:0 PCMU/8000\r\n\
+            a=rtpmap:101 telephone-event/8000\r\n\
+            a=sendrecv\r\n";
+
+        let result = ep.update_remote_sdp(reinvite_sdp);
+        assert!(
+            result.is_ok(),
+            "update_remote_sdp should succeed for RTP endpoint: {:?}",
+            result
         );
     }
 }

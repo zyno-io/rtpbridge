@@ -259,6 +259,22 @@ pub struct EndpointSrtpRekeyResult {
     pub sdp: String,
 }
 
+// ── Direction Update ───────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct EndpointUpdateDirectionParams {
+    pub endpoint_id: EndpointId,
+    pub direction: EndpointDirection,
+}
+
+// ── Update Remote SDP (address + SRTP only, no codec changes) ─────
+
+#[derive(Debug, Deserialize)]
+pub struct EndpointUpdateRemoteSdpParams {
+    pub endpoint_id: EndpointId,
+    pub sdp: String,
+}
+
 // ── File Playback Control ───────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -302,6 +318,12 @@ fn default_dtmf_volume() -> u8 {
 pub struct RecordingStartParams {
     pub endpoint_id: Option<EndpointId>,
     pub file_path: String,
+    /// When true, also capture the unencrypted outbound RTP/RTCP packets that
+    /// rtpbridge writes toward each endpoint. Default false because outbound
+    /// capture roughly doubles per-recording bandwidth and adds a clone of
+    /// every wire packet on the hot path.
+    #[serde(default)]
+    pub record_outbound: bool,
 }
 
 #[derive(Debug, Serialize)]

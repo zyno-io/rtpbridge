@@ -45,6 +45,9 @@ struct Recording {
     pub dropped_packet_count: u64,
     pub tx: mpsc::Sender<RecordPacket>,
     pub task: tokio::task::JoinHandle<()>,
+    /// When true, this recording also receives the unencrypted outbound RTP/RTCP
+    /// packets that rtpbridge writes toward each captured endpoint. Default false.
+    pub record_outbound: bool,
 }
 
 impl Default for RecordingManager {
@@ -83,12 +86,28 @@ impl RecordingManager {
         }
     }
 
-    /// Start a new recording. Returns the recording ID.
-    /// Validates the path and that the PCAP file can be created before returning success.
+    /// Start a new inbound-only recording. Equivalent to
+    /// [`start_with_options`] with `record_outbound = false`.
     pub async fn start(
         &mut self,
         endpoint_id: Option<EndpointId>,
         file_path: String,
+    ) -> anyhow::Result<RecordingId> {
+        self.start_with_options(endpoint_id, file_path, false).await
+    }
+
+    /// Start a new recording. Returns the recording ID.
+    /// Validates the path and that the PCAP file can be created before returning success.
+    ///
+    /// `record_outbound`: when true, this recording also receives outbound packets
+    /// (rtpbridge → endpoint), captured pre-encryption. Default for callers without
+    /// the flag should be false because outbound capture roughly doubles bandwidth
+    /// and adds a small allocation on the hot path per outbound RTP packet.
+    pub async fn start_with_options(
+        &mut self,
+        endpoint_id: Option<EndpointId>,
+        file_path: String,
+        record_outbound: bool,
     ) -> anyhow::Result<RecordingId> {
         if self.recordings.len() >= self.max_recordings {
             let max = self.max_recordings;
@@ -135,6 +154,7 @@ impl RecordingManager {
             dropped_packet_count: 0,
             tx,
             task,
+            record_outbound,
         };
 
         self.recordings.insert(id, recording);
@@ -242,6 +262,10 @@ impl RecordingManager {
         if let Some(rec_ids) = self.endpoint_recordings.get(endpoint_id) {
             for rec_id in rec_ids {
                 if let Some(rec) = self.recordings.get_mut(rec_id) {
+                    // Outbound packets only go to recordings that explicitly opted in.
+                    if is_outbound && !rec.record_outbound {
+                        continue;
+                    }
                     match rec.tx.try_send(pkt.clone_packet()) {
                         Ok(()) => rec.packet_count += 1,
                         Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -259,6 +283,9 @@ impl RecordingManager {
         // Send to session-wide recordings (endpoint_id = None)
         for rec in self.recordings.values_mut() {
             if rec.endpoint_id.is_none() {
+                if is_outbound && !rec.record_outbound {
+                    continue;
+                }
                 match rec.tx.try_send(pkt.clone_packet()) {
                     Ok(()) => rec.packet_count += 1,
                     Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -743,14 +770,18 @@ mod tests {
     async fn test_record_packet_session_wide_receives_all() {
         let mut mgr = RecordingManager::new();
         let dir = std::env::temp_dir().join("rtpbridge-rec-session-wide-test");
+        // Defensively remove any leftover from a prior failed run before recreating —
+        // this test uses a fixed path, not tempfile::tempdir().
+        std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).ok();
 
         let ep1 = EndpointId::new_v4();
         let ep2 = EndpointId::new_v4();
 
-        // Start a session-wide recording (endpoint_id = None)
+        // Start a session-wide recording (endpoint_id = None) with outbound capture
+        // enabled so the third (outbound) packet is not filtered.
         let path = dir.join("session-wide.pcap").to_string_lossy().to_string();
-        mgr.start(None, path).await.unwrap();
+        mgr.start_with_options(None, path, true).await.unwrap();
 
         // Record packets from different endpoints
         mgr.record_packet(&ep1, &[0xAA; 100], false);
@@ -1061,13 +1092,17 @@ mod tests {
         let ep_a = EndpointId::new_v4();
         let ep_b = EndpointId::new_v4();
 
-        // Recording only for ep_a
+        // Recording only for ep_a (inbound only, default)
         let path_a = dir.path().join("ep_a.pcap").to_string_lossy().to_string();
         let id_a = mgr.start(Some(ep_a), path_a.clone()).await.unwrap();
 
-        // Recording only for ep_b
+        // Recording only for ep_b (opt into outbound so the outbound packets below
+        // are not filtered by the record_outbound flag).
         let path_b = dir.path().join("ep_b.pcap").to_string_lossy().to_string();
-        let id_b = mgr.start(Some(ep_b), path_b.clone()).await.unwrap();
+        let id_b = mgr
+            .start_with_options(Some(ep_b), path_b.clone(), true)
+            .await
+            .unwrap();
 
         // Send 3 packets to ep_a, 2 packets to ep_b
         let fake_rtp = [
@@ -1097,13 +1132,16 @@ mod tests {
 
         let ep = EndpointId::new_v4();
 
-        // One endpoint-specific recording
+        // Both recordings opt into outbound so the outbound packet below is not
+        // filtered by the record_outbound flag.
         let path_ep = dir.path().join("ep.pcap").to_string_lossy().to_string();
-        let id_ep = mgr.start(Some(ep), path_ep).await.unwrap();
+        let id_ep = mgr
+            .start_with_options(Some(ep), path_ep, true)
+            .await
+            .unwrap();
 
-        // One session-wide recording
         let path_all = dir.path().join("all.pcap").to_string_lossy().to_string();
-        let id_all = mgr.start(None, path_all).await.unwrap();
+        let id_all = mgr.start_with_options(None, path_all, true).await.unwrap();
 
         let fake_rtp = [0x80u8; 12];
         mgr.record_packet(&ep, &fake_rtp, false);
@@ -1118,6 +1156,50 @@ mod tests {
         assert_eq!(
             pkts_all, 2,
             "session-wide recording should also get both packets"
+        );
+    }
+
+    /// Recordings started without `record_outbound` must drop outbound packets
+    /// while still capturing inbound. Recordings started with `record_outbound = true`
+    /// must capture both directions.
+    #[tokio::test]
+    async fn test_record_outbound_flag_filters_outbound() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let mut mgr = RecordingManager::new();
+
+        let ep = EndpointId::new_v4();
+
+        let inbound_only_path = dir
+            .path()
+            .join("inbound-only.pcap")
+            .to_string_lossy()
+            .to_string();
+        let inbound_only_id = mgr.start(Some(ep), inbound_only_path).await.unwrap();
+
+        let both_path = dir.path().join("both.pcap").to_string_lossy().to_string();
+        let both_id = mgr
+            .start_with_options(Some(ep), both_path, true)
+            .await
+            .unwrap();
+
+        let fake_rtp = [0x80u8; 12];
+        // 2 inbound, 3 outbound
+        mgr.record_packet(&ep, &fake_rtp, false);
+        mgr.record_packet(&ep, &fake_rtp, false);
+        mgr.record_packet(&ep, &fake_rtp, true);
+        mgr.record_packet(&ep, &fake_rtp, true);
+        mgr.record_packet(&ep, &fake_rtp, true);
+
+        let (_, _, inbound_only_pkts, _) = mgr.stop(&inbound_only_id).unwrap();
+        assert_eq!(
+            inbound_only_pkts, 2,
+            "default recording should drop outbound packets"
+        );
+
+        let (_, _, both_pkts, _) = mgr.stop(&both_id).unwrap();
+        assert_eq!(
+            both_pkts, 5,
+            "opt-in recording should capture inbound and outbound"
         );
     }
 

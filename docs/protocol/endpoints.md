@@ -76,6 +76,76 @@ Accept a remote SDP answer for an endpoint created with `endpoint.create_offer`.
 
 Returns an empty result `{}` on success. The SDP answer is consumed by the endpoint but no data is returned to the caller.
 
+## endpoint.update_direction
+
+Change an endpoint's direction in the routing table (e.g. when a phone toggles hold/unhold via re-INVITE). Resets the symmetric RTP address lock so the endpoint will re-learn the remote source address — useful when the peer resumes from a new NAT binding after hold.
+
+```json
+{
+  "id": "4",
+  "method": "endpoint.update_direction",
+  "params": {
+    "endpoint_id": "...",
+    "direction": "sendrecv"
+  }
+}
+```
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `endpoint_id` | string | required | Endpoint to update |
+| `direction` | string | required | `"sendrecv"`, `"sendonly"`, or `"recvonly"` |
+
+**Response:**
+```json
+{"id":"4","result":{}}
+```
+
+Returns an empty result `{}` on success. Only supported on RTP, WebRTC, and Bridge endpoints — File and Tone endpoints do not have a meaningful remote direction and will return an error.
+
+## endpoint.update_remote_sdp
+
+Update an RTP endpoint's remote RTP/RTCP address (and SRTP keys, if present) from a re-INVITE SDP body, **without touching codec state**. Use this for hold/unhold or other mid-call re-INVITEs where the remote may send a different codec list or PT mapping than the original answer — applying that SDP via `endpoint.accept_answer` would re-parse codecs and corrupt the session's codec/telephone-event PT state.
+
+```json
+{
+  "id": "5",
+  "method": "endpoint.update_remote_sdp",
+  "params": {
+    "endpoint_id": "...",
+    "sdp": "v=0\r\no=..."
+  }
+}
+```
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `endpoint_id` | string | required | Endpoint to update |
+| `sdp` | string | required | Re-INVITE SDP body |
+
+**Response:**
+```json
+{"id":"5","result":{"sdp_answer":"v=0\r\no=rtpbridge ..."}}
+```
+
+Returns an SDP answer that the caller can send back as the `200 OK` body for the re-INVITE. The answer reflects the endpoint's **current state** — local address/port, currently-selected codec listed first (so the peer obeys RFC 3264 and continues sending the codec we're already sending), and the existing TX SRTP key if SRTP is active. The codec list is reordered so `send_codec` precedes the rest; this is critical for phones (e.g. Grandstream GXP21xx) that re-derive their outbound codec from the first PT in the answer.
+
+**What it updates:**
+- Remote RTP and RTCP addresses (honors `a=rtcp-mux` and explicit `a=rtcp:` lines)
+- SRTP RX key, **only if** the `a=crypto` line differs from the currently installed RX key. When the key changes, the 5-second dual-context transition applies (the endpoint accepts packets encrypted with either the old or new key during the window).
+- SRTP/SRTCP RX sequence + replay state. Same-key or different-key, the inbound replay window (`highest_seq` / `replay_window` for SRTP, `highest_recv_index` / `replay_window` for SRTCP) is reset on the live RX context. Phones commonly send RTCP BYE on hold and resume with a new SSRC + reset RTP sequence on unhold; without this reset, the post-resume packets are rejected as "too old" and decrypt silently fails for the rest of the call. The derived session keys (`cipher_key`, `auth_key`, `cipher_salt`) are preserved.
+- Remote SSRC tracker. The cached remote SSRC is cleared and relearned from the next inbound packet (the SSRC may change across hold/unhold). This also defers outbound media until the peer is confirmed reachable on the new address (NAT safety).
+
+**What it deliberately does NOT update:**
+- `codecs` list
+- `send_codec`
+- `telephone_event_pt`
+- Outbound (TX) SRTP/SRTCP state — our own ROC/sequence number/SRTCP index keep advancing so the peer's replay window stays valid for our outbound stream.
+
+The address lock is reset so the endpoint re-learns the remote source address from inbound packets (necessary when the peer's NAT binding changes after hold).
+
+Only supported on RTP endpoints. WebRTC, File, Tone, and Bridge endpoints will return an error.
+
 ## endpoint.remove
 
 Remove an endpoint from the session.

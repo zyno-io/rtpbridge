@@ -123,6 +123,21 @@ impl SrtpContext {
         Ok(output)
     }
 
+    /// Reset the sequence/ROC/replay state, preserving the derived session keys.
+    ///
+    /// Use this when the remote peer restarts its RTP stream mid-session — e.g.,
+    /// after a SIP hold where the phone sends RTCP BYE and resumes with a new
+    /// SSRC + reset sequence number. Without this, the old `replay_window` /
+    /// `highest_seq` would reject the peer's fresh low-seq packets as "too old"
+    /// and decrypt would silently drop every packet until the sequence climbed
+    /// back into range.
+    pub fn reset_sequence_state(&mut self) {
+        self.roc = 0;
+        self.highest_seq = 0;
+        self.seq_initialized = false;
+        self.replay_window = 0;
+    }
+
     /// Decrypt an SRTP packet, verifying the auth tag, checking for replay,
     /// and decrypting the payload.
     /// Returns the decrypted RTP packet (without auth tag).
@@ -370,6 +385,19 @@ impl SrtcpContext {
         output.extend_from_slice(&tag[..SRTP_AUTH_TAG_LEN]);
 
         Ok(output)
+    }
+
+    /// Reset the inbound SRTCP replay state, preserving the derived session keys
+    /// and the outbound `srtcp_index` counter.
+    ///
+    /// Use this when the remote peer restarts their RTCP stream mid-session — e.g.,
+    /// after a SIP hold where the phone sends RTCP BYE and resumes with a fresh
+    /// SRTCP index of 0. Without this, the old `replay_window` / `highest_recv_index`
+    /// would reject the peer's restarted low-index packets as "too old".
+    pub fn reset_recv_state(&mut self) {
+        self.highest_recv_index = 0;
+        self.recv_index_initialized = false;
+        self.replay_window = 0;
     }
 
     /// Decrypt an SRTCP packet, verifying auth and decrypting if E=1.
@@ -709,6 +737,122 @@ mod tests {
             result.is_err(),
             "old packet outside window should be rejected"
         );
+    }
+
+    #[test]
+    fn test_srtp_reset_sequence_state_accepts_restarted_low_seq() {
+        // Reproduces the post-hold "no audio" bug: peer sends RTCP BYE on hold,
+        // then resumes with a fresh low sequence number on unhold. Without
+        // reset_sequence_state(), the replay window rejects the resumed packets
+        // as "too old" and decrypt fails silently for the entire call.
+        let key = make_test_key();
+        let mut protect_ctx = SrtpContext::from_sdes_key(&key).unwrap();
+        let mut unprotect_ctx = SrtpContext::from_sdes_key(&key).unwrap();
+
+        // Phone runs up to seq=200 before going on hold
+        for seq in 1..=200u16 {
+            let rtp = crate::media::rtp::RtpHeader::build(
+                0,
+                seq,
+                seq as u32 * 160,
+                0xABCD,
+                false,
+                &[seq as u8; 80],
+            );
+            let srtp = protect_ctx.protect(&rtp).unwrap();
+            unprotect_ctx.unprotect(&srtp).unwrap();
+        }
+
+        // Phone unholds, restarts its protect context (fresh seq from 1)
+        let mut restarted_protect = SrtpContext::from_sdes_key(&key).unwrap();
+        let restart_rtp =
+            crate::media::rtp::RtpHeader::build(0, 1, 160, 0xBEEF, false, &[0xAA; 80]);
+        let restart_srtp = restarted_protect.protect(&restart_rtp).unwrap();
+
+        // Without reset, the low-seq packet must be rejected — this is the bug
+        let pre_reset = unprotect_ctx.unprotect(&restart_srtp);
+        assert!(
+            pre_reset.is_err(),
+            "sanity: low-seq packet on a stale context should be rejected before reset"
+        );
+
+        // After reset_sequence_state, the same packet must decrypt successfully
+        unprotect_ctx.reset_sequence_state();
+        let decrypted = unprotect_ctx
+            .unprotect(&restart_srtp)
+            .expect("restarted low-seq packet should decrypt after reset");
+        assert_eq!(decrypted, restart_rtp);
+    }
+
+    #[test]
+    fn test_srtp_reset_sequence_state_preserves_keys() {
+        // The key derivation should survive a reset — only the replay/sequence
+        // tracking is cleared. Verified by checking that the cipher_key/auth_key
+        // bytes are unchanged across a reset.
+        let key = make_test_key();
+        let mut ctx = SrtpContext::from_sdes_key(&key).unwrap();
+
+        // Pump the context so it has non-default state
+        let rtp = crate::media::rtp::RtpHeader::build(0, 50, 8000, 0x11223344, false, &[0x55; 80]);
+        let srtp = {
+            let mut twin = SrtpContext::from_sdes_key(&key).unwrap();
+            twin.protect(&rtp).unwrap()
+        };
+        ctx.unprotect(&srtp).unwrap();
+
+        let cipher_before = ctx.cipher_key;
+        let salt_before = ctx.cipher_salt;
+        let auth_before = ctx.auth_key;
+
+        ctx.reset_sequence_state();
+
+        assert_eq!(
+            ctx.cipher_key, cipher_before,
+            "cipher_key must be preserved"
+        );
+        assert_eq!(
+            ctx.cipher_salt, salt_before,
+            "cipher_salt must be preserved"
+        );
+        assert_eq!(ctx.auth_key, auth_before, "auth_key must be preserved");
+        assert_eq!(ctx.roc, 0);
+        assert_eq!(ctx.highest_seq, 0);
+        assert!(!ctx.seq_initialized);
+        assert_eq!(ctx.replay_window, 0);
+    }
+
+    #[test]
+    fn test_srtcp_reset_recv_state_accepts_restarted_low_index() {
+        // SRTCP analogue of the SRTP test: peer restarts with a fresh SRTCP
+        // index of 0 after RTCP BYE / hold. Without reset_recv_state(), the
+        // replay window rejects the restarted low-index packets.
+        let key = make_test_key();
+        let mut protect_ctx = SrtcpContext::from_sdes_key(&key).unwrap();
+        let mut unprotect_ctx = SrtcpContext::from_sdes_key(&key).unwrap();
+
+        let mut stats = crate::media::rtcp::RtcpStats::new();
+        let rtcp = crate::media::rtcp::build_sr_rr(0x11111111, 0x22222222, &mut stats, 0, 8000);
+
+        // Run the protect context past the 64-packet replay window
+        for _ in 0..200 {
+            let srtcp = protect_ctx.protect_rtcp(&rtcp).unwrap();
+            unprotect_ctx.unprotect_rtcp(&srtcp).unwrap();
+        }
+
+        // Peer restarts SRTCP from index 0
+        let mut restarted_protect = SrtcpContext::from_sdes_key(&key).unwrap();
+        let restart_srtcp = restarted_protect.protect_rtcp(&rtcp).unwrap();
+
+        let pre_reset = unprotect_ctx.unprotect_rtcp(&restart_srtcp);
+        assert!(
+            pre_reset.is_err(),
+            "sanity: low-index SRTCP on a stale context should be rejected before reset"
+        );
+
+        unprotect_ctx.reset_recv_state();
+        unprotect_ctx
+            .unprotect_rtcp(&restart_srtcp)
+            .expect("restarted low-index SRTCP should decrypt after reset");
     }
 
     #[test]

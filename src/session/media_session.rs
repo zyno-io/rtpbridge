@@ -97,6 +97,7 @@ pub enum SessionCommand {
         reply: oneshot::Sender<anyhow::Result<RecordingId>>,
         endpoint_id: Option<EndpointId>,
         file_path: String,
+        record_outbound: bool,
     },
     RecordingStop {
         reply: oneshot::Sender<anyhow::Result<(String, u64, u64, u64)>>,
@@ -156,6 +157,16 @@ pub enum SessionCommand {
     SrtpRekey {
         reply: oneshot::Sender<anyhow::Result<String>>,
         endpoint_id: EndpointId,
+    },
+    UpdateDirection {
+        reply: oneshot::Sender<anyhow::Result<()>>,
+        endpoint_id: EndpointId,
+        direction: EndpointDirection,
+    },
+    UpdateRemoteSdp {
+        reply: oneshot::Sender<anyhow::Result<String>>,
+        endpoint_id: EndpointId,
+        sdp: String,
     },
     StatsSubscribe {
         reply: oneshot::Sender<anyhow::Result<()>>,
@@ -373,16 +384,21 @@ impl SessionState {
                 reply,
                 endpoint_id,
                 file_path,
+                record_outbound,
             } => {
                 // Validate that the endpoint exists before starting a recording
                 let result = if let Some(eid) = endpoint_id {
                     if self.endpoints.contains_key(&eid) {
-                        self.recording_mgr.start(Some(eid), file_path).await
+                        self.recording_mgr
+                            .start_with_options(Some(eid), file_path, record_outbound)
+                            .await
                     } else {
                         Err(anyhow::anyhow!("Endpoint not found"))
                     }
                 } else {
-                    self.recording_mgr.start(None, file_path).await
+                    self.recording_mgr
+                        .start_with_options(None, file_path, record_outbound)
+                        .await
                 };
                 if result.is_ok() {
                     self.metrics.recordings_active.inc();
@@ -485,6 +501,20 @@ impl SessionState {
             SessionCommand::SrtpRekey { reply, endpoint_id } => {
                 let _ = reply.send(self.handle_srtp_rekey(endpoint_id));
             }
+            SessionCommand::UpdateDirection {
+                reply,
+                endpoint_id,
+                direction,
+            } => {
+                let _ = reply.send(self.handle_update_direction(endpoint_id, direction));
+            }
+            SessionCommand::UpdateRemoteSdp {
+                reply,
+                endpoint_id,
+                sdp,
+            } => {
+                let _ = reply.send(self.handle_update_remote_sdp(endpoint_id, &sdp));
+            }
             SessionCommand::StatsSubscribe { reply, interval_ms } => {
                 self.stats_interval = Some(Duration::from_millis(interval_ms as u64));
                 self.last_stats_emit = Instant::now();
@@ -551,6 +581,14 @@ impl SessionState {
             let (ep, answer) =
                 WebRtcEndpoint::from_offer(id, direction, sdp_str, ep_bind, packet_tx.clone())
                     .await?;
+            info!(
+                session_id = %self.session_id,
+                endpoint_id = %id,
+                endpoint_type = "webrtc",
+                direction = ?direction,
+                local_addr = %ep.local_addr,
+                "endpoint created (from offer)"
+            );
             self.endpoints.insert(id, Endpoint::WebRtc(Box::new(ep)));
             (answer, Some(101u8))
         } else {
@@ -564,6 +602,17 @@ impl SessionState {
                 packet_tx.clone(),
             )?;
             let te = ep.telephone_event_pt;
+            info!(
+                session_id = %self.session_id,
+                endpoint_id = %id,
+                endpoint_type = "rtp",
+                direction = ?direction,
+                local_addr = %ep.local_rtp_addr,
+                remote_addr = ?ep.remote_rtp_addr,
+                codec = ?ep.send_codec.as_ref().map(|c| c.name),
+                srtp = ep.has_srtp(),
+                "endpoint created (from offer)"
+            );
             self.endpoints.insert(id, Endpoint::Rtp(Box::new(ep)));
             (answer, te)
         };
@@ -597,6 +646,14 @@ impl SessionState {
                 let ep_bind = SocketAddr::new(self.media_ip, 0);
                 let (ep, offer) =
                     WebRtcEndpoint::create_offer(id, direction, ep_bind, packet_tx.clone()).await?;
+                info!(
+                    session_id = %self.session_id,
+                    endpoint_id = %id,
+                    endpoint_type = "webrtc",
+                    direction = ?direction,
+                    local_addr = %ep.local_addr,
+                    "endpoint created (offer generated)"
+                );
                 self.endpoints.insert(id, Endpoint::WebRtc(Box::new(ep)));
                 (offer, Some(101u8))
             }
@@ -629,6 +686,17 @@ impl SessionState {
                     packet_tx.clone(),
                 )?;
                 let te = ep.telephone_event_pt;
+                let codec_names: Vec<&str> = ep.codecs.iter().map(|c| c.name).collect();
+                info!(
+                    session_id = %self.session_id,
+                    endpoint_id = %id,
+                    endpoint_type = "rtp",
+                    direction = ?direction,
+                    local_addr = %ep.local_rtp_addr,
+                    codecs = ?codec_names,
+                    srtp = srtp,
+                    "endpoint created (offer generated)"
+                );
                 self.endpoints.insert(id, Endpoint::Rtp(Box::new(ep)));
                 (offer, te)
             }
@@ -668,6 +736,15 @@ impl SessionState {
             ep.shared = shared;
             self.endpoints.insert(id, Endpoint::File(Box::new(ep)));
             self.rebuild_routing();
+            info!(
+                session_id = %self.session_id,
+                endpoint_id = %id,
+                endpoint_type = "file",
+                source = %source,
+                shared = shared,
+                gain_db = gain_db,
+                "file endpoint created (downloading)"
+            );
 
             let url = source.to_string();
             self.url_sources.insert(id, url.clone());
@@ -732,6 +809,17 @@ impl SessionState {
                 self.endpoints.insert(id, Endpoint::File(Box::new(ep)));
             }
             self.rebuild_routing();
+            info!(
+                session_id = %self.session_id,
+                endpoint_id = %id,
+                endpoint_type = "file",
+                source = %source,
+                shared = shared,
+                start_ms = start_ms,
+                loop_count = ?loop_count,
+                gain_db = gain_db,
+                "file endpoint created (local)"
+            );
             Ok(id)
         }
     }
@@ -759,6 +847,31 @@ impl SessionState {
             None => Err(anyhow::anyhow!("Endpoint not found")),
         };
         if let Some((old_state, new_state)) = state_change {
+            // Log codec/address info now that answer is accepted
+            if let Some(ep) = self.endpoints.get(&endpoint_id) {
+                match ep {
+                    Endpoint::Rtp(rep) => {
+                        info!(
+                            session_id = %self.session_id,
+                            endpoint_id = %endpoint_id,
+                            remote_addr = ?rep.remote_rtp_addr,
+                            codec = ?rep.send_codec.as_ref().map(|c| c.name),
+                            old_state = ?old_state,
+                            new_state = ?new_state,
+                            "endpoint answer accepted"
+                        );
+                    }
+                    _ => {
+                        info!(
+                            session_id = %self.session_id,
+                            endpoint_id = %endpoint_id,
+                            old_state = ?old_state,
+                            new_state = ?new_state,
+                            "endpoint answer accepted"
+                        );
+                    }
+                }
+            }
             self.send_event(
                 "endpoint.state_changed",
                 EndpointStateChangedData {
@@ -790,10 +903,34 @@ impl SessionState {
         let ep = super::endpoint_tone::ToneEndpoint::new(id, tone_type, frequency, duration_ms);
         self.endpoints.insert(id, Endpoint::Tone(Box::new(ep)));
         self.rebuild_routing();
+        info!(
+            session_id = %self.session_id,
+            endpoint_id = %id,
+            endpoint_type = "tone",
+            tone_type = ?tone_type,
+            frequency = ?frequency,
+            duration_ms = ?duration_ms,
+            "tone endpoint created"
+        );
         Ok(id)
     }
 
     async fn handle_remove_endpoint(&mut self, endpoint_id: EndpointId) -> anyhow::Result<()> {
+        if let Some(ep) = self.endpoints.get(&endpoint_id) {
+            let ep_type = match ep {
+                Endpoint::WebRtc(_) => "webrtc",
+                Endpoint::Rtp(_) => "rtp",
+                Endpoint::File(_) => "file",
+                Endpoint::Tone(_) => "tone",
+                Endpoint::Bridge(_) => "bridge",
+            };
+            info!(
+                session_id = %self.session_id,
+                endpoint_id = %endpoint_id,
+                endpoint_type = ep_type,
+                "endpoint removed"
+            );
+        }
         let mut removed = self.endpoints.remove(&endpoint_id);
         // Explicitly clean up shared playback subscriber before general cleanup,
         // so the async ref_count decrement happens reliably (not via Drop spawn).
@@ -857,6 +994,20 @@ impl SessionState {
             .endpoints
             .remove(&endpoint_id)
             .ok_or_else(|| anyhow::anyhow!("Endpoint not found"))?;
+
+        let ep_type = match &endpoint {
+            Endpoint::WebRtc(_) => "webrtc",
+            Endpoint::Rtp(_) => "rtp",
+            Endpoint::File(_) => "file",
+            Endpoint::Tone(_) => "tone",
+            Endpoint::Bridge(_) => "bridge",
+        };
+        info!(
+            session_id = %self.session_id,
+            endpoint_id = %endpoint_id,
+            endpoint_type = ep_type,
+            "endpoint extracted for transfer"
+        );
 
         // Stop recv tasks before moving
         endpoint.stop_recv_tasks().await;
@@ -944,6 +1095,15 @@ impl SessionState {
             Endpoint::Bridge(_) => "bridge",
         };
 
+        info!(
+            session_id = %self.session_id,
+            endpoint_id = %endpoint_id,
+            endpoint_type = endpoint_type,
+            direction = ?direction,
+            source_session_id = %bundle.source_session_id,
+            "endpoint inserted (transferred in)"
+        );
+
         // Restart recv tasks with this session's packet_tx
         bundle.endpoint.restart_recv_tasks(packet_tx.clone());
 
@@ -1020,6 +1180,9 @@ impl SessionState {
         }
 
         let endpoint_id = bridge.id;
+        let paired_endpoint_id = bridge.paired_endpoint_id;
+        let paired_session_id = bridge.paired_session_id;
+        let direction = bridge.config.direction;
         self.endpoints
             .insert(endpoint_id, Endpoint::Bridge(Box::new(bridge)));
 
@@ -1034,6 +1197,16 @@ impl SessionState {
 
         // Rebuild routing
         self.rebuild_routing();
+
+        info!(
+            session_id = %self.session_id,
+            endpoint_id = %endpoint_id,
+            endpoint_type = "bridge",
+            direction = ?direction,
+            paired_endpoint_id = %paired_endpoint_id,
+            paired_session_id = %paired_session_id,
+            "bridge endpoint created"
+        );
 
         Ok(endpoint_id)
     }
@@ -1079,6 +1252,13 @@ impl SessionState {
 
                     match init_result {
                         Ok(()) => {
+                            info!(
+                                session_id = %self.session_id,
+                                endpoint_id = %endpoint_id,
+                                source = %path_str,
+                                shared = is_shared,
+                                "file endpoint playback started"
+                            );
                             self.send_event(
                                 "endpoint.state_changed",
                                 EndpointStateChangedData {
@@ -1134,11 +1314,20 @@ impl SessionState {
         endpoint_id: EndpointId,
         position_ms: u64,
     ) -> anyhow::Result<()> {
-        match self.endpoints.get_mut(&endpoint_id) {
+        let result = match self.endpoints.get_mut(&endpoint_id) {
             Some(Endpoint::File(fep)) => fep.seek(position_ms),
             Some(_) => Err(anyhow::anyhow!("Not a file endpoint")),
             None => Err(anyhow::anyhow!("Endpoint not found")),
+        };
+        if result.is_ok() {
+            info!(
+                session_id = %self.session_id,
+                endpoint_id = %endpoint_id,
+                position_ms = position_ms,
+                "file endpoint seeked"
+            );
         }
+        result
     }
 
     fn handle_file_pause(&mut self, endpoint_id: EndpointId) -> anyhow::Result<()> {
@@ -1156,6 +1345,11 @@ impl SessionState {
             None => return Err(anyhow::anyhow!("Endpoint not found")),
         };
         if let Some((old_state, new_state)) = state_change {
+            info!(
+                session_id = %self.session_id,
+                endpoint_id = %endpoint_id,
+                "file endpoint paused"
+            );
             self.send_event(
                 "endpoint.state_changed",
                 EndpointStateChangedData {
@@ -1183,6 +1377,11 @@ impl SessionState {
             None => return Err(anyhow::anyhow!("Endpoint not found")),
         };
         if let Some((old_state, new_state)) = state_change {
+            info!(
+                session_id = %self.session_id,
+                endpoint_id = %endpoint_id,
+                "file endpoint resumed"
+            );
             self.send_event(
                 "endpoint.state_changed",
                 EndpointStateChangedData {
@@ -1253,6 +1452,66 @@ impl SessionState {
             Some(_) => Err(anyhow::anyhow!("Not a plain RTP endpoint")),
             None => Err(anyhow::anyhow!("Endpoint not found")),
         }
+    }
+
+    fn handle_update_direction(
+        &mut self,
+        endpoint_id: EndpointId,
+        direction: EndpointDirection,
+    ) -> anyhow::Result<()> {
+        match self.endpoints.get_mut(&endpoint_id) {
+            Some(Endpoint::Rtp(rep)) => {
+                rep.config.direction = direction;
+                rep.reset_addr_lock();
+            }
+            Some(Endpoint::WebRtc(wep)) => {
+                wep.config.direction = direction;
+            }
+            Some(Endpoint::Bridge(bep)) => {
+                bep.config.direction = direction;
+            }
+            Some(Endpoint::File(_) | Endpoint::Tone(_)) => {
+                anyhow::bail!("Cannot update direction on file/tone endpoints");
+            }
+            None => anyhow::bail!("Endpoint not found"),
+        }
+        self.rebuild_routing();
+        info!(
+            session_id = %self.session_id,
+            endpoint_id = %endpoint_id,
+            direction = ?direction,
+            "endpoint direction updated"
+        );
+        Ok(())
+    }
+
+    fn handle_update_remote_sdp(
+        &mut self,
+        endpoint_id: EndpointId,
+        sdp: &str,
+    ) -> anyhow::Result<String> {
+        let result = match self.endpoints.get_mut(&endpoint_id) {
+            Some(ep) => ep.update_remote_sdp(sdp),
+            None => Err(anyhow::anyhow!("Endpoint not found")),
+        };
+        if result.is_ok() {
+            if let Some(Endpoint::Rtp(rep)) = self.endpoints.get(&endpoint_id) {
+                info!(
+                    session_id = %self.session_id,
+                    endpoint_id = %endpoint_id,
+                    remote_addr = ?rep.remote_rtp_addr,
+                    codec = ?rep.send_codec.as_ref().map(|c| c.name),
+                    "endpoint remote SDP updated"
+                );
+            } else {
+                info!(
+                    session_id = %self.session_id,
+                    endpoint_id = %endpoint_id,
+                    "endpoint remote SDP updated"
+                );
+            }
+        }
+        result
     }
 
     // ── Info ─────────────────────────────────────────────────────────
@@ -2143,16 +2402,29 @@ async fn poll_and_route(
                 };
 
                 if let Some(dest_ep) = endpoints.get_mut(&dest_id) {
-                    let result = match dest_ep {
-                        Endpoint::WebRtc(wep) => wep.write_rtp(&routed),
+                    let result: anyhow::Result<Option<Vec<u8>>> = match dest_ep {
+                        Endpoint::WebRtc(wep) => wep.write_rtp(&routed).map(|()| None),
                         Endpoint::Rtp(rep) => rep.write_rtp(&routed).await,
-                        Endpoint::File(_) | Endpoint::Tone(_) => Ok(()),
-                        Endpoint::Bridge(bep) => bep.write_rtp(&routed).await,
+                        Endpoint::File(_) | Endpoint::Tone(_) => Ok(None),
+                        Endpoint::Bridge(bep) => bep.write_rtp(&routed).await.map(|()| None),
                     };
-                    if let Err(e) = result {
-                        warn!(src = %pkt.source_endpoint_id, dst = %dest_id, error = %e, "route error");
-                    } else {
-                        metrics.packets_routed.inc();
+                    match result {
+                        Err(e) => {
+                            warn!(src = %pkt.source_endpoint_id, dst = %dest_id, error = %e, "route error")
+                        }
+                        Ok(wire) => {
+                            metrics.packets_routed.inc();
+                            if let Some(bytes) = wire {
+                                let dead = recording_mgr.record_packet(&dest_id, &bytes, true);
+                                emit_dead_recordings(
+                                    event_tx,
+                                    critical_event_tx,
+                                    dropped_events,
+                                    metrics,
+                                    dead,
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -2163,16 +2435,27 @@ async fn poll_and_route(
     for (&dest_id, mixer) in mixers.iter_mut() {
         for routed in mixer.drain() {
             if let Some(dest_ep) = endpoints.get_mut(&dest_id) {
-                let result = match dest_ep {
-                    Endpoint::WebRtc(wep) => wep.write_rtp(&routed),
+                let result: anyhow::Result<Option<Vec<u8>>> = match dest_ep {
+                    Endpoint::WebRtc(wep) => wep.write_rtp(&routed).map(|()| None),
                     Endpoint::Rtp(rep) => rep.write_rtp(&routed).await,
-                    Endpoint::File(_) | Endpoint::Tone(_) => Ok(()),
-                    Endpoint::Bridge(bep) => bep.write_rtp(&routed).await,
+                    Endpoint::File(_) | Endpoint::Tone(_) => Ok(None),
+                    Endpoint::Bridge(bep) => bep.write_rtp(&routed).await.map(|()| None),
                 };
-                if let Err(e) = result {
-                    warn!(dst = %dest_id, error = %e, "mixer route error");
-                } else {
-                    metrics.packets_routed.inc();
+                match result {
+                    Err(e) => warn!(dst = %dest_id, error = %e, "mixer route error"),
+                    Ok(wire) => {
+                        metrics.packets_routed.inc();
+                        if let Some(bytes) = wire {
+                            let dead = recording_mgr.record_packet(&dest_id, &bytes, true);
+                            emit_dead_recordings(
+                                event_tx,
+                                critical_event_tx,
+                                dropped_events,
+                                metrics,
+                                dead,
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -2407,6 +2690,19 @@ mod tests {
     fn test_handle_accept_answer_not_found() {
         let mut state = test_session_state();
         let result = state.handle_accept_answer(EndpointId::new_v4(), "v=0\r\n");
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Endpoint not found")
+        );
+    }
+
+    #[test]
+    fn test_handle_update_remote_sdp_not_found() {
+        let mut state = test_session_state();
+        let result = state.handle_update_remote_sdp(EndpointId::new_v4(), "v=0\r\n");
         assert!(result.is_err());
         assert!(
             result

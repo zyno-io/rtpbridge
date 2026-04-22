@@ -101,6 +101,8 @@ Most methods that require a session can return `NO_SESSION` (no session bound), 
 | `endpoint.create_from_offer` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
 | `endpoint.create_offer` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
 | `endpoint.accept_answer` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
+| `endpoint.update_direction` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
+| `endpoint.update_remote_sdp` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
 | `endpoint.remove` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
 | `endpoint.dtmf.inject` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
 | `endpoint.create_with_file` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |

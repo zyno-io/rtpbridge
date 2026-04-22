@@ -148,6 +148,10 @@ pub async fn handle_request(
 
         "endpoint.ice_restart" => handle_ice_restart(id, req.params, state).await,
         "endpoint.srtp_rekey" => handle_srtp_rekey(id, req.params, state).await,
+        "endpoint.update_direction" => handle_update_direction(id, req.params, state).await,
+        "endpoint.update_remote_sdp" => {
+            handle_update_remote_sdp(id, req.params, state, manager).await
+        }
 
         "stats.subscribe" => handle_stats_subscribe(id, req.params, state).await,
         "stats.unsubscribe" => handle_stats_unsubscribe(id, state).await,
@@ -646,6 +650,7 @@ async fn handle_recording_start(
             reply: reply_tx,
             endpoint_id: params.endpoint_id,
             file_path: resolved_path,
+            record_outbound: params.record_outbound,
         },
         reply_rx,
         &id,
@@ -1114,6 +1119,82 @@ async fn handle_srtp_rekey(
     .await
     {
         Ok(Ok(sdp)) => Response::ok(id, EndpointSrtpRekeyResult { sdp }),
+        Ok(Err(e)) => Response::err(id, "ENDPOINT_ERROR", e.to_string()),
+        Err(resp) => resp,
+    }
+}
+
+// ── Direction Update ────────────────────────────────────────────────────
+
+async fn handle_update_direction(
+    id: String,
+    params: serde_json::Value,
+    state: &mut ConnectionState,
+) -> Response {
+    let cmd_tx = match state.require_session(&id) {
+        Ok(tx) => tx.clone(),
+        Err(resp) => return resp,
+    };
+
+    let params: EndpointUpdateDirectionParams = match serde_json::from_value(params) {
+        Ok(p) => p,
+        Err(e) => return Response::err(id, "INVALID_PARAMS", e.to_string()),
+    };
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    match send_and_recv(
+        &cmd_tx,
+        SessionCommand::UpdateDirection {
+            reply: reply_tx,
+            endpoint_id: params.endpoint_id,
+            direction: params.direction,
+        },
+        reply_rx,
+        &id,
+    )
+    .await
+    {
+        Ok(Ok(())) => Response::ok(id, serde_json::json!({})),
+        Ok(Err(e)) => Response::err(id, "ENDPOINT_ERROR", e.to_string()),
+        Err(resp) => resp,
+    }
+}
+
+async fn handle_update_remote_sdp(
+    id: String,
+    params: serde_json::Value,
+    state: &mut ConnectionState,
+    manager: &Arc<SessionManager>,
+) -> Response {
+    let cmd_tx = match state.require_session(&id) {
+        Ok(tx) => tx.clone(),
+        Err(resp) => return resp,
+    };
+
+    let params: EndpointUpdateRemoteSdpParams = match serde_json::from_value(params) {
+        Ok(p) => p,
+        Err(e) => return Response::err(id, "INVALID_PARAMS", e.to_string()),
+    };
+
+    let max_sdp_size = manager.max_sdp_size();
+    if params.sdp.len() > max_sdp_size {
+        return Response::err(id, "INVALID_PARAMS", "SDP too large");
+    }
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    match send_and_recv(
+        &cmd_tx,
+        SessionCommand::UpdateRemoteSdp {
+            reply: reply_tx,
+            endpoint_id: params.endpoint_id,
+            sdp: params.sdp,
+        },
+        reply_rx,
+        &id,
+    )
+    .await
+    {
+        Ok(Ok(answer)) => Response::ok(id, serde_json::json!({ "sdp_answer": answer })),
         Ok(Err(e)) => Response::err(id, "ENDPOINT_ERROR", e.to_string()),
         Err(resp) => resp,
     }

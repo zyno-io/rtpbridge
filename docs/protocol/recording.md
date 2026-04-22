@@ -13,7 +13,8 @@ Recording captures decrypted RTP and RTCP packets to a PCAP file with accurate t
   "method": "recording.start",
   "params": {
     "endpoint_id": null,
-    "file_path": "/recordings/call-123.pcap"
+    "file_path": "/recordings/call-123.pcap",
+    "record_outbound": false
   }
 }
 ```
@@ -22,6 +23,7 @@ Recording captures decrypted RTP and RTCP packets to a PCAP file with accurate t
 |-------|------|---------|-------------|
 | `endpoint_id` | string or null | optional (default: `null`) | `null` for full-session recording, endpoint ID for single leg |
 | `file_path` | string | required | Absolute path within `recording_dir`. Symlinks are resolved; the real path must remain inside the configured directory |
+| `record_outbound` | bool | `false` | When `true`, also capture the unencrypted outbound RTP/RTCP packets that rtpbridge writes toward each captured endpoint. Useful for diagnosing what the remote actually receives (timestamps, sequence numbers, mixer→passthrough transitions). Off by default because it roughly doubles bandwidth and adds a small allocation per outbound RTP packet on the hot path. |
 
 **Response:**
 ```json
@@ -54,7 +56,8 @@ Recording captures decrypted RTP and RTCP packets to a PCAP file with accurate t
 - Endpoint addresses are deterministic: `10.{(N/254)+1}.0.{(N%254)+1}:10000` where N is the endpoint index
 - Timestamps are wall-clock time from when the packet was received
 - Both RTP media packets and RTCP reports are captured
-- Packets are post-decryption (SRTP is unwrapped before recording)
+- Packets are post-decryption inbound and pre-encryption outbound (SRTP is never written to the file)
+- Outbound packets (when `record_outbound` is enabled) flow from `10.255.0.1:10000` to the endpoint's synthetic address; inbound packets flow the opposite direction. Filter on these in Wireshark to isolate one direction
 - The PCAP file can be opened directly in Wireshark
 
 | Field | Description |

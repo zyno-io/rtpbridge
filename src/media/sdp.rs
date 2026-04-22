@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 
 /// Codec info for SDP generation
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SdpCodec {
     pub pt: u8,
     pub name: &'static str,

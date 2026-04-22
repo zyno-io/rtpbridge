@@ -188,6 +188,22 @@ impl WebRtcEndpoint {
         Ok(())
     }
 
+    /// Accept a remote SDP offer (re-negotiation), returning our SDP answer.
+    pub fn accept_offer(&mut self, offer_sdp: &str) -> anyhow::Result<String> {
+        let offer = SdpOffer::from_sdp_string(offer_sdp).or_else(|_| {
+            serde_json::from_str::<SdpOffer>(offer_sdp)
+                .map_err(|e| anyhow::anyhow!("Failed to parse SDP offer: {e}"))
+        })?;
+
+        let answer = self.rtc.sdp_api().accept_offer(offer)?;
+
+        // If we had a local offer in flight, a remote offer supersedes it.
+        // Dropping pending_offer is equivalent to rolling back the local offer.
+        self.pending_offer = None;
+
+        Ok(answer.to_sdp_string())
+    }
+
     /// Perform an ICE restart, returning a new SDP offer
     pub fn ice_restart(&mut self) -> anyhow::Result<String> {
         let mut api = self.rtc.sdp_api();

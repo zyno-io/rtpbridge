@@ -91,6 +91,8 @@ Events are emitted asynchronously and are not correlated to requests.
 
 Most methods that require a session can return `NO_SESSION` (no session bound), `SESSION_GONE` (session task ended), and `SESSION_UNRESPONSIVE` (5-second command timeout). These common codes are listed once here and apply to all session-bound methods below.
 
+### Session and Server
+
 | Method | Additional Error Codes |
 |--------|----------------------|
 | `session.create` | `SESSION_ALREADY_BOUND`, `SHUTTING_DOWN`, `MAX_SESSIONS_REACHED` |
@@ -99,19 +101,43 @@ Most methods that require a session can return `NO_SESSION` (no session bound), 
 | `session.info` | _(none beyond common)_ |
 | `session.list` | _(always succeeds)_ |
 | `server.info` | _(always succeeds)_ |
-| `endpoint.create_from_offer` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
-| `endpoint.create_offer` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
-| `endpoint.accept_answer` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
+
+### WebRTC Endpoint Commands
+
+| Method | Additional Error Codes |
+|--------|----------------------|
+| `endpoint.webrtc.create_from_offer` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
+| `endpoint.webrtc.create_offer` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
+| `endpoint.webrtc.accept_answer` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
+| `endpoint.webrtc.accept_offer` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
+| `endpoint.webrtc.ice_restart` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
+
+### RTP Endpoint Commands
+
+| Method | Additional Error Codes |
+|--------|----------------------|
+| `endpoint.rtp.create_from_offer` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
+| `endpoint.rtp.create_offer` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
+| `endpoint.rtp.accept_answer` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
+| `endpoint.rtp.reinvite` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
+| `endpoint.rtp.srtp_rekey` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
+
+### Generic Endpoint Commands
+
+| Method | Additional Error Codes |
+|--------|----------------------|
 | `endpoint.update_direction` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
-| `endpoint.update_remote_sdp` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
 | `endpoint.remove` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
 | `endpoint.dtmf.inject` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
 | `endpoint.create_with_file` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
 | `endpoint.file.seek` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
 | `endpoint.file.pause` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
 | `endpoint.file.resume` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
-| `endpoint.ice_restart` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
-| `endpoint.srtp_rekey` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
+
+### Recording, VAD, and Stats
+
+| Method | Additional Error Codes |
+|--------|----------------------|
 | `recording.start` | `INVALID_PARAMS`, `RECORDING_ERROR` |
 | `recording.stop` | `INVALID_PARAMS`, `RECORDING_ERROR` |
 | `vad.start` | `INVALID_PARAMS`, `VAD_ERROR` |

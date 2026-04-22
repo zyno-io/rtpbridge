@@ -177,6 +177,22 @@ pub struct EndpointCreateOfferParams {
     pub codecs: Option<Vec<String>>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct WebRtcCreateOfferParams {
+    #[serde(default = "default_direction")]
+    pub direction: EndpointDirection,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RtpCreateOfferParams {
+    #[serde(default = "default_direction")]
+    pub direction: EndpointDirection,
+    #[serde(default)]
+    pub srtp: bool,
+    #[serde(default)]
+    pub codecs: Option<Vec<String>>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct EndpointCreateOfferResult {
     pub endpoint_id: EndpointId,
@@ -187,6 +203,17 @@ pub struct EndpointCreateOfferResult {
 pub struct EndpointAcceptAnswerParams {
     pub endpoint_id: EndpointId,
     pub sdp: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EndpointAcceptOfferParams {
+    pub endpoint_id: EndpointId,
+    pub sdp: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EndpointAcceptOfferResult {
+    pub sdp_answer: String,
 }
 
 #[derive(Debug, Deserialize)]

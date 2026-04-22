@@ -47,7 +47,7 @@ Response:
 Create a WebRTC endpoint with an SDP offer:
 
 ```json
-{"id":"2","method":"endpoint.create_offer","params":{"type":"webrtc","direction":"sendrecv"}}
+{"id":"2","method":"endpoint.webrtc.create_offer","params":{"direction":"sendrecv"}}
 ```
 
 Response includes the SDP offer to send to the remote peer:

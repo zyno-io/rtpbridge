@@ -132,6 +132,52 @@ pub async fn handle_request(
         "endpoint.accept_answer" => {
             handle_endpoint_accept_answer(id, req.params, state, manager).await
         }
+        "endpoint.accept_offer" => {
+            handle_endpoint_accept_offer(id, req.params, state, manager).await
+        }
+        "endpoint.webrtc.create_from_offer" => {
+            handle_endpoint_create_from_offer_typed(
+                id,
+                req.params,
+                state,
+                manager,
+                EndpointType::Webrtc,
+            )
+            .await
+        }
+        "endpoint.rtp.create_from_offer" => {
+            handle_endpoint_create_from_offer_typed(
+                id,
+                req.params,
+                state,
+                manager,
+                EndpointType::Rtp,
+            )
+            .await
+        }
+        "endpoint.webrtc.create_offer" => {
+            handle_endpoint_create_offer_webrtc(id, req.params, state).await
+        }
+        "endpoint.rtp.create_offer" => {
+            handle_endpoint_create_offer_rtp(id, req.params, state).await
+        }
+        "endpoint.webrtc.accept_answer" => {
+            handle_endpoint_accept_answer_typed(
+                id,
+                req.params,
+                state,
+                manager,
+                EndpointType::Webrtc,
+            )
+            .await
+        }
+        "endpoint.rtp.accept_answer" => {
+            handle_endpoint_accept_answer_typed(id, req.params, state, manager, EndpointType::Rtp)
+                .await
+        }
+        "endpoint.webrtc.accept_offer" => {
+            handle_endpoint_accept_offer(id, req.params, state, manager).await
+        }
         "endpoint.remove" => handle_endpoint_remove(id, req.params, state).await,
 
         "endpoint.dtmf.inject" => handle_dtmf_inject(id, req.params, state).await,
@@ -149,11 +195,14 @@ pub async fn handle_request(
         "endpoint.create_tone" => handle_create_tone(id, req.params, state).await,
 
         "endpoint.ice_restart" => handle_ice_restart(id, req.params, state).await,
+        "endpoint.webrtc.ice_restart" => handle_ice_restart(id, req.params, state).await,
         "endpoint.srtp_rekey" => handle_srtp_rekey(id, req.params, state).await,
+        "endpoint.rtp.srtp_rekey" => handle_srtp_rekey(id, req.params, state).await,
         "endpoint.update_direction" => handle_update_direction(id, req.params, state).await,
         "endpoint.update_remote_sdp" => {
             handle_update_remote_sdp(id, req.params, state, manager).await
         }
+        "endpoint.rtp.reinvite" => handle_update_remote_sdp(id, req.params, state, manager).await,
 
         "stats.subscribe" => handle_stats_subscribe(id, req.params, state).await,
         "stats.unsubscribe" => handle_stats_unsubscribe(id, state).await,
@@ -366,6 +415,26 @@ async fn handle_endpoint_create_from_offer(
     state: &mut ConnectionState,
     manager: &Arc<SessionManager>,
 ) -> Response {
+    handle_endpoint_create_from_offer_inner(id, params, state, manager, None).await
+}
+
+async fn handle_endpoint_create_from_offer_typed(
+    id: String,
+    params: serde_json::Value,
+    state: &mut ConnectionState,
+    manager: &Arc<SessionManager>,
+    expected_type: EndpointType,
+) -> Response {
+    handle_endpoint_create_from_offer_inner(id, params, state, manager, Some(expected_type)).await
+}
+
+async fn handle_endpoint_create_from_offer_inner(
+    id: String,
+    params: serde_json::Value,
+    state: &mut ConnectionState,
+    manager: &Arc<SessionManager>,
+    expected_type: Option<EndpointType>,
+) -> Response {
     let cmd_tx = match state.require_session(&id) {
         Ok(tx) => tx.clone(),
         Err(resp) => return resp,
@@ -389,6 +458,7 @@ async fn handle_endpoint_create_from_offer(
             reply: reply_tx,
             sdp: params.sdp,
             direction: params.direction,
+            expected_type,
         },
         reply_rx,
         &id,
@@ -412,14 +482,72 @@ async fn handle_endpoint_create_offer(
     params: serde_json::Value,
     state: &mut ConnectionState,
 ) -> Response {
-    let cmd_tx = match state.require_session(&id) {
-        Ok(tx) => tx.clone(),
-        Err(resp) => return resp,
-    };
-
     let params: EndpointCreateOfferParams = match serde_json::from_value(params) {
         Ok(p) => p,
         Err(e) => return Response::err(id, "INVALID_PARAMS", e.to_string()),
+    };
+    handle_endpoint_create_offer_inner(
+        id,
+        state,
+        params.direction,
+        params.endpoint_type,
+        params.srtp,
+        params.codecs,
+    )
+    .await
+}
+
+async fn handle_endpoint_create_offer_webrtc(
+    id: String,
+    params: serde_json::Value,
+    state: &mut ConnectionState,
+) -> Response {
+    let params: WebRtcCreateOfferParams = match serde_json::from_value(params) {
+        Ok(p) => p,
+        Err(e) => return Response::err(id, "INVALID_PARAMS", e.to_string()),
+    };
+    handle_endpoint_create_offer_inner(
+        id,
+        state,
+        params.direction,
+        EndpointType::Webrtc,
+        false,
+        None,
+    )
+    .await
+}
+
+async fn handle_endpoint_create_offer_rtp(
+    id: String,
+    params: serde_json::Value,
+    state: &mut ConnectionState,
+) -> Response {
+    let params: RtpCreateOfferParams = match serde_json::from_value(params) {
+        Ok(p) => p,
+        Err(e) => return Response::err(id, "INVALID_PARAMS", e.to_string()),
+    };
+    handle_endpoint_create_offer_inner(
+        id,
+        state,
+        params.direction,
+        EndpointType::Rtp,
+        params.srtp,
+        params.codecs,
+    )
+    .await
+}
+
+async fn handle_endpoint_create_offer_inner(
+    id: String,
+    state: &mut ConnectionState,
+    direction: EndpointDirection,
+    endpoint_type: EndpointType,
+    srtp: bool,
+    codecs: Option<Vec<String>>,
+) -> Response {
+    let cmd_tx = match state.require_session(&id) {
+        Ok(tx) => tx.clone(),
+        Err(resp) => return resp,
     };
 
     let (reply_tx, reply_rx) = oneshot::channel();
@@ -427,10 +555,10 @@ async fn handle_endpoint_create_offer(
         &cmd_tx,
         SessionCommand::CreateOffer {
             reply: reply_tx,
-            direction: params.direction,
-            endpoint_type: params.endpoint_type,
-            srtp: params.srtp,
-            codecs: params.codecs,
+            direction,
+            endpoint_type,
+            srtp,
+            codecs,
         },
         reply_rx,
         &id,
@@ -455,6 +583,26 @@ async fn handle_endpoint_accept_answer(
     state: &mut ConnectionState,
     manager: &Arc<SessionManager>,
 ) -> Response {
+    handle_endpoint_accept_answer_inner(id, params, state, manager, None).await
+}
+
+async fn handle_endpoint_accept_answer_typed(
+    id: String,
+    params: serde_json::Value,
+    state: &mut ConnectionState,
+    manager: &Arc<SessionManager>,
+    expected_type: EndpointType,
+) -> Response {
+    handle_endpoint_accept_answer_inner(id, params, state, manager, Some(expected_type)).await
+}
+
+async fn handle_endpoint_accept_answer_inner(
+    id: String,
+    params: serde_json::Value,
+    state: &mut ConnectionState,
+    manager: &Arc<SessionManager>,
+    expected_type: Option<EndpointType>,
+) -> Response {
     let cmd_tx = match state.require_session(&id) {
         Ok(tx) => tx.clone(),
         Err(resp) => return resp,
@@ -477,6 +625,7 @@ async fn handle_endpoint_accept_answer(
             reply: reply_tx,
             endpoint_id: params.endpoint_id,
             sdp: params.sdp,
+            expected_type,
         },
         reply_rx,
         &id,
@@ -484,6 +633,46 @@ async fn handle_endpoint_accept_answer(
     .await
     {
         Ok(Ok(())) => Response::ok(id, serde_json::json!({})),
+        Ok(Err(e)) => Response::err(id, "ENDPOINT_ERROR", e.to_string()),
+        Err(resp) => resp,
+    }
+}
+
+async fn handle_endpoint_accept_offer(
+    id: String,
+    params: serde_json::Value,
+    state: &mut ConnectionState,
+    manager: &Arc<SessionManager>,
+) -> Response {
+    let cmd_tx = match state.require_session(&id) {
+        Ok(tx) => tx.clone(),
+        Err(resp) => return resp,
+    };
+
+    let params: EndpointAcceptOfferParams = match serde_json::from_value(params) {
+        Ok(p) => p,
+        Err(e) => return Response::err(id, "INVALID_PARAMS", e.to_string()),
+    };
+
+    let max_sdp_size = manager.max_sdp_size();
+    if params.sdp.len() > max_sdp_size {
+        return Response::err(id, "INVALID_PARAMS", "SDP too large");
+    }
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    match send_and_recv(
+        &cmd_tx,
+        SessionCommand::AcceptOffer {
+            reply: reply_tx,
+            endpoint_id: params.endpoint_id,
+            sdp: params.sdp,
+        },
+        reply_rx,
+        &id,
+    )
+    .await
+    {
+        Ok(Ok(sdp_answer)) => Response::ok(id, EndpointAcceptOfferResult { sdp_answer }),
         Ok(Err(e)) => Response::err(id, "ENDPOINT_ERROR", e.to_string()),
         Err(resp) => resp,
     }

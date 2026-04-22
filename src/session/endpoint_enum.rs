@@ -70,6 +70,13 @@ impl Endpoint {
         }
     }
 
+    pub fn accept_offer(&mut self, sdp: &str) -> anyhow::Result<String> {
+        match self {
+            Endpoint::WebRtc(ep) => ep.accept_offer(sdp),
+            _ => anyhow::bail!("accept_offer only supported on WebRTC endpoints"),
+        }
+    }
+
     pub fn update_remote_sdp(&mut self, sdp: &str) -> anyhow::Result<String> {
         match self {
             Endpoint::Rtp(ep) => ep.update_remote_sdp(sdp),

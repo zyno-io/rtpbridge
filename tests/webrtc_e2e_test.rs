@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::json;
-use str0m::change::SdpOffer;
+use str0m::change::{SdpAnswer, SdpOffer};
 use str0m::net::{Protocol, Receive};
 use str0m::{Candidate, Event, Input, Output, RtcConfig};
 use tokio::net::UdpSocket;
@@ -974,6 +974,69 @@ async fn test_double_ice_restart() {
         ufrag2, original_ufrag,
         "second restart should produce different ICE ufrag than original"
     );
+
+    client.request_ok("session.destroy", json!({})).await;
+}
+
+/// Test: Remote-initiated ICE restart via endpoint.accept_offer.
+///
+/// Peer creates an ICE-restart offer, server accepts it on an existing endpoint,
+/// returns an SDP answer, and the peer successfully applies that answer.
+#[tokio::test]
+async fn test_remote_ice_restart_via_accept_offer() {
+    let server = TestServer::start().await;
+    let mut client = TestControlClient::connect(&server.addr).await;
+    client.request_ok("session.create", json!({})).await;
+
+    let (mut rtc, _peer_socket, _peer_addr, ep_id) =
+        setup_connected_webrtc_endpoint(&mut client).await;
+
+    // Peer initiates ICE restart.
+    let mut change = rtc.sdp_api();
+    let _new_creds = change.ice_restart(true);
+    let (offer, pending) = change
+        .apply()
+        .expect("ice_restart should produce a pending offer");
+    let offer_sdp = offer.to_sdp_string();
+    assert!(
+        !extract_ice_ufrag(&offer_sdp).is_empty(),
+        "restart offer should contain ICE ufrag"
+    );
+
+    // Server accepts remote offer and returns answer.
+    let result = client
+        .request_ok(
+            "endpoint.webrtc.accept_offer",
+            json!({"endpoint_id": ep_id, "sdp": offer_sdp}),
+        )
+        .await;
+    let answer_sdp = result["sdp_answer"].as_str().unwrap();
+    assert!(answer_sdp.contains("v=0"), "answer should be valid SDP");
+    assert!(
+        !extract_ice_ufrag(answer_sdp).is_empty(),
+        "answer should contain ICE ufrag"
+    );
+
+    // Peer applies server answer to complete renegotiation.
+    rtc.sdp_api()
+        .accept_answer(pending, SdpAnswer::from_sdp_string(answer_sdp).unwrap())
+        .expect("peer should accept answer from endpoint.accept_offer");
+
+    // Sanity check: local-initiated restart should still work afterwards.
+    let restart = client
+        .request_ok("endpoint.webrtc.ice_restart", json!({"endpoint_id": ep_id}))
+        .await;
+    let server_offer = restart["sdp_offer"].as_str().unwrap();
+    let answer = rtc
+        .sdp_api()
+        .accept_offer(SdpOffer::from_sdp_string(server_offer).unwrap())
+        .unwrap();
+    client
+        .request_ok(
+            "endpoint.webrtc.accept_answer",
+            json!({"endpoint_id": ep_id, "sdp": answer.to_sdp_string()}),
+        )
+        .await;
 
     client.request_ok("session.destroy", json!({})).await;
 }

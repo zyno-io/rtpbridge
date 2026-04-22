@@ -53,11 +53,11 @@ WebRTC endpoints handle SRTP internally via str0m's DTLS-SRTP. The SRTP module i
 
 ## Rekey
 
-Plain RTP/SRTP endpoints support mid-session key rotation via `endpoint.srtp_rekey`:
+Plain RTP/SRTP endpoints support mid-session key rotation via `endpoint.rtp.srtp_rekey`:
 
-1. **`endpoint.srtp_rekey`** generates a new TX master key and returns an SDP offer with the new `a=crypto` line. The TX context is replaced immediately — outbound packets use the new key.
+1. **`endpoint.rtp.srtp_rekey`** generates a new TX master key and returns an SDP offer with the new `a=crypto` line. The TX context is replaced immediately — outbound packets use the new key.
 
-2. **`endpoint.accept_answer`** with the remote's new SDP installs the remote's new RX key as a pending context. A 5-second dual-context transition window begins.
+2. **`endpoint.rtp.accept_answer`** with the remote's new SDP installs the remote's new RX key as a pending context. A 5-second dual-context transition window begins.
 
 3. **Dual-context decryption**: During the transition, inbound packets are tried against the new key first. If the new key succeeds, the old key is discarded (early promotion). If the new key fails, the old key is used as fallback.
 

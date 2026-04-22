@@ -69,6 +69,7 @@ pub enum SessionCommand {
         reply: oneshot::Sender<anyhow::Result<(EndpointId, String)>>,
         sdp: String,
         direction: EndpointDirection,
+        expected_type: Option<EndpointType>,
     },
     CreateOffer {
         reply: oneshot::Sender<anyhow::Result<(EndpointId, String)>>,
@@ -79,6 +80,12 @@ pub enum SessionCommand {
     },
     AcceptAnswer {
         reply: oneshot::Sender<anyhow::Result<()>>,
+        endpoint_id: EndpointId,
+        sdp: String,
+        expected_type: Option<EndpointType>,
+    },
+    AcceptOffer {
+        reply: oneshot::Sender<anyhow::Result<String>>,
         endpoint_id: EndpointId,
         sdp: String,
     },
@@ -334,9 +341,10 @@ impl SessionState {
                 reply,
                 sdp,
                 direction,
+                expected_type,
             } => {
                 let result = self
-                    .handle_create_from_offer(packet_tx, &sdp, direction)
+                    .handle_create_from_offer(packet_tx, &sdp, direction, expected_type)
                     .await;
                 if result.is_ok() {
                     self.metrics.endpoints_total.inc();
@@ -364,8 +372,16 @@ impl SessionState {
                 reply,
                 endpoint_id,
                 sdp,
+                expected_type,
             } => {
-                let _ = reply.send(self.handle_accept_answer(endpoint_id, &sdp));
+                let _ = reply.send(self.handle_accept_answer(endpoint_id, &sdp, expected_type));
+            }
+            SessionCommand::AcceptOffer {
+                reply,
+                endpoint_id,
+                sdp,
+            } => {
+                let _ = reply.send(self.handle_accept_offer(endpoint_id, &sdp));
             }
             SessionCommand::RemoveEndpoint { reply, endpoint_id } => {
                 let _ = reply.send(self.handle_remove_endpoint(endpoint_id).await);
@@ -569,12 +585,29 @@ impl SessionState {
         packet_tx: &mpsc::Sender<InboundPacket>,
         sdp_str: &str,
         direction: EndpointDirection,
+        expected_type: Option<EndpointType>,
     ) -> anyhow::Result<(EndpointId, String)> {
         if self.max_endpoints > 0 && self.endpoints.len() >= self.max_endpoints {
             anyhow::bail!("MAX_ENDPOINTS_REACHED");
         }
         let id = EndpointId::new_v4();
         let parsed = sdp::parse_sdp(sdp_str);
+
+        if let Some(expected) = expected_type {
+            let is_match = matches!(
+                (expected, parsed.is_webrtc),
+                (EndpointType::Webrtc, true) | (EndpointType::Rtp, false)
+            );
+            if !is_match {
+                anyhow::bail!(
+                    "Offered SDP transport does not match method (expected {})",
+                    match expected {
+                        EndpointType::Webrtc => "webrtc",
+                        EndpointType::Rtp => "rtp",
+                    }
+                );
+            }
+        }
 
         let (answer, te_pt) = if parsed.is_webrtc {
             let ep_bind = SocketAddr::new(self.media_ip, 0);
@@ -826,12 +859,27 @@ impl SessionState {
 
     // ── Endpoint modification ───────────────────────────────────────
 
-    fn handle_accept_answer(&mut self, endpoint_id: EndpointId, sdp: &str) -> anyhow::Result<()> {
+    fn handle_accept_answer(
+        &mut self,
+        endpoint_id: EndpointId,
+        sdp: &str,
+        expected_type: Option<EndpointType>,
+    ) -> anyhow::Result<()> {
         let mut state_change = None;
         let result = match self.endpoints.get_mut(&endpoint_id) {
             Some(ep) => {
                 let old_state = ep.state();
-                let r = ep.accept_answer(sdp);
+                let r = match (expected_type, &mut *ep) {
+                    (Some(EndpointType::Webrtc), Endpoint::WebRtc(wep)) => wep.accept_answer(sdp),
+                    (Some(EndpointType::Rtp), Endpoint::Rtp(rep)) => rep.accept_answer(sdp),
+                    (Some(EndpointType::Webrtc), _) => {
+                        Err(anyhow::anyhow!("Not a WebRTC endpoint"))
+                    }
+                    (Some(EndpointType::Rtp), _) => {
+                        Err(anyhow::anyhow!("Not a plain RTP endpoint"))
+                    }
+                    (None, ep) => ep.accept_answer(sdp),
+                };
                 if r.is_ok() {
                     let new_state = ep.state();
                     if old_state != new_state {
@@ -887,6 +935,27 @@ impl SessionState {
         if state_change.is_some() {
             self.rebuild_routing();
         }
+        result
+    }
+
+    fn handle_accept_offer(
+        &mut self,
+        endpoint_id: EndpointId,
+        sdp: &str,
+    ) -> anyhow::Result<String> {
+        let result = match self.endpoints.get_mut(&endpoint_id) {
+            Some(ep) => ep.accept_offer(sdp),
+            None => Err(anyhow::anyhow!("Endpoint not found")),
+        };
+
+        if result.is_ok() {
+            info!(
+                session_id = %self.session_id,
+                endpoint_id = %endpoint_id,
+                "endpoint offer accepted"
+            );
+        }
+
         result
     }
 
@@ -2689,7 +2758,20 @@ mod tests {
     #[test]
     fn test_handle_accept_answer_not_found() {
         let mut state = test_session_state();
-        let result = state.handle_accept_answer(EndpointId::new_v4(), "v=0\r\n");
+        let result = state.handle_accept_answer(EndpointId::new_v4(), "v=0\r\n", None);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Endpoint not found")
+        );
+    }
+
+    #[test]
+    fn test_handle_accept_offer_not_found() {
+        let mut state = test_session_state();
+        let result = state.handle_accept_offer(EndpointId::new_v4(), "v=0\r\n");
         assert!(result.is_err());
         assert!(
             result

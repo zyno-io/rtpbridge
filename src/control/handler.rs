@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
@@ -122,6 +123,7 @@ pub async fn handle_request(
         "session.destroy" => handle_session_destroy(id, state, manager).await,
         "session.info" => handle_session_info(id, state, manager).await,
         "session.list" => handle_session_list(id, manager),
+        "server.info" => handle_server_info(id, manager),
 
         "endpoint.create_from_offer" => {
             handle_endpoint_create_from_offer(id, req.params, state, manager).await
@@ -319,6 +321,41 @@ fn handle_session_list(id: String, manager: &Arc<SessionManager>) -> Response {
             sessions: manager.list_sessions(),
         },
     )
+}
+
+fn handle_server_info(id: String, manager: &Arc<SessionManager>) -> Response {
+    Response::ok(
+        id,
+        ServerInfoResult {
+            hostname: server_hostname(),
+            media_ip: manager.media_ip(),
+        },
+    )
+}
+
+fn server_hostname() -> String {
+    static HOSTNAME_CACHE: OnceLock<String> = OnceLock::new();
+    HOSTNAME_CACHE
+        .get_or_init(|| {
+            for key in ["HOSTNAME", "COMPUTERNAME"] {
+                if let Ok(value) = std::env::var(key) {
+                    let trimmed = value.trim();
+                    if !trimmed.is_empty() {
+                        return trimmed.to_string();
+                    }
+                }
+            }
+
+            if let Ok(value) = std::fs::read_to_string("/etc/hostname") {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    return trimmed.to_string();
+                }
+            }
+
+            "unknown".to_string()
+        })
+        .clone()
 }
 
 // ── Endpoint handlers ───────────────────────────────────────────────────

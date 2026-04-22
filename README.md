@@ -97,6 +97,7 @@ All communication uses JSON over WebSocket. Each connection is bound to exactly 
 | `session.destroy` | Destroy the current session |
 | `session.info` | Get session details |
 | `session.list` | List all sessions on the server |
+| `server.info` | Get server hostname and configured media IP |
 | `endpoint.create_from_offer` | Create endpoint from remote SDP offer (auto-detects WebRTC vs RTP) |
 | `endpoint.create_offer` | Create a new endpoint and generate SDP offer |
 | `endpoint.accept_answer` | Accept remote SDP answer |

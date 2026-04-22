@@ -388,6 +388,10 @@ impl SessionManager {
         self.disconnect_timeout_secs.saturating_mul(1000)
     }
 
+    pub fn media_ip(&self) -> IpAddr {
+        self.media_ip
+    }
+
     /// Query a session's detailed state (endpoints, recordings, VAD)
     pub async fn get_session_details(
         &self,

@@ -113,6 +113,28 @@ async fn test_session_lifecycle() {
 }
 
 #[tokio::test]
+async fn test_server_info() {
+    let server = TestServer::start().await;
+    let addr = &server.addr;
+    let mut ws = connect_with_retry(addr).await;
+
+    // server.info should work without creating/attaching a session.
+    let resp = send_request(&mut ws, "1", "server.info", json!({})).await;
+    let hostname = resp["result"]["hostname"]
+        .as_str()
+        .expect("hostname should be a string");
+    assert!(!hostname.is_empty(), "hostname must be non-empty: {resp}");
+    assert_eq!(
+        resp["result"]["media_ip"]
+            .as_str()
+            .expect("media_ip should be a string"),
+        "127.0.0.1"
+    );
+
+    ws.close(None).await.ok();
+}
+
+#[tokio::test]
 async fn test_session_create_requires_no_existing() {
     let server = TestServer::start().await;
     let addr = &server.addr;

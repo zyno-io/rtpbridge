@@ -98,6 +98,7 @@ Most methods that require a session can return `NO_SESSION` (no session bound), 
 | `session.destroy` | _(none beyond common)_ |
 | `session.info` | _(none beyond common)_ |
 | `session.list` | _(always succeeds)_ |
+| `server.info` | _(always succeeds)_ |
 | `endpoint.create_from_offer` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
 | `endpoint.create_offer` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
 | `endpoint.accept_answer` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |

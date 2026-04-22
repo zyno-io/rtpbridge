@@ -110,6 +110,25 @@ List all sessions on the server (not just this connection's session).
 }
 ```
 
+## server.info
+
+Get server-level metadata.
+
+```json
+{"id":"6","method":"server.info","params":{}}
+```
+
+**Response:**
+```json
+{
+  "id": "6",
+  "result": {
+    "hostname": "rtpbridge-0",
+    "media_ip": "203.0.113.5"
+  }
+}
+```
+
 ## session.bridge
 
 Create a bidirectional audio bridge between the current session and a target session. This inserts a virtual "bridge endpoint" into each session. Audio routed to a bridge endpoint is forwarded to the paired session as decoded PCM (L16 at 48kHz), preserving full audio quality with zero lossy re-encoding at the bridge boundary.

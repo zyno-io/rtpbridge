@@ -133,6 +133,16 @@ pub struct SessionSummary {
     pub created_at: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct ServerInfoParams {}
+
+#[derive(Debug, Serialize)]
+pub struct ServerInfoResult {
+    pub hostname: String,
+    pub media_ip: std::net::IpAddr,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionState {

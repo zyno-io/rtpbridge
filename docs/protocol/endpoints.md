@@ -262,7 +262,10 @@ Initiate an SDES SRTP rekey on a plain RTP endpoint. Not applicable to WebRTC en
 
 ### endpoint.update_direction
 
-Change endpoint direction in the routing table. Useful for hold/unhold and NAT rebinding scenarios.
+Change endpoint direction policy in the routing table.
+
+- Explicit directions (`sendrecv`, `sendonly`, `recvonly`, `inactive`) set a manual override.
+- `auto` clears the manual override.
 
 ```json
 {
@@ -270,7 +273,7 @@ Change endpoint direction in the routing table. Useful for hold/unhold and NAT r
   "method": "endpoint.update_direction",
   "params": {
     "endpoint_id": "...",
-    "direction": "sendrecv"
+    "direction": "auto"
   }
 }
 ```
@@ -278,14 +281,17 @@ Change endpoint direction in the routing table. Useful for hold/unhold and NAT r
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | `endpoint_id` | string | required | Endpoint to update |
-| `direction` | string | required | `"sendrecv"`, `"sendonly"`, or `"recvonly"` |
+| `direction` | string | required | `"auto"`, `"sendrecv"`, `"sendonly"`, `"recvonly"`, or `"inactive"` |
 
 **Response:**
 ```json
 {"id":"4","result":{}}
 ```
 
-Supported on RTP, WebRTC, and Bridge endpoints.
+Notes:
+- `auto` clears manual override for RTP, WebRTC, and Bridge endpoints.
+- On RTP endpoints, `auto` resumes following SDP direction from initial offer/answer and `endpoint.rtp.reinvite`.
+- On WebRTC and Bridge endpoints, `auto` restores the endpoint's baseline direction.
 
 ### endpoint.remove
 

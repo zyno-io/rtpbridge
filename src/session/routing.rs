@@ -25,16 +25,17 @@ impl RoutingTable {
     }
 
     /// Rebuild the routing table from the current set of endpoints.
-    /// - SendRecv endpoints send to and receive from all other non-SendOnly endpoints
-    /// - SendOnly endpoints send to all non-SendOnly endpoints but receive nothing
-    /// - RecvOnly endpoints receive from all non-RecvOnly endpoints but send nothing
+    /// - SendRecv endpoints send to and receive from all other receiving endpoints
+    /// - SendOnly endpoints send to all receiving endpoints but receive nothing
+    /// - RecvOnly endpoints receive from all sending endpoints but send nothing
+    /// - Inactive endpoints neither send nor receive
     /// - Bridge-to-bridge routing is excluded to prevent audio loops
     pub fn rebuild(&mut self, endpoints: &[(EndpointId, EndpointDirection, bool)]) {
         self.routes.clear();
 
         for &(src_id, src_dir, src_is_bridge) in endpoints {
-            // RecvOnly endpoints never produce outgoing media
-            if src_dir == EndpointDirection::RecvOnly {
+            // RecvOnly/Inactive endpoints never produce outgoing media
+            if src_dir == EndpointDirection::RecvOnly || src_dir == EndpointDirection::Inactive {
                 continue;
             }
 
@@ -43,6 +44,7 @@ impl RoutingTable {
                 .filter(|&&(dst_id, dst_dir, dst_is_bridge)| {
                     dst_id != src_id
                         && dst_dir != EndpointDirection::SendOnly
+                        && dst_dir != EndpointDirection::Inactive
                         && !(src_is_bridge && dst_is_bridge)
                 })
                 .map(|&(id, _, _)| id)
@@ -135,6 +137,27 @@ mod tests {
 
         // c doesn't send to anyone
         assert!(rt.destinations(&c).is_none());
+    }
+
+    #[test]
+    fn test_inactive_neither_sends_nor_receives() {
+        let a = eid();
+        let inactive = eid();
+        let mut rt = RoutingTable::new();
+        rt.rebuild(&[
+            (a, EndpointDirection::SendRecv, false),
+            (inactive, EndpointDirection::Inactive, false),
+        ]);
+
+        let a_dests = rt.destinations(&a).unwrap();
+        assert!(
+            !a_dests.contains(&inactive),
+            "inactive endpoint must not be a destination"
+        );
+        assert!(
+            rt.destinations(&inactive).is_none(),
+            "inactive endpoint must not have outgoing routes"
+        );
     }
 
     #[test]

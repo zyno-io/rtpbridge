@@ -301,7 +301,7 @@ pub struct EndpointSrtpRekeyResult {
 #[derive(Debug, Deserialize)]
 pub struct EndpointUpdateDirectionParams {
     pub endpoint_id: EndpointId,
-    pub direction: EndpointDirection,
+    pub direction: EndpointDirectionUpdate,
 }
 
 // ── Update Remote SDP (address + SRTP only, no codec changes) ─────
@@ -475,6 +475,34 @@ pub enum EndpointDirection {
     RecvOnly,
     #[serde(rename = "sendonly")]
     SendOnly,
+    #[serde(rename = "inactive")]
+    Inactive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EndpointDirectionUpdate {
+    #[serde(rename = "auto")]
+    Auto,
+    #[serde(rename = "sendrecv")]
+    SendRecv,
+    #[serde(rename = "recvonly")]
+    RecvOnly,
+    #[serde(rename = "sendonly")]
+    SendOnly,
+    #[serde(rename = "inactive")]
+    Inactive,
+}
+
+impl EndpointDirectionUpdate {
+    pub fn as_direction(self) -> Option<EndpointDirection> {
+        match self {
+            EndpointDirectionUpdate::Auto => None,
+            EndpointDirectionUpdate::SendRecv => Some(EndpointDirection::SendRecv),
+            EndpointDirectionUpdate::RecvOnly => Some(EndpointDirection::RecvOnly),
+            EndpointDirectionUpdate::SendOnly => Some(EndpointDirection::SendOnly),
+            EndpointDirectionUpdate::Inactive => Some(EndpointDirection::Inactive),
+        }
+    }
 }
 
 fn default_direction() -> EndpointDirection {
@@ -830,6 +858,28 @@ mod tests {
         let params: VadStartParams = serde_json::from_value(json).unwrap();
         assert!((params.speech_threshold - 0.8).abs() < f32::EPSILON);
         assert_eq!(params.silence_interval_ms, 2000);
+    }
+
+    // ── EndpointUpdateDirectionParams parsing ──────────────────────────
+
+    #[test]
+    fn update_direction_accepts_auto() {
+        let json = json!({
+            "endpoint_id": "00000000-0000-0000-0000-000000000001",
+            "direction": "auto"
+        });
+        let params: EndpointUpdateDirectionParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.direction, EndpointDirectionUpdate::Auto);
+    }
+
+    #[test]
+    fn update_direction_accepts_inactive() {
+        let json = json!({
+            "endpoint_id": "00000000-0000-0000-0000-000000000001",
+            "direction": "inactive"
+        });
+        let params: EndpointUpdateDirectionParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.direction, EndpointDirectionUpdate::Inactive);
     }
 
     // ── Event serialization ─────────────────────────────────────────────

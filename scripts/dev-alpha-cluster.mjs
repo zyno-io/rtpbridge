@@ -64,16 +64,23 @@ async function kcSafe(...args) {
   try { await kc(...args); } catch {}
 }
 
-/// Check if the pod is Running (not Terminating) and exec-able.
+/// Check if the pod is Running (not Terminating/Pending) and exec-able.
 async function isPodUsable() {
+  const { execSync } = await import('node:child_process');
   try {
-    const code = await spawnp('kubectl', [
-      '--context', CTX, '-n', NS,
-      'get', 'pod', POD, '-o', 'jsonpath={.metadata.deletionTimestamp}{.status.phase}',
-    ], { stdio: ['ignore', 'pipe', 'ignore'] });
-    // If deletionTimestamp is set, pod is terminating
-    // We can't easily read stdout from spawnp, so just try exec
-    if (code !== 0) return false;
+    // Check pod phase is Running (not Pending/Terminating)
+    const phase = execSync(
+      `kubectl --context ${CTX} -n ${NS} get pod ${POD} -o jsonpath='{.status.phase}' 2>/dev/null`,
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }
+    ).trim().replace(/'/g, '');
+    if (phase !== 'Running') return false;
+
+    // Check not being deleted
+    const deleting = execSync(
+      `kubectl --context ${CTX} -n ${NS} get pod ${POD} -o jsonpath='{.metadata.deletionTimestamp}' 2>/dev/null`,
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }
+    ).trim().replace(/'/g, '');
+    if (deleting) return false;
   } catch {
     return false;
   }
@@ -88,11 +95,43 @@ async function isPodUsable() {
   }
 }
 
+/// Check if the pod is stuck in Init/ContainerCreating with network errors.
+async function isPodStuckInInit() {
+  const { execSync } = await import('node:child_process');
+  try {
+    // Check if pod exists and is in Pending/ContainerCreating state
+    const phase = execSync(
+      `kubectl --context ${CTX} -n ${NS} get pod ${POD} -o jsonpath='{.status.phase}' 2>/dev/null`,
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }
+    ).trim().replace(/'/g, '');
+    if (phase !== 'Pending') return false;
+
+    // Check for FailedCreatePodSandBox events (network errors)
+    const events = execSync(
+      `kubectl --context ${CTX} -n ${NS} get events --field-selector involvedObject.name=${POD},reason=FailedCreatePodSandBox -o jsonpath='{.items}' 2>/dev/null`,
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }
+    ).trim();
+    return events && events !== "'[]'" && events !== '[]';
+  } catch {
+    return false;
+  }
+}
+
 async function prepare() {
   if (await isPodUsable()) {
     console.log('\n>>> Pod already running, killing old rtpbridge process');
     await killRemote();
-    return;
+    // Verify pod is still usable after killing - it may have restarted and gotten stuck
+    if (await isPodUsable()) {
+      return;
+    }
+    console.log('>>> Pod no longer usable after kill, running full prepare');
+  }
+
+  // Check if pod is stuck in Init with network errors - clean up interfaces first
+  if (await isPodStuckInInit()) {
+    console.log('\n>>> Pod stuck in Init (network error), cleaning up stale interfaces first');
+    await cleanupStaleNetns();
   }
 
   console.log('\n>>> Preparing cluster');

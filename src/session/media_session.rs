@@ -168,7 +168,7 @@ pub enum SessionCommand {
     UpdateDirection {
         reply: oneshot::Sender<anyhow::Result<()>>,
         endpoint_id: EndpointId,
-        direction: EndpointDirection,
+        direction: EndpointDirectionUpdate,
     },
     UpdateRemoteSdp {
         reply: oneshot::Sender<anyhow::Result<String>>,
@@ -405,16 +405,22 @@ impl SessionState {
                 // Validate that the endpoint exists before starting a recording
                 let result = if let Some(eid) = endpoint_id {
                     if self.endpoints.contains_key(&eid) {
-                        self.recording_mgr
-                            .start_with_options(Some(eid), file_path, record_outbound)
-                            .await
+                        if record_outbound {
+                            self.recording_mgr
+                                .start_with_options(Some(eid), file_path, true)
+                                .await
+                        } else {
+                            self.recording_mgr.start(Some(eid), file_path).await
+                        }
                     } else {
                         Err(anyhow::anyhow!("Endpoint not found"))
                     }
-                } else {
+                } else if record_outbound {
                     self.recording_mgr
-                        .start_with_options(None, file_path, record_outbound)
+                        .start_with_options(None, file_path, true)
                         .await
+                } else {
+                    self.recording_mgr.start(None, file_path).await
                 };
                 if result.is_ok() {
                     self.metrics.recordings_active.inc();
@@ -1526,18 +1532,18 @@ impl SessionState {
     fn handle_update_direction(
         &mut self,
         endpoint_id: EndpointId,
-        direction: EndpointDirection,
+        direction: EndpointDirectionUpdate,
     ) -> anyhow::Result<()> {
         match self.endpoints.get_mut(&endpoint_id) {
             Some(Endpoint::Rtp(rep)) => {
-                rep.config.direction = direction;
+                rep.set_direction_override(direction);
                 rep.reset_addr_lock();
             }
             Some(Endpoint::WebRtc(wep)) => {
-                wep.config.direction = direction;
+                wep.set_direction_override(direction);
             }
             Some(Endpoint::Bridge(bep)) => {
-                bep.config.direction = direction;
+                bep.set_direction_override(direction);
             }
             Some(Endpoint::File(_) | Endpoint::Tone(_)) => {
                 anyhow::bail!("Cannot update direction on file/tone endpoints");
@@ -1548,7 +1554,7 @@ impl SessionState {
         info!(
             session_id = %self.session_id,
             endpoint_id = %endpoint_id,
-            direction = ?direction,
+            direction_update = ?direction,
             "endpoint direction updated"
         );
         Ok(())
@@ -1564,6 +1570,7 @@ impl SessionState {
             None => Err(anyhow::anyhow!("Endpoint not found")),
         };
         if result.is_ok() {
+            self.rebuild_routing();
             if let Some(Endpoint::Rtp(rep)) = self.endpoints.get(&endpoint_id) {
                 info!(
                     session_id = %self.session_id,

@@ -4,6 +4,8 @@
 
 Subscribe to periodic session statistics.
 
+Requires a bound session (`session.create` or `session.attach`). Statistics and `stats` events are for the currently bound session only.
+
 ```json
 {"id":"1","method":"stats.subscribe","params":{"interval_ms":5000}}
 ```
@@ -13,6 +15,8 @@ Subscribe to periodic session statistics.
 | `interval_ms` | u32 | `5000` | Emission interval in milliseconds (min: 500, max: 3600000) |
 
 ## stats.unsubscribe
+
+Unsubscribe from periodic statistics for the currently bound session.
 
 ```json
 {"id":"2","method":"stats.unsubscribe","params":{}}

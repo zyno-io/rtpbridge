@@ -18,7 +18,9 @@ fn rtcp_addr_from_rtp(rtp_addr: SocketAddr) -> Option<SocketAddr> {
 
 use super::endpoint::{EndpointConfig, InboundPacket, RoutedRtpPacket};
 use super::stats::EndpointStats;
-use crate::control::protocol::{EndpointDirection, EndpointId, EndpointState};
+use crate::control::protocol::{
+    EndpointDirection, EndpointDirectionUpdate, EndpointId, EndpointState,
+};
 use crate::media::rtcp::{self, RtcpStats};
 use crate::media::rtp::RtpHeader;
 use crate::media::sdp::{self, SdpCodec, SdpCrypto};
@@ -115,6 +117,13 @@ pub struct RtpEndpoint {
     /// Whether the remote address has been locked (learning window expired)
     addr_locked: bool,
 
+    /// Direction control mode:
+    /// - Auto: follow SDP direction from re-INVITEs (endpoint.rtp.reinvite)
+    /// - Manual: explicit override from endpoint.update_direction
+    direction_auto: bool,
+    /// Most recently advertised remote SDP direction mapped into local direction.
+    last_remote_direction: Option<EndpointDirection>,
+
     /// Cancellation token for cooperative recv task shutdown
     cancel_token: CancellationToken,
     /// Recv task handles
@@ -161,8 +170,22 @@ impl RtpEndpoint {
             addr_learn_window_secs: 5,
             created_at: Instant::now(),
             addr_locked: false,
+            direction_auto: true,
+            last_remote_direction: None,
             cancel_token: CancellationToken::new(),
             recv_tasks: Vec::new(),
+        }
+    }
+
+    pub fn set_direction_override(&mut self, update: EndpointDirectionUpdate) {
+        if let Some(dir) = update.as_direction() {
+            self.config.direction = dir;
+            self.direction_auto = false;
+        } else {
+            self.direction_auto = true;
+            if let Some(dir) = self.last_remote_direction {
+                self.config.direction = dir;
+            }
         }
     }
 
@@ -265,6 +288,17 @@ impl RtpEndpoint {
         let parsed = sdp::parse_sdp(offer_sdp);
 
         let mut endpoint = Self::new(id, direction, socket_pair);
+
+        if let Some(dir) = parsed
+            .direction
+            .as_deref()
+            .and_then(map_remote_direction_to_local)
+        {
+            endpoint.last_remote_direction = Some(dir);
+            if endpoint.direction_auto {
+                endpoint.config.direction = dir;
+            }
+        }
 
         // Set remote address from SDP
         endpoint.remote_rtp_addr = parsed.remote_addr;
@@ -414,6 +448,17 @@ impl RtpEndpoint {
     pub fn accept_answer(&mut self, answer_sdp: &str) -> anyhow::Result<()> {
         let parsed = sdp::parse_sdp(answer_sdp);
 
+        if let Some(dir) = parsed
+            .direction
+            .as_deref()
+            .and_then(map_remote_direction_to_local)
+        {
+            self.last_remote_direction = Some(dir);
+            if self.direction_auto {
+                self.config.direction = dir;
+            }
+        }
+
         self.remote_rtp_addr = parsed.remote_addr;
         if parsed.rtcp_mux {
             self.rtcp_mux = true;
@@ -532,6 +577,19 @@ impl RtpEndpoint {
     /// originally-negotiated one, causing one-way audio after hold/unhold.
     pub fn update_remote_sdp(&mut self, sdp: &str) -> anyhow::Result<String> {
         let parsed = sdp::parse_sdp(sdp);
+
+        // Apply remote SDP direction by default unless an explicit manual
+        // override is active via endpoint.update_direction.
+        if let Some(dir) = parsed
+            .direction
+            .as_deref()
+            .and_then(map_remote_direction_to_local)
+        {
+            self.last_remote_direction = Some(dir);
+            if self.direction_auto {
+                self.config.direction = dir;
+            }
+        }
 
         // Update remote address
         self.remote_rtp_addr = parsed.remote_addr;
@@ -1132,6 +1190,16 @@ impl RtpEndpoint {
     }
 }
 
+fn map_remote_direction_to_local(remote_dir: &str) -> Option<EndpointDirection> {
+    match remote_dir {
+        "sendrecv" => Some(EndpointDirection::SendRecv),
+        "recvonly" => Some(EndpointDirection::SendOnly), // remote receives -> we send
+        "sendonly" => Some(EndpointDirection::RecvOnly), // remote sends -> we receive
+        "inactive" => Some(EndpointDirection::Inactive),
+        _ => None,
+    }
+}
+
 /// Cancels then aborts recv tasks on drop, ensuring cleanup when endpoints are removed
 /// from a session (HashMap::remove drops the value, triggering this) or when the session
 /// itself ends. The cancellation token gives tasks a cooperative exit path; the abort
@@ -1338,6 +1406,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_from_offer_applies_initial_remote_direction_in_auto_mode() {
+        let pool =
+            crate::net::socket_pool::SocketPool::new("127.0.0.1".parse().unwrap(), 41000, 41100)
+                .unwrap();
+        let pair = pool.allocate_pair().await.unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+
+        let sdp = make_sdp_with_mux(20000, true).replace("a=sendrecv", "a=recvonly");
+        let (ep, _answer) = RtpEndpoint::from_offer(
+            EndpointId::new_v4(),
+            EndpointDirection::SendRecv,
+            &sdp,
+            pair,
+            "127.0.0.1".parse().unwrap(),
+            tx,
+        )
+        .unwrap();
+
+        assert_eq!(
+            ep.config.direction,
+            EndpointDirection::SendOnly,
+            "initial remote recvonly should map to local sendonly"
+        );
+    }
+
+    #[tokio::test]
     async fn test_accept_answer_with_rtcp_mux_updates_addr() {
         let pool =
             crate::net::socket_pool::SocketPool::new("127.0.0.1".parse().unwrap(), 51200, 51300)
@@ -1370,6 +1464,39 @@ mod tests {
 
         assert!(!ep.rtcp_mux);
         assert_eq!(ep.remote_rtcp_addr.unwrap().port(), 30001);
+    }
+
+    #[tokio::test]
+    async fn test_accept_answer_applies_initial_remote_direction_in_auto_mode() {
+        let pool =
+            crate::net::socket_pool::SocketPool::new("127.0.0.1".parse().unwrap(), 41100, 41200)
+                .unwrap();
+        let pair = pool.allocate_pair().await.unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let codecs = vec![
+            crate::media::sdp::CODEC_PCMU,
+            crate::media::sdp::CODEC_TELEPHONE_EVENT,
+        ];
+
+        let (mut ep, _offer) = RtpEndpoint::create_offer(
+            EndpointId::new_v4(),
+            EndpointDirection::SendRecv,
+            pair,
+            "127.0.0.1".parse().unwrap(),
+            &codecs,
+            false,
+            tx,
+        )
+        .unwrap();
+
+        let answer = make_sdp_with_mux(30000, true).replace("a=sendrecv", "a=sendonly");
+        ep.accept_answer(&answer).unwrap();
+
+        assert_eq!(
+            ep.config.direction,
+            EndpointDirection::RecvOnly,
+            "initial remote sendonly should map to local recvonly"
+        );
     }
 
     #[tokio::test]
@@ -1467,6 +1594,96 @@ mod tests {
             !ep.addr_locked,
             "update_remote_sdp should reset addr lock so new NAT bindings can be learned"
         );
+    }
+
+    #[tokio::test]
+    async fn test_update_remote_sdp_applies_direction_in_auto_mode() {
+        let pool =
+            crate::net::socket_pool::SocketPool::new("127.0.0.1".parse().unwrap(), 41200, 41300)
+                .unwrap();
+        let pair = pool.allocate_pair().await.unwrap();
+        let mut ep = RtpEndpoint::new(EndpointId::new_v4(), EndpointDirection::SendRecv, pair);
+
+        let reinvite_sendonly = "\
+            v=0\r\n\
+            o=- 123 2 IN IP4 10.0.0.1\r\n\
+            s=-\r\n\
+            c=IN IP4 10.0.0.1\r\n\
+            t=0 0\r\n\
+            m=audio 40000 RTP/AVP 0 101\r\n\
+            a=rtpmap:0 PCMU/8000\r\n\
+            a=rtpmap:101 telephone-event/8000\r\n\
+            a=sendonly\r\n\
+            a=rtcp-mux\r\n";
+
+        ep.update_remote_sdp(reinvite_sendonly).unwrap();
+        assert_eq!(
+            ep.config.direction,
+            EndpointDirection::RecvOnly,
+            "remote sendonly should map to local recvonly in auto mode"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_remote_sdp_manual_override_takes_priority_until_auto() {
+        let pool =
+            crate::net::socket_pool::SocketPool::new("127.0.0.1".parse().unwrap(), 41300, 41400)
+                .unwrap();
+        let pair = pool.allocate_pair().await.unwrap();
+        let mut ep = RtpEndpoint::new(EndpointId::new_v4(), EndpointDirection::SendRecv, pair);
+
+        ep.set_direction_override(EndpointDirectionUpdate::SendOnly);
+        assert_eq!(ep.config.direction, EndpointDirection::SendOnly);
+
+        let reinvite_sendonly = "\
+            v=0\r\n\
+            o=- 123 2 IN IP4 10.0.0.1\r\n\
+            s=-\r\n\
+            c=IN IP4 10.0.0.1\r\n\
+            t=0 0\r\n\
+            m=audio 40000 RTP/AVP 0 101\r\n\
+            a=rtpmap:0 PCMU/8000\r\n\
+            a=rtpmap:101 telephone-event/8000\r\n\
+            a=sendonly\r\n\
+            a=rtcp-mux\r\n";
+
+        ep.update_remote_sdp(reinvite_sendonly).unwrap();
+        assert_eq!(
+            ep.config.direction,
+            EndpointDirection::SendOnly,
+            "manual override must win over remote SDP direction"
+        );
+
+        ep.set_direction_override(EndpointDirectionUpdate::Auto);
+        assert_eq!(
+            ep.config.direction,
+            EndpointDirection::RecvOnly,
+            "switching back to auto should apply last remote SDP direction"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_remote_sdp_maps_inactive_direction() {
+        let pool =
+            crate::net::socket_pool::SocketPool::new("127.0.0.1".parse().unwrap(), 41400, 41500)
+                .unwrap();
+        let pair = pool.allocate_pair().await.unwrap();
+        let mut ep = RtpEndpoint::new(EndpointId::new_v4(), EndpointDirection::SendRecv, pair);
+
+        let reinvite_inactive = "\
+            v=0\r\n\
+            o=- 123 2 IN IP4 10.0.0.1\r\n\
+            s=-\r\n\
+            c=IN IP4 10.0.0.1\r\n\
+            t=0 0\r\n\
+            m=audio 40000 RTP/AVP 0 101\r\n\
+            a=rtpmap:0 PCMU/8000\r\n\
+            a=rtpmap:101 telephone-event/8000\r\n\
+            a=inactive\r\n\
+            a=rtcp-mux\r\n";
+
+        ep.update_remote_sdp(reinvite_inactive).unwrap();
+        assert_eq!(ep.config.direction, EndpointDirection::Inactive);
     }
 
     /// Regression: when a bridged peer (e.g. Grandstream GXP21xx) sends a

@@ -30,6 +30,7 @@ export default defineConfig({
         items: [
           { text: 'Overview', link: '/protocol/overview' },
           { text: 'Sessions', link: '/protocol/session' },
+          { text: 'Server', link: '/protocol/server' },
           { text: 'Endpoints', link: '/protocol/endpoints' },
           { text: 'File Playback', link: '/protocol/file-playback' },
           { text: 'DTMF', link: '/protocol/dtmf' },

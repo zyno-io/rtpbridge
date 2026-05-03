@@ -13,7 +13,9 @@ use tracing::{debug, trace, warn};
 
 use super::endpoint::{EndpointConfig, InboundPacket, RoutedRtpPacket};
 use super::stats::EndpointStats;
-use crate::control::protocol::{EndpointDirection, EndpointId, EndpointState};
+use crate::control::protocol::{
+    EndpointDirection, EndpointDirectionUpdate, EndpointId, EndpointState,
+};
 
 /// A WebRTC endpoint backed by str0m
 pub struct WebRtcEndpoint {
@@ -28,6 +30,8 @@ pub struct WebRtcEndpoint {
     pub audio_mid: Option<Mid>,
     /// Pending offer (when we created an offer, waiting for answer)
     pub pending_offer: Option<SdpPendingOffer>,
+    /// Baseline direction this endpoint uses in auto mode.
+    auto_direction: EndpointDirection,
     /// Handle to the recv task (aborted on drop)
     recv_task: Option<tokio::task::JoinHandle<()>>,
     /// Cancellation token for cooperative recv task shutdown (cloned in start_recv_task, cancelled in drop)
@@ -55,7 +59,7 @@ impl WebRtcEndpoint {
 
         Ok(Self {
             id,
-            config,
+            config: config.clone(),
             state: EndpointState::New,
             stats: EndpointStats::new(),
             rtc,
@@ -63,9 +67,18 @@ impl WebRtcEndpoint {
             local_addr,
             audio_mid: None,
             pending_offer: None,
+            auto_direction: config.direction,
             recv_task: None,
             cancel_token: CancellationToken::new(),
         })
+    }
+
+    pub fn set_direction_override(&mut self, update: EndpointDirectionUpdate) {
+        if let Some(dir) = update.as_direction() {
+            self.config.direction = dir;
+        } else {
+            self.config.direction = self.auto_direction;
+        }
     }
 
     /// Start the recv task that reads UDP packets and sends them to the session

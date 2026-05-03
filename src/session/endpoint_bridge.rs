@@ -3,7 +3,9 @@ use tracing::trace;
 
 use super::endpoint::{EndpointConfig, InboundPacket, RoutedRtpPacket};
 use super::stats::EndpointStats;
-use crate::control::protocol::{EndpointDirection, EndpointId, EndpointState, SessionId};
+use crate::control::protocol::{
+    EndpointDirection, EndpointDirectionUpdate, EndpointId, EndpointState, SessionId,
+};
 use crate::session::media_session::SessionCommand;
 
 /// A bridge endpoint that forwards audio between sessions via in-process channels.
@@ -21,6 +23,8 @@ pub struct BridgeEndpoint {
     pub paired_session_id: SessionId,
     /// Command channel to the paired session (for auto-remove on disconnect)
     pub paired_cmd_tx: mpsc::Sender<SessionCommand>,
+    /// Baseline direction this endpoint uses in auto mode.
+    auto_direction: EndpointDirection,
 }
 
 impl BridgeEndpoint {
@@ -41,6 +45,15 @@ impl BridgeEndpoint {
             paired_endpoint_id,
             paired_session_id,
             paired_cmd_tx,
+            auto_direction: direction,
+        }
+    }
+
+    pub fn set_direction_override(&mut self, update: EndpointDirectionUpdate) {
+        if let Some(dir) = update.as_direction() {
+            self.config.direction = dir;
+        } else {
+            self.config.direction = self.auto_direction;
         }
     }
 

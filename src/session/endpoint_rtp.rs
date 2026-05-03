@@ -170,7 +170,10 @@ impl RtpEndpoint {
             addr_learn_window_secs: 5,
             created_at: Instant::now(),
             addr_locked: false,
-            direction_auto: true,
+            // Auto mode tracks remote SDP direction. An explicit non-default
+            // direction at creation is treated as a manual override, so the
+            // user's choice survives the initial offer/answer exchange.
+            direction_auto: matches!(direction, EndpointDirection::SendRecv),
             last_remote_direction: None,
             cancel_token: CancellationToken::new(),
             recv_tasks: Vec::new(),

@@ -99,6 +99,7 @@ async fn test_no_session_bound() {
         .request(
             "endpoint.create_offer",
             json!({
+                "type": "rtp",
                 "direction": "sendrecv"
             }),
         )

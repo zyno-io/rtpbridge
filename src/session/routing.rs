@@ -149,10 +149,12 @@ mod tests {
             (inactive, EndpointDirection::Inactive, false),
         ]);
 
-        let a_dests = rt.destinations(&a).unwrap();
+        // a's only candidate dest (inactive) is filtered out, so a has no
+        // outgoing routes — consistent with how recvonly-only peers are
+        // represented (no entry in the table).
         assert!(
-            !a_dests.contains(&inactive),
-            "inactive endpoint must not be a destination"
+            rt.destinations(&a).is_none(),
+            "a must not route to an inactive endpoint"
         );
         assert!(
             rt.destinations(&inactive).is_none(),

@@ -538,6 +538,14 @@ pub struct EndpointInfo {
     pub codec: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shared_playback_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_rtp_addr: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_rtcp_addr: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_rtp_addr: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_rtcp_addr: Option<String>,
 }
 
 // ── Event Data Types ────────────────────────────────────────────────────

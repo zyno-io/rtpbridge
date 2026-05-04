@@ -902,14 +902,27 @@ impl SessionState {
         };
         if let Some((old_state, new_state)) = state_change {
             // Log codec/address info now that answer is accepted
+            let sdp_remote = sdp::parse_sdp(sdp).remote_addr;
             if let Some(ep) = self.endpoints.get(&endpoint_id) {
                 match ep {
                     Endpoint::Rtp(rep) => {
                         info!(
                             session_id = %self.session_id,
                             endpoint_id = %endpoint_id,
+                            local_addr = %rep.local_rtp_addr,
                             remote_addr = ?rep.remote_rtp_addr,
                             codec = ?rep.send_codec.as_ref().map(|c| c.name),
+                            old_state = ?old_state,
+                            new_state = ?new_state,
+                            "endpoint answer accepted"
+                        );
+                    }
+                    Endpoint::WebRtc(wep) => {
+                        info!(
+                            session_id = %self.session_id,
+                            endpoint_id = %endpoint_id,
+                            local_addr = %wep.local_addr,
+                            sdp_remote_addr = ?sdp_remote,
                             old_state = ?old_state,
                             new_state = ?new_state,
                             "endpoint answer accepted"
@@ -955,9 +968,17 @@ impl SessionState {
         };
 
         if result.is_ok() {
+            let sdp_remote = sdp::parse_sdp(sdp).remote_addr;
+            let local_addr = self.endpoints.get(&endpoint_id).and_then(|ep| match ep {
+                Endpoint::WebRtc(w) => Some(w.local_addr),
+                Endpoint::Rtp(r) => Some(r.local_rtp_addr),
+                _ => None,
+            });
             info!(
                 session_id = %self.session_id,
                 endpoint_id = %endpoint_id,
+                local_addr = ?local_addr,
+                sdp_remote_addr = ?sdp_remote,
                 "endpoint offer accepted"
             );
         }
@@ -1575,7 +1596,9 @@ impl SessionState {
                 info!(
                     session_id = %self.session_id,
                     endpoint_id = %endpoint_id,
+                    local_addr = %rep.local_rtp_addr,
                     remote_addr = ?rep.remote_rtp_addr,
+                    remote_rtcp_addr = ?rep.remote_rtcp_addr,
                     codec = ?rep.send_codec.as_ref().map(|c| c.name),
                     "endpoint remote SDP updated"
                 );
@@ -1597,13 +1620,27 @@ impl SessionState {
             .endpoints
             .values()
             .map(|ep| {
+                let mut local_rtp_addr = None;
+                let mut local_rtcp_addr = None;
+                let mut remote_rtp_addr = None;
+                let mut remote_rtcp_addr = None;
                 let (ep_type, codec, shared_playback_id) = match ep {
-                    Endpoint::WebRtc(_) => ("webrtc".to_string(), Some("opus".to_string()), None),
-                    Endpoint::Rtp(r) => (
-                        "rtp".to_string(),
-                        r.send_codec.as_ref().map(|c| c.name.to_string()),
-                        None,
-                    ),
+                    Endpoint::WebRtc(w) => {
+                        local_rtp_addr = Some(w.local_addr.to_string());
+                        remote_rtp_addr = w.remote_addr.map(|a| a.to_string());
+                        ("webrtc".to_string(), Some("opus".to_string()), None)
+                    }
+                    Endpoint::Rtp(r) => {
+                        local_rtp_addr = Some(r.local_rtp_addr.to_string());
+                        local_rtcp_addr = r.rtcp_socket.local_addr().ok().map(|a| a.to_string());
+                        remote_rtp_addr = r.remote_rtp_addr.map(|a| a.to_string());
+                        remote_rtcp_addr = r.remote_rtcp_addr.map(|a| a.to_string());
+                        (
+                            "rtp".to_string(),
+                            r.send_codec.as_ref().map(|c| c.name.to_string()),
+                            None,
+                        )
+                    }
                     Endpoint::File(f) => {
                         let spid = if f.shared {
                             Some(
@@ -1629,6 +1666,10 @@ impl SessionState {
                     state: ep.state(),
                     codec,
                     shared_playback_id,
+                    local_rtp_addr,
+                    local_rtcp_addr,
+                    remote_rtp_addr,
+                    remote_rtcp_addr,
                 }
             })
             .collect();

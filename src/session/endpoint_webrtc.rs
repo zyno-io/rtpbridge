@@ -26,6 +26,9 @@ pub struct WebRtcEndpoint {
     pub rtc: Rtc,
     pub socket: Arc<UdpSocket>,
     pub local_addr: SocketAddr,
+    /// Last destination str0m emitted a transmit to once ICE was nominated.
+    /// Cleared on disconnect.
+    pub remote_addr: Option<SocketAddr>,
     /// Mid for the audio media line (set after SDP negotiation)
     pub audio_mid: Option<Mid>,
     /// Pending offer (when we created an offer, waiting for answer)
@@ -65,6 +68,7 @@ impl WebRtcEndpoint {
             rtc,
             socket,
             local_addr,
+            remote_addr: None,
             audio_mid: None,
             pending_offer: None,
             auto_direction: config.direction,
@@ -260,6 +264,9 @@ impl WebRtcEndpoint {
                     return Ok((events, when));
                 }
                 Output::Transmit(transmit) => {
+                    if self.state == EndpointState::Connected {
+                        self.remote_addr = Some(transmit.destination);
+                    }
                     // Use non-blocking send to avoid spawning a task per packet.
                     // UDP sends almost never block; if the socket isn't ready we
                     // drop the packet (acceptable for real-time media).
@@ -297,6 +304,7 @@ impl WebRtcEndpoint {
                                 if self.state != EndpointState::Disconnected {
                                     let old = self.state;
                                     self.state = EndpointState::Disconnected;
+                                    self.remote_addr = None;
                                     events.push(WebRtcEvent::StateChanged {
                                         old,
                                         new: self.state,

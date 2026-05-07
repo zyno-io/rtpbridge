@@ -1,2 +1,11 @@
 # Debian base image CVEs with no upstream fix available.
 # Review periodically and remove once patched.
+
+# libcap2 — privilege escalation via TOCTOU race
+CVE-2026-4878
+
+# systemd (libsystemd0, libudev1) — arbitrary code execution / DoS
+CVE-2026-29111
+
+# ncurses (libtinfo6, ncurses-base) — buffer overflow
+CVE-2025-69720

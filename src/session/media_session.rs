@@ -1569,14 +1569,15 @@ impl SessionState {
             }
             Some(Endpoint::WebRtc(wep)) => {
                 wep.set_direction_override(direction);
-                if prev_dir.is_some_and(|d| !d.is_sending()) && wep.config.direction.is_sending() {
-                    if let Err(e) = wep.bump_outbound_ssrc() {
-                        warn!(
-                            endpoint_id = %endpoint_id,
-                            error = %e,
-                            "failed to rotate outbound SSRC on unhold"
-                        );
-                    }
+                if prev_dir.is_some_and(|d| !d.is_sending())
+                    && wep.config.direction.is_sending()
+                    && let Err(e) = wep.bump_outbound_ssrc()
+                {
+                    warn!(
+                        endpoint_id = %endpoint_id,
+                        error = %e,
+                        "failed to rotate outbound SSRC on unhold"
+                    );
                 }
             }
             Some(Endpoint::Bridge(bep)) => {
@@ -1613,10 +1614,11 @@ impl SessionState {
             None => Err(anyhow::anyhow!("Endpoint not found")),
         };
         if result.is_ok() {
-            if let Some(Endpoint::Rtp(rep)) = self.endpoints.get_mut(&endpoint_id) {
-                if prev_dir.is_some_and(|d| !d.is_sending()) && rep.config.direction.is_sending() {
-                    rep.bump_outbound_ssrc();
-                }
+            if let Some(Endpoint::Rtp(rep)) = self.endpoints.get_mut(&endpoint_id)
+                && prev_dir.is_some_and(|d| !d.is_sending())
+                && rep.config.direction.is_sending()
+            {
+                rep.bump_outbound_ssrc();
             }
             self.rebuild_routing();
             if let Some(Endpoint::Rtp(rep)) = self.endpoints.get(&endpoint_id) {

@@ -33,15 +33,45 @@ for cid in $STALE_CIDS; do
 done
 echo "Stopped $STOPPED stale container(s)"
 
-# --- Remove ALL net1 macvlan interfaces from every namespace ---
+# --- Remove ALL net1 macvlan interfaces from every net namespace ---
+# Enumerate from multiple sources and dedupe by inode. `ip netns list` only
+# shows symlinks under /var/run/netns/ and misses (a) the host netns and
+# (b) sandbox netns that aren't symlinked there. A stale net1 in any of
+# those produces a "address already in use" MAC collision when CNI tries
+# to bring up net1 in a new sandbox.
 
 CLEANED=0
-for ns in $(ip netns list | awk '{print $1}'); do
-  has=$(ip netns exec "$ns" ip link show net1 2>/dev/null | grep net1 || true)
-  if [ -n "$has" ]; then
-    echo "Removing net1 from $ns"
-    ip netns exec "$ns" ip link del net1
+declare -A SEEN
+
+remove_net1_from() {
+  local path="$1"
+  local desc="$2"
+  local inode
+  inode=$(stat -L -c '%i' "$path" 2>/dev/null) || return 0
+  [ -n "${SEEN[$inode]}" ] && return 0
+  SEEN[$inode]=1
+  if nsenter --net="$path" ip link show net1 >/dev/null 2>&1; then
+    local mac
+    mac=$(nsenter --net="$path" ip link show net1 2>/dev/null | awk '/link\/ether/ {print $2}')
+    echo "Removing net1 ($mac) from $desc"
+    nsenter --net="$path" ip link del net1 2>/dev/null || true
     CLEANED=$((CLEANED + 1))
   fi
+}
+
+# Bind-mounted CNI netns (canonical CNI location)
+for f in /var/run/netns/* /run/netns/*; do
+  [ -e "$f" ] || continue
+  remove_net1_from "$f" "$(basename "$f")"
 done
-echo "Cleaned $CLEANED namespace(s)"
+
+# Every distinct process netns (catches the host netns and any sandbox
+# whose netns isn't symlinked into /var/run/netns/)
+for p in /proc/[0-9]*/ns/net; do
+  [ -e "$p" ] || continue
+  pid=${p#/proc/}
+  pid=${pid%/ns/net}
+  remove_net1_from "$p" "pid $pid"
+done
+
+echo "Cleaned $CLEANED net1 interface(s)"

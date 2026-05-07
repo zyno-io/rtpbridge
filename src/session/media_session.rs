@@ -1555,13 +1555,29 @@ impl SessionState {
         endpoint_id: EndpointId,
         direction: EndpointDirectionUpdate,
     ) -> anyhow::Result<()> {
+        // Capture pre-direction so we can detect a non-sending → sending
+        // transition (i.e. unhold) and rotate the outbound SSRC.
+        let prev_dir = self.endpoints.get(&endpoint_id).map(|e| e.direction());
+
         match self.endpoints.get_mut(&endpoint_id) {
             Some(Endpoint::Rtp(rep)) => {
                 rep.set_direction_override(direction);
                 rep.reset_addr_lock();
+                if prev_dir.is_some_and(|d| !d.is_sending()) && rep.config.direction.is_sending() {
+                    rep.bump_outbound_ssrc();
+                }
             }
             Some(Endpoint::WebRtc(wep)) => {
                 wep.set_direction_override(direction);
+                if prev_dir.is_some_and(|d| !d.is_sending()) && wep.config.direction.is_sending() {
+                    if let Err(e) = wep.bump_outbound_ssrc() {
+                        warn!(
+                            endpoint_id = %endpoint_id,
+                            error = %e,
+                            "failed to rotate outbound SSRC on unhold"
+                        );
+                    }
+                }
             }
             Some(Endpoint::Bridge(bep)) => {
                 bep.set_direction_override(direction);
@@ -1586,11 +1602,22 @@ impl SessionState {
         endpoint_id: EndpointId,
         sdp: &str,
     ) -> anyhow::Result<String> {
+        // Snapshot direction before applying the SDP so we can detect a
+        // non-sending → sending transition (i.e. a SIP-style unhold via
+        // re-INVITE) and rotate the outbound SSRC. Mirrors the same logic
+        // in handle_update_direction.
+        let prev_dir = self.endpoints.get(&endpoint_id).map(|e| e.direction());
+
         let result = match self.endpoints.get_mut(&endpoint_id) {
             Some(ep) => ep.update_remote_sdp(sdp),
             None => Err(anyhow::anyhow!("Endpoint not found")),
         };
         if result.is_ok() {
+            if let Some(Endpoint::Rtp(rep)) = self.endpoints.get_mut(&endpoint_id) {
+                if prev_dir.is_some_and(|d| !d.is_sending()) && rep.config.direction.is_sending() {
+                    rep.bump_outbound_ssrc();
+                }
+            }
             self.rebuild_routing();
             if let Some(Endpoint::Rtp(rep)) = self.endpoints.get(&endpoint_id) {
                 info!(

@@ -479,6 +479,13 @@ pub enum EndpointDirection {
     Inactive,
 }
 
+impl EndpointDirection {
+    /// Whether this direction permits the endpoint to transmit to its peer.
+    pub fn is_sending(self) -> bool {
+        matches!(self, Self::SendRecv | Self::SendOnly)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EndpointDirectionUpdate {
     #[serde(rename = "auto")]

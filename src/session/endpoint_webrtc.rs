@@ -85,6 +85,39 @@ impl WebRtcEndpoint {
         }
     }
 
+    /// Rotate the outbound SSRC on the audio TX stream.
+    ///
+    /// Used on hold→unhold transitions to force libwebrtc on the receiver to
+    /// rebuild its `AudioReceiveStream` with a fresh wall-clock anchor. Without
+    /// this, a paused-then-resumed iOS receiver discards post-resume packets as
+    /// "too late" because the server's RTP timeline is real-time-continuous
+    /// while the local audio clock paused for the duration of the hold.
+    ///
+    /// `reset_stream_tx` rotates the SSRC, restarts the seq number, clears the
+    /// RTP↔wallclock anchor, and forces a prompt SR/SDES emission for the new
+    /// SSRC. CNAME is preserved (lives on the m-section, not the SSRC) so the
+    /// receiver ties the new SSRC back to the same logical source.
+    pub fn bump_outbound_ssrc(&mut self) -> anyhow::Result<()> {
+        let mid = self
+            .audio_mid
+            .ok_or_else(|| anyhow::anyhow!("no audio mid negotiated"))?;
+        let new_ssrc: str0m::rtp::Ssrc = rand::random::<u32>().into();
+        let mut api = self.rtc.direct_api();
+        if api.reset_stream_tx(mid, None, new_ssrc, None).is_none() {
+            // None means: no stream for mid, or new SSRC equals current. The
+            // SSRC collision is astronomically unlikely; missing stream means
+            // we got called before the first negotiation, which is a no-op.
+            debug!(endpoint_id = %self.id, "bump_outbound_ssrc: no TX stream to rotate (yet)");
+            return Ok(());
+        }
+        debug!(
+            endpoint_id = %self.id,
+            new_ssrc = *new_ssrc,
+            "WebRTC outbound SSRC rotated"
+        );
+        Ok(())
+    }
+
     /// Start the recv task that reads UDP packets and sends them to the session
     pub fn start_recv_task(&mut self, packet_tx: mpsc::Sender<InboundPacket>) {
         let socket = Arc::clone(&self.socket);

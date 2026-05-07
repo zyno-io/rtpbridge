@@ -192,6 +192,32 @@ impl RtpEndpoint {
         }
     }
 
+    /// Rotate the outbound SSRC and reset the outbound RTP timeline.
+    ///
+    /// Used on hold→unhold transitions to give the receiver a fresh stream to
+    /// re-anchor its jitter buffer against. Per RFC 3550, a new SSRC SHOULD
+    /// start with random seq/timestamp bases, so the peer treats it as an
+    /// independent stream rather than a continuation of the prior timeline.
+    /// `last_source_id`/`last_source_ts` are also cleared so the next outbound
+    /// packet seeds from the new random anchor with a marker bit set (via
+    /// `advance_outbound_timeline`'s "first packet" arm).
+    pub fn bump_outbound_ssrc(&mut self) {
+        let prev = self.our_ssrc;
+        self.our_ssrc = rand::random();
+        self.seq_no = rand::random();
+        let new_ts: u32 = rand::random();
+        self.last_outbound_ts = None;
+        self.last_source_id = None;
+        self.last_source_ts = None;
+        self.last_rtp_timestamp = new_ts;
+        debug!(
+            endpoint_id = %self.id,
+            prev_ssrc = prev,
+            new_ssrc = self.our_ssrc,
+            "RTP outbound SSRC rotated"
+        );
+    }
+
     /// Start recv tasks for RTP and RTCP sockets
     pub fn start_recv_tasks(&mut self, packet_tx: mpsc::Sender<InboundPacket>) {
         // RTP recv task
@@ -2066,5 +2092,45 @@ mod tests {
         ep.advance_outbound_timeline(src_a, 1000, false);
         let (ts, _) = ep.advance_outbound_timeline(src_b, 50_000, false);
         assert_eq!(ts, 1000 + 160, "fallback step is 160 (8kHz/50)");
+    }
+
+    #[tokio::test]
+    async fn test_bump_outbound_ssrc_rotates_state() {
+        let pool =
+            crate::net::socket_pool::SocketPool::new("127.0.0.1".parse().unwrap(), 52800, 52900)
+                .unwrap();
+        let pair = pool.allocate_pair().await.unwrap();
+        let mut ep = RtpEndpoint::new(EndpointId::new_v4(), EndpointDirection::SendRecv, pair);
+
+        // Establish a prior outbound timeline as if we'd been sending.
+        let src = EndpointId::new_v4();
+        ep.advance_outbound_timeline(src, 12_345, false);
+        let prev_ssrc = ep.our_ssrc;
+        let prev_seq = ep.seq_no;
+        assert!(ep.last_outbound_ts.is_some());
+        assert!(ep.last_source_id.is_some());
+
+        ep.bump_outbound_ssrc();
+
+        assert_ne!(ep.our_ssrc, prev_ssrc, "SSRC must rotate");
+        assert_ne!(
+            ep.seq_no, prev_seq,
+            "seq_no must restart from a fresh random base"
+        );
+        assert!(
+            ep.last_outbound_ts.is_none(),
+            "outbound timeline anchor must be cleared so the next packet \
+             seeds from the new random base with a marker bit"
+        );
+        assert!(ep.last_source_id.is_none());
+        assert!(ep.last_source_ts.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_direction_is_sending_classification() {
+        assert!(EndpointDirection::SendRecv.is_sending());
+        assert!(EndpointDirection::SendOnly.is_sending());
+        assert!(!EndpointDirection::RecvOnly.is_sending());
+        assert!(!EndpointDirection::Inactive.is_sending());
     }
 }

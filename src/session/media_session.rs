@@ -31,6 +31,17 @@ struct CachedTranscode {
     pipeline: TranscodePipeline,
     last_used: Instant,
 }
+
+fn endpoint_type_label(endpoint: &Endpoint) -> &'static str {
+    match endpoint {
+        Endpoint::WebRtc(_) => "webrtc",
+        Endpoint::Rtp(_) => "rtp",
+        Endpoint::File(_) => "file",
+        Endpoint::Tone(_) => "tone",
+        Endpoint::Bridge(_) => "bridge",
+    }
+}
+
 use crate::net::socket_pool::SocketPool;
 use crate::recording::recorder::RecordingManager;
 
@@ -871,6 +882,20 @@ impl SessionState {
         sdp: &str,
         expected_type: Option<EndpointType>,
     ) -> anyhow::Result<()> {
+        let endpoint_type = self
+            .endpoints
+            .get(&endpoint_id)
+            .map(endpoint_type_label)
+            .unwrap_or("unknown");
+        info!(
+            session_id = %self.session_id,
+            endpoint_id = %endpoint_id,
+            endpoint_type = endpoint_type,
+            expected_type = ?expected_type,
+            sdp_len = sdp.len(),
+            "endpoint accept_answer enter"
+        );
+
         let mut state_change = None;
         let result = match self.endpoints.get_mut(&endpoint_id) {
             Some(ep) => {
@@ -953,6 +978,27 @@ impl SessionState {
         // Rebuild routing now that endpoint is Connected and has a remote address
         if state_change.is_some() {
             self.rebuild_routing();
+        }
+        match &result {
+            Ok(()) => {
+                let current_state = self.endpoints.get(&endpoint_id).map(|ep| ep.state());
+                info!(
+                    session_id = %self.session_id,
+                    endpoint_id = %endpoint_id,
+                    endpoint_type = endpoint_type,
+                    state = ?current_state,
+                    "endpoint accept_answer exit"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    session_id = %self.session_id,
+                    endpoint_id = %endpoint_id,
+                    endpoint_type = endpoint_type,
+                    error = %e,
+                    "endpoint accept_answer exit"
+                );
+            }
         }
         result
     }
@@ -1934,6 +1980,13 @@ pub async fn run_media_session(
             .any(|ep| matches!(ep, Endpoint::Tone(t) if t.state == EndpointState::Playing));
         let has_pending_dtmf = state.dtmf_injection.is_some();
         let has_active_dtmf = super::session_dtmf::has_active_dtmf(&state.dtmf_state);
+        // Connecting-watchdog: if any WebRTC endpoint has an in-flight
+        // negotiation, cap sleep at 1s so the periodic check that emits the
+        // WARN can't be starved by a far-out str0m timeout.
+        let has_pending_webrtc_negotiation = state
+            .endpoints
+            .values()
+            .any(|ep| matches!(ep, Endpoint::WebRtc(wep) if wep.connecting_since.is_some()));
         let sleep_duration =
             if has_playing_files || has_playing_tones || has_pending_dtmf || has_active_dtmf {
                 next_timeout
@@ -1941,9 +1994,14 @@ pub async fn run_media_session(
                     .unwrap_or(Duration::ZERO)
                     .min(Duration::from_millis(20))
             } else {
-                next_timeout
+                let raw = next_timeout
                     .checked_duration_since(Instant::now())
-                    .unwrap_or(Duration::ZERO)
+                    .unwrap_or(Duration::ZERO);
+                if has_pending_webrtc_negotiation {
+                    raw.min(Duration::from_secs(1))
+                } else {
+                    raw
+                }
             };
 
         let mut inbound_rtp = Vec::new();
@@ -2063,6 +2121,7 @@ pub async fn run_media_session(
                 &state.dropped_events,
                 &state.metrics,
             );
+            check_connecting_watchdog(&mut state.endpoints, &state.metrics);
             state.last_timeout_check = Instant::now();
         }
         vad_tap::check_vad_timeouts(
@@ -2214,7 +2273,17 @@ fn handle_inbound_packet(
         match ep {
             Endpoint::WebRtc(wep) => {
                 if let Err(e) = wep.handle_receive(pkt.source, &pkt.data, now) {
-                    debug!(endpoint_id = %pkt.endpoint_id, error = %e, "WebRTC packet error");
+                    metrics.webrtc_packet_errors.inc();
+                    if !wep.packet_error_warned {
+                        wep.packet_error_warned = true;
+                        warn!(
+                            endpoint_id = %pkt.endpoint_id,
+                            error = %e,
+                            "WebRTC packet error (first for this endpoint; subsequent errors only update rtpbridge_webrtc_packet_errors)"
+                        );
+                    } else {
+                        debug!(endpoint_id = %pkt.endpoint_id, error = %e, "WebRTC packet error");
+                    }
                 }
             }
             Endpoint::Rtp(rep) => {
@@ -2645,6 +2714,41 @@ fn check_media_timeouts(
         } else {
             // Receiving media again — reset so next timeout fires fresh
             emitted.remove(&eid);
+        }
+    }
+}
+
+/// Threshold after which a WebRTC endpoint stuck in `Connecting` triggers a
+/// watchdog WARN. Picked to comfortably outlast a healthy ICE+DTLS handshake
+/// (~1–3s in practice) while still firing well before SIP-level call timeouts.
+const WEBRTC_CONNECTING_WATCHDOG_SECS: u64 = 15;
+
+/// Warns once per negotiation attempt for any WebRTC endpoint whose
+/// `connecting_since` has exceeded the watchdog threshold. Top-level
+/// `EndpointState` is NOT gated on here: an ICE restart on an already-
+/// `Connected` endpoint can stall without changing the state, and we still
+/// want that stall to fire the watchdog. Cleared on str0m's Connected /
+/// Disconnected events. Bumps `rtpbridge_webrtc_connecting_stuck` per warn.
+fn check_connecting_watchdog(
+    endpoints: &mut HashMap<EndpointId, Endpoint>,
+    metrics: &crate::metrics::Metrics,
+) {
+    let threshold = Duration::from_secs(WEBRTC_CONNECTING_WATCHDOG_SECS);
+    for ep in endpoints.values_mut() {
+        if let Endpoint::WebRtc(wep) = ep
+            && let Some(since) = wep.connecting_since
+            && !wep.connecting_warned
+            && since.elapsed() >= threshold
+        {
+            wep.connecting_warned = true;
+            metrics.webrtc_connecting_stuck.inc();
+            warn!(
+                endpoint_id = %wep.id,
+                local_addr = %wep.local_addr,
+                state = ?wep.state,
+                stuck_secs = since.elapsed().as_secs(),
+                "WebRTC negotiation stuck past watchdog threshold (no ICE/DTLS completion since last attempt)"
+            );
         }
     }
 }

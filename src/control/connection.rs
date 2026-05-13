@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -127,8 +128,7 @@ async fn handle_connection_inner(
                                     "PARSE_ERROR",
                                     format!("Invalid JSON: {e}"),
                                 );
-                                let json = serde_json::to_string(&resp).unwrap_or_else(|_| r#"{"error":{"code":"INTERNAL_ERROR","message":"serialize error"}}"#.to_string());
-                                if ws_tx.send(Message::Text(json.into())).await.is_err() {
+                                if !send_ws_response(&mut ws_tx, "<parse_error>", resp).await {
                                     break;
                                 }
                                 continue;
@@ -142,8 +142,7 @@ async fn handle_connection_inner(
                                 "INVALID_PARAMS",
                                 format!("request id exceeds maximum length of {MAX_REQUEST_ID_LEN}"),
                             );
-                            let json = serde_json::to_string(&resp).unwrap_or_else(|_| r#"{"error":{"code":"INTERNAL_ERROR","message":"serialize error"}}"#.to_string());
-                            if ws_tx.send(Message::Text(json.into())).await.is_err() {
+                            if !send_ws_response(&mut ws_tx, &req.method, resp).await {
                                 break;
                             }
                             continue;
@@ -162,22 +161,21 @@ async fn handle_connection_inner(
 
                         // Check if server is shutting down for session.create
                         if req.method == "session.create" && shutdown.is_shutting_down() {
+                            let method = req.method.clone();
                             let resp = Response::err(
                                 req.id,
                                 "SHUTTING_DOWN",
                                 "Server is shutting down, not accepting new sessions",
                             );
-                            let json = serde_json::to_string(&resp).unwrap_or_else(|_| r#"{"error":{"code":"INTERNAL_ERROR","message":"serialize error"}}"#.to_string());
-                            if ws_tx.send(Message::Text(json.into())).await.is_err() {
+                            if !send_ws_response(&mut ws_tx, &method, resp).await {
                                 break;
                             }
                             continue;
                         }
 
+                        let method = req.method.clone();
                         let resp = handle_request(req, &mut state, &event_tx, &critical_event_tx, &dropped_events, &manager).await;
-                        let json = serde_json::to_string(&resp).unwrap_or_else(|_| r#"{"error":{"code":"INTERNAL_ERROR","message":"serialize error"}}"#.to_string());
-                        trace!(payload = %json, "ws send response");
-                        if ws_tx.send(Message::Text(json.into())).await.is_err() {
+                        if !send_ws_response(&mut ws_tx, &method, resp).await {
                             break;
                         }
 
@@ -261,6 +259,97 @@ async fn handle_connection_inner(
     }
 
     info!("WebSocket connection closed");
+}
+
+async fn send_ws_response(
+    ws_tx: &mut SplitSink<WebSocketStream<TcpStream>, Message>,
+    method: &str,
+    resp: Response,
+) -> bool {
+    let json = serde_json::to_string(&resp).unwrap_or_else(|e| {
+        warn!(
+            id = %resp.id,
+            method = %method,
+            error = %e,
+            "failed to serialize JSON-RPC response"
+        );
+        r#"{"error":{"code":"INTERNAL_ERROR","message":"serialize error"}}"#.to_string()
+    });
+    trace!(payload = %json, "ws send response");
+
+    match ws_tx.send(Message::Text(json.into())).await {
+        Ok(()) => {
+            log_ws_response_sent(method, &resp);
+            true
+        }
+        Err(e) => {
+            warn!(
+                id = %resp.id,
+                method = %method,
+                error = %e,
+                "failed to send JSON-RPC response"
+            );
+            false
+        }
+    }
+}
+
+/// Methods whose successful replies are worth INFO-level breadcrumbs because
+/// they drive signaling / lifecycle. Everything else logs ok-replies at DEBUG
+/// to keep INFO volume sane in busy deployments. All error replies stay at
+/// INFO regardless of method.
+const INFO_REPLY_METHODS: &[&str] = &[
+    "session.create",
+    "session.attach",
+    "session.destroy",
+    "session.bridge",
+    "endpoint.create_offer",
+    "endpoint.create_from_offer",
+    "endpoint.webrtc.create_offer",
+    "endpoint.webrtc.create_from_offer",
+    "endpoint.rtp.create_from_offer",
+    "endpoint.webrtc.accept_offer",
+    "endpoint.webrtc.accept_answer",
+    "endpoint.webrtc.ice_restart",
+    "endpoint.rtp.create_offer",
+    "endpoint.rtp.accept_answer",
+    "endpoint.rtp.reinvite",
+    "endpoint.accept_offer",
+    "endpoint.accept_answer",
+    "endpoint.update_remote_sdp",
+    "endpoint.update_direction",
+    "endpoint.ice_restart",
+    "endpoint.transfer",
+    "endpoint.remove",
+    "endpoint.srtp_rekey",
+    "endpoint.rtp.srtp_rekey",
+];
+
+fn log_ws_response_sent(method: &str, resp: &Response) {
+    if let Some(error) = &resp.error {
+        info!(
+            id = %resp.id,
+            method = %method,
+            result = "error",
+            error_code = %error.code,
+            error_message = %error.message,
+            "JSON-RPC response sent"
+        );
+    } else if INFO_REPLY_METHODS.contains(&method) {
+        info!(
+            id = %resp.id,
+            method = %method,
+            result = "ok",
+            "JSON-RPC response sent"
+        );
+    } else {
+        debug!(
+            id = %resp.id,
+            method = %method,
+            result = "ok",
+            "JSON-RPC response sent"
+        );
+    }
 }
 
 /// Drain pending events from both critical and normal channels.

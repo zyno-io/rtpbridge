@@ -33,6 +33,14 @@ pub struct Metrics {
     pub transcode_errors: Counter,
     /// Events dropped due to channel backpressure (client too slow).
     pub events_dropped: Counter,
+    /// Inbound packets that a WebRTC endpoint's `handle_receive` rejected
+    /// (str0m parse / auth / DTLS errors). Counts every drop; a per-endpoint
+    /// WARN is emitted on first occurrence only.
+    pub webrtc_packet_errors: Counter,
+    /// WebRTC endpoints that stayed in `Connecting` past the watchdog
+    /// threshold without reaching `Connected`. One increment per stuck
+    /// endpoint (the watchdog only fires once per Connecting period).
+    pub webrtc_connecting_stuck: Counter,
 
     /// The Prometheus registry.  Wrapped in a `Mutex` because
     /// `encode()` requires `&Registry` but we need interior mutability
@@ -66,6 +74,8 @@ impl Metrics {
         let dtmf_events = Counter::default();
         let transcode_errors = Counter::default();
         let events_dropped = Counter::default();
+        let webrtc_packet_errors = Counter::default();
+        let webrtc_connecting_stuck = Counter::default();
 
         // Note: prometheus-client automatically appends `_total` to counter
         // names in the encoded output, so we register without that suffix.
@@ -124,6 +134,16 @@ impl Metrics {
             "Events dropped due to channel backpressure",
             events_dropped.clone(),
         );
+        registry.register(
+            "rtpbridge_webrtc_packet_errors",
+            "Inbound packets a WebRTC endpoint's str0m handle_receive rejected",
+            webrtc_packet_errors.clone(),
+        );
+        registry.register(
+            "rtpbridge_webrtc_connecting_stuck",
+            "WebRTC endpoints that stayed in Connecting past the watchdog threshold",
+            webrtc_connecting_stuck.clone(),
+        );
         Self {
             sessions_total,
             sessions_active,
@@ -136,6 +156,8 @@ impl Metrics {
             dtmf_events,
             transcode_errors,
             events_dropped,
+            webrtc_packet_errors,
+            webrtc_connecting_stuck,
             registry: Mutex::new(registry),
         }
     }

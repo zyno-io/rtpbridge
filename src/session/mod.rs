@@ -15,12 +15,13 @@ pub mod tone_poll;
 pub mod vad_tap;
 
 use dashmap::DashMap;
+use futures_util::FutureExt;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::mpsc;
-use tracing::{Instrument, warn};
+use tracing::{Instrument, error, warn};
 
 use crate::control::protocol::*;
 use crate::metrics::Metrics;
@@ -29,6 +30,16 @@ use crate::playback::file_cache::FileCache;
 use crate::shutdown::ShutdownCoordinator;
 
 pub use media_session::SessionCommand;
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        s
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.as_str()
+    } else {
+        "non-string panic payload"
+    }
+}
 
 /// A managed media session
 pub struct Session {
@@ -206,7 +217,7 @@ impl SessionManager {
                     manager.shutdown.session_ended();
                     metrics.sessions_active.dec();
                 }));
-                media_session::run_media_session(
+                let result = std::panic::AssertUnwindSafe(media_session::run_media_session(
                     session_id,
                     media_ip,
                     socket_pool,
@@ -225,8 +236,16 @@ impl SessionManager {
                     shared_playback,
                     cmd_tx_clone,
                     cmd_rx,
-                )
+                ))
+                .catch_unwind()
                 .await;
+                if let Err(payload) = result {
+                    error!(
+                        session_id = %session_id,
+                        panic = %panic_payload_message(payload.as_ref()),
+                        "media session task panicked"
+                    );
+                }
             }
             .instrument(session_span),
         );

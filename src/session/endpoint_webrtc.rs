@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
+use futures_util::FutureExt;
 use str0m::change::{SdpAnswer, SdpOffer, SdpPendingOffer};
 use str0m::media::{Direction, MediaKind, Mid};
 use str0m::net::{Protocol, Receive};
@@ -9,7 +10,7 @@ use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig}
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use super::endpoint::{EndpointConfig, InboundPacket, RoutedRtpPacket};
 use super::stats::EndpointStats;
@@ -35,11 +36,33 @@ pub struct WebRtcEndpoint {
     pub pending_offer: Option<SdpPendingOffer>,
     /// Baseline direction this endpoint uses in auto mode.
     auto_direction: EndpointDirection,
+    /// When the most-recent negotiation attempt (initial offer/answer, re-offer,
+    /// or ICE restart) started. Cleared when str0m reports the endpoint
+    /// connected (or disconnected). Used by the connecting-watchdog to detect
+    /// negotiations that never reach Connected.
+    pub connecting_since: Option<Instant>,
+    /// Whether the watchdog has already WARN'd for the current `connecting_since`
+    /// period. Reset whenever a new negotiation begins.
+    pub connecting_warned: bool,
+    /// Whether a packet-input error has already been WARN'd for the current
+    /// negotiation attempt. Reset whenever a new negotiation begins so a
+    /// re-attempt after errors can produce a fresh WARN.
+    pub packet_error_warned: bool,
     /// Handle to the recv task (aborted on drop)
     recv_task: Option<tokio::task::JoinHandle<()>>,
     /// Cancellation token for cooperative recv task shutdown (cloned in start_recv_task, cancelled in drop)
     #[allow(dead_code)]
     cancel_token: CancellationToken,
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        s
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.as_str()
+    } else {
+        "non-string panic payload"
+    }
 }
 
 impl WebRtcEndpoint {
@@ -72,9 +95,22 @@ impl WebRtcEndpoint {
             audio_mid: None,
             pending_offer: None,
             auto_direction: config.direction,
+            connecting_since: None,
+            connecting_warned: false,
+            packet_error_warned: false,
             recv_task: None,
             cancel_token: CancellationToken::new(),
         })
+    }
+
+    /// Mark the start of a negotiation attempt for the connecting-watchdog.
+    /// Called from create_offer / from_offer / accept_answer / accept_offer /
+    /// ice_restart on success. Resets `connecting_warned` and
+    /// `packet_error_warned` so the next stall produces a fresh WARN.
+    fn mark_negotiation_started(&mut self) {
+        self.connecting_since = Some(Instant::now());
+        self.connecting_warned = false;
+        self.packet_error_warned = false;
     }
 
     pub fn set_direction_override(&mut self, update: EndpointDirectionUpdate) {
@@ -125,32 +161,61 @@ impl WebRtcEndpoint {
         let token = self.cancel_token.clone();
 
         let handle = tokio::spawn(async move {
-            let mut buf = vec![0u8; 4096];
-            loop {
-                tokio::select! {
-                    result = socket.recv_from(&mut buf) => {
-                        match result {
-                            Ok((n, source)) => {
-                                let packet = InboundPacket {
-                                    endpoint_id,
-                                    source,
-                                    data: buf[..n].to_vec(),
-                                    is_rtcp: false,
-                                };
-                                if packet_tx.send(packet).await.is_err() {
-                                    break; // Session dropped
+            let result = std::panic::AssertUnwindSafe(async move {
+                let mut buf = vec![0u8; 4096];
+                let mut exit_reason = "cancelled";
+                loop {
+                    tokio::select! {
+                        result = socket.recv_from(&mut buf) => {
+                            match result {
+                                Ok((n, source)) => {
+                                    let packet = InboundPacket {
+                                        endpoint_id,
+                                        source,
+                                        data: buf[..n].to_vec(),
+                                        is_rtcp: false,
+                                    };
+                                    if packet_tx.send(packet).await.is_err() {
+                                        exit_reason = "session_dropped";
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(endpoint_id = %endpoint_id, error = %e, "UDP recv error");
+                                    exit_reason = "udp_error";
+                                    break;
                                 }
                             }
-                            Err(e) => {
-                                warn!(endpoint_id = %endpoint_id, error = %e, "UDP recv error");
-                                break;
-                            }
+                        }
+                        _ = token.cancelled() => {
+                            break;
                         }
                     }
-                    _ = token.cancelled() => {
-                        break;
-                    }
                 }
+
+                if exit_reason == "cancelled" {
+                    debug!(
+                        endpoint_id = %endpoint_id,
+                        reason = exit_reason,
+                        "WebRTC recv task exiting"
+                    );
+                } else {
+                    info!(
+                        endpoint_id = %endpoint_id,
+                        reason = exit_reason,
+                        "WebRTC recv task exiting"
+                    );
+                }
+            })
+            .catch_unwind()
+            .await;
+
+            if let Err(payload) = result {
+                error!(
+                    endpoint_id = %endpoint_id,
+                    panic = %panic_payload_message(payload.as_ref()),
+                    "WebRTC recv task panicked"
+                );
             }
         });
 
@@ -182,6 +247,7 @@ impl WebRtcEndpoint {
         let answer_str = answer.to_sdp_string();
 
         endpoint.state = EndpointState::Connecting;
+        endpoint.mark_negotiation_started();
         endpoint.start_recv_task(packet_tx);
 
         Ok((endpoint, answer_str))
@@ -216,6 +282,7 @@ impl WebRtcEndpoint {
         endpoint.audio_mid = Some(mid);
 
         endpoint.state = EndpointState::Connecting;
+        endpoint.mark_negotiation_started();
         endpoint.start_recv_task(packet_tx);
 
         Ok((endpoint, offer_str))
@@ -235,6 +302,10 @@ impl WebRtcEndpoint {
 
         self.rtc.sdp_api().accept_answer(pending, answer)?;
 
+        // Restart the watchdog so a stall after the answer is applied is
+        // measured from now, not from the original offer.
+        self.mark_negotiation_started();
+
         Ok(())
     }
 
@@ -250,6 +321,16 @@ impl WebRtcEndpoint {
         // If we had a local offer in flight, a remote offer supersedes it.
         // Dropping pending_offer is equivalent to rolling back the local offer.
         self.pending_offer = None;
+        // Only arm the watchdog for re-offers received before we ever finished
+        // the initial handshake. A re-offer on an already-Connected endpoint is
+        // often a pure SDP/direction change that does NOT trigger a new ICE or
+        // DTLS completion event — arming the watchdog there would false-positive
+        // 15s later. True ICE-restart re-offers on a Connected transport are
+        // accepted as a known blind spot here; ours go through `ice_restart()`
+        // which does arm.
+        if self.state != EndpointState::Connected {
+            self.mark_negotiation_started();
+        }
 
         Ok(answer.to_sdp_string())
     }
@@ -264,6 +345,9 @@ impl WebRtcEndpoint {
 
         let offer_str = offer.to_sdp_string();
         self.pending_offer = Some(pending);
+        // Re-arm the watchdog: an ICE restart that never re-converges is
+        // exactly the kind of silent stall this is meant to catch.
+        self.mark_negotiation_started();
         Ok(offer_str)
     }
 
@@ -315,6 +399,8 @@ impl WebRtcEndpoint {
                         debug!(endpoint_id = %self.id, "WebRTC connected");
                         let old = self.state;
                         self.state = EndpointState::Connected;
+                        self.connecting_since = None;
+                        self.connecting_warned = false;
                         events.push(WebRtcEvent::StateChanged {
                             old,
                             new: self.state,
@@ -323,7 +409,28 @@ impl WebRtcEndpoint {
                     Event::IceConnectionStateChange(ice_state) => {
                         debug!(endpoint_id = %self.id, ?ice_state, "ICE state change");
                         match ice_state {
+                            IceConnectionState::Checking => {
+                                // str0m enters Checking whenever a new ICE
+                                // attempt begins — initial handshake AND every
+                                // ICE restart (str0m's agent emits this on the
+                                // restart entry point). Use it as the canonical
+                                // arm signal: it catches remote-initiated ICE
+                                // restarts via `accept_offer` (where we skip
+                                // arming in the post-Connected pure-SDP case)
+                                // without false-positiving on those pure-SDP
+                                // re-offers, which do NOT emit Checking.
+                                self.connecting_since = Some(Instant::now());
+                                self.connecting_warned = false;
+                                self.packet_error_warned = false;
+                            }
                             IceConnectionState::Connected | IceConnectionState::Completed => {
+                                // Always disarm the watchdog on a successful ICE
+                                // (re-)connection, even if our top-level state is
+                                // already Connected — a post-Connected ICE restart
+                                // re-arms the watchdog while leaving `state`
+                                // unchanged, and we still need to clear it here.
+                                self.connecting_since = None;
+                                self.connecting_warned = false;
                                 if self.state != EndpointState::Connected {
                                     let old = self.state;
                                     self.state = EndpointState::Connected;
@@ -334,6 +441,12 @@ impl WebRtcEndpoint {
                                 }
                             }
                             IceConnectionState::Disconnected => {
+                                // Disarm watchdog regardless of prior state — a
+                                // disconnect means there's no longer an in-flight
+                                // attempt to wait for, even from a no-op
+                                // Disconnected→Disconnected event.
+                                self.connecting_since = None;
+                                self.connecting_warned = false;
                                 if self.state != EndpointState::Disconnected {
                                     let old = self.state;
                                     self.state = EndpointState::Disconnected;

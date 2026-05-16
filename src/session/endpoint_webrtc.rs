@@ -104,8 +104,12 @@ impl WebRtcEndpoint {
     }
 
     /// Mark the start of a negotiation attempt for the connecting-watchdog.
-    /// Called from create_offer / from_offer / accept_answer / accept_offer /
-    /// ice_restart on success. Resets `connecting_warned` and
+    /// Called only from sites where negotiation is genuinely in flight
+    /// (remote credentials known, ICE can progress): from_offer, accept_answer,
+    /// accept_offer. NOT called from create_offer or ice_restart, where the
+    /// offer can sit indefinitely without a counter-answer (e.g. ring-no-answer
+    /// or caller hangup) — those rely on accept_answer / IceConnectionState::
+    /// Checking to arm at the right moment. Resets `connecting_warned` and
     /// `packet_error_warned` so the next stall produces a fresh WARN.
     fn mark_negotiation_started(&mut self) {
         self.connecting_since = Some(Instant::now());
@@ -282,7 +286,11 @@ impl WebRtcEndpoint {
         endpoint.audio_mid = Some(mid);
 
         endpoint.state = EndpointState::Connecting;
-        endpoint.mark_negotiation_started();
+        // Watchdog is NOT armed here: a created offer that the caller never
+        // answers (hangup during ringing, ring-no-answer) would otherwise
+        // false-fire at 15s. Negotiation only becomes "in flight" when the
+        // answer arrives (accept_answer) or ICE moves to Checking — both arm
+        // the watchdog at the right moment.
         endpoint.start_recv_task(packet_tx);
 
         Ok((endpoint, offer_str))
@@ -325,9 +333,8 @@ impl WebRtcEndpoint {
         // the initial handshake. A re-offer on an already-Connected endpoint is
         // often a pure SDP/direction change that does NOT trigger a new ICE or
         // DTLS completion event — arming the watchdog there would false-positive
-        // 15s later. True ICE-restart re-offers on a Connected transport are
-        // accepted as a known blind spot here; ours go through `ice_restart()`
-        // which does arm.
+        // 15s later. True ICE-restart re-offers on a Connected transport are a
+        // known blind spot here.
         if self.state != EndpointState::Connected {
             self.mark_negotiation_started();
         }
@@ -345,9 +352,10 @@ impl WebRtcEndpoint {
 
         let offer_str = offer.to_sdp_string();
         self.pending_offer = Some(pending);
-        // Re-arm the watchdog: an ICE restart that never re-converges is
-        // exactly the kind of silent stall this is meant to catch.
-        self.mark_negotiation_started();
+        // Watchdog is NOT armed here: like create_offer, the restart offer
+        // can sit indefinitely if the remote never answers. Arming happens
+        // on accept_answer or when ICE re-enters Checking — both fire only
+        // once the negotiation is genuinely in flight.
         Ok(offer_str)
     }
 
@@ -412,16 +420,27 @@ impl WebRtcEndpoint {
                             IceConnectionState::Checking => {
                                 // str0m enters Checking whenever a new ICE
                                 // attempt begins — initial handshake AND every
-                                // ICE restart (str0m's agent emits this on the
-                                // restart entry point). Use it as the canonical
-                                // arm signal: it catches remote-initiated ICE
-                                // restarts via `accept_offer` (where we skip
-                                // arming in the post-Connected pure-SDP case)
-                                // without false-positiving on those pure-SDP
-                                // re-offers, which do NOT emit Checking.
-                                self.connecting_since = Some(Instant::now());
-                                self.connecting_warned = false;
-                                self.packet_error_warned = false;
+                                // ICE restart. Use it as the canonical arm
+                                // signal: catches remote-initiated ICE restarts
+                                // via `accept_offer` (where we skip arming in
+                                // the post-Connected pure-SDP case) without
+                                // false-positiving on those pure-SDP re-offers,
+                                // which do NOT emit Checking.
+                                //
+                                // GATED on `pending_offer.is_none()`: str0m's
+                                // ICE agent will transition New→Checking on its
+                                // own timeout regardless of whether remote
+                                // credentials have arrived. For the offerer
+                                // flow, `pending_offer` stays Some until
+                                // accept_answer runs, so we skip arming here
+                                // and let accept_answer be the canonical arm
+                                // point. Otherwise an unanswered offer (e.g.
+                                // ring-no-answer) would false-fire at 15s.
+                                if self.pending_offer.is_none() {
+                                    self.connecting_since = Some(Instant::now());
+                                    self.connecting_warned = false;
+                                    self.packet_error_warned = false;
+                                }
                             }
                             IceConnectionState::Connected | IceConnectionState::Completed => {
                                 // Always disarm the watchdog on a successful ICE
@@ -881,6 +900,53 @@ mod tests {
         assert!(
             client_rtp_count > 0,
             "spy phone must receive RTP from the session mix"
+        );
+    }
+
+    /// Regression: create_offer must NOT arm the connecting-watchdog. The
+    /// offer can sit indefinitely without a counter-answer (ring-no-answer,
+    /// caller hangup), and str0m's ICE agent will independently transition
+    /// New→Checking on its own timer. Both paths previously armed the
+    /// watchdog, causing false `webrtc_connecting_stuck` increments on
+    /// every unanswered call. Verifies the fix on both sites:
+    ///   1. create_offer no longer calls mark_negotiation_started.
+    ///   2. Event::IceConnectionStateChange(Checking) skips arming while
+    ///      pending_offer.is_some().
+    #[tokio::test]
+    async fn test_create_offer_does_not_arm_watchdog_before_answer() {
+        let id = uuid::Uuid::new_v4();
+        let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let (tx, _rx) = mpsc::channel(16);
+
+        let (mut ep, _offer_sdp) =
+            WebRtcEndpoint::create_offer(id, EndpointDirection::SendRecv, bind_addr, tx)
+                .await
+                .expect("create_offer should succeed");
+
+        assert!(
+            ep.connecting_since.is_none(),
+            "watchdog must not be armed at create_offer time"
+        );
+        assert!(
+            ep.pending_offer.is_some(),
+            "pending_offer must be Some while waiting for the answer"
+        );
+
+        // Drive str0m well past the point where its ICE agent would emit
+        // Checking on its own (handle_timeout-driven New→Checking transition).
+        // With pending_offer.is_some(), the Checking arm site must skip.
+        let start = Instant::now();
+        for i in 0..200 {
+            let now = start + std::time::Duration::from_millis(i * 100);
+            let _ = ep.handle_timeout(now);
+            let _ = ep.poll_output();
+        }
+
+        assert!(
+            ep.connecting_since.is_none(),
+            "watchdog must NOT be armed by str0m's pre-answer Checking transition \
+             while pending_offer is still Some (regression for unanswered-call \
+             false positive)"
         );
     }
 }

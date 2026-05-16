@@ -351,7 +351,16 @@ pub fn cache_key(url: &str) -> String {
 fn url_hash(url: &str) -> String {
     use sha1::Digest;
     let hash = sha1::Sha1::digest(url.as_bytes());
-    format!("{hash:040x}")
+    hex_lower(&hash)
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        write!(s, "{b:02x}").unwrap();
+    }
+    s
 }
 
 /// Cache key that incorporates both URL and optional headers.
@@ -375,7 +384,7 @@ fn cache_key_hash(
             hasher.update(v.as_bytes());
         }
     }
-    format!("{:040x}", hasher.finalize())
+    hex_lower(&hasher.finalize())
 }
 
 fn url_extension(url: &str) -> String {

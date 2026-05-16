@@ -4,7 +4,7 @@
 
 use aes::cipher::{KeyIvInit, StreamCipher};
 use base64::Engine;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha1::Sha1;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroize;

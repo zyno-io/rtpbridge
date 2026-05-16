@@ -15,7 +15,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time",
 tokio-util = "0.7"
 
 # WebSocket
-tokio-tungstenite = "0.26"
+tokio-tungstenite = "0.29"
 futures-util = "0.3"
 
 # Serialization
@@ -24,7 +24,7 @@ serde_json = "1"
 
 # CLI / Config
 clap = { version = "4", features = ["derive"] }
-toml = "0.8"
+toml = "1"
 
 # Logging
 tracing = "0.1"
@@ -35,10 +35,10 @@ uuid = { version = "1", features = ["v4", "serde"] }
 dashmap = "6"
 thiserror = "2"
 anyhow = "1"
-rand = "0.9"
+rand = "0.10"
 
 # WebRTC
-str0m = { version = "0.17", default-features = false, features = ["openssl", "vendored"] }
+str0m = { version = "0.19", default-features = false, features = ["openssl", "vendored"] }
 
 # Codecs
 xlaw = "0.0.3"
@@ -48,24 +48,24 @@ opus = "0.3"
 # Audio file decode
 symphonia = { version = "0.5", features = ["mp3", "ogg", "wav", "flac", "pcm", "vorbis"] }
 symphonia-adapter-libopus = { version = "0.2", default-features = false }
-reqwest = { version = "0.12", features = ["stream"] }
+reqwest = { version = "0.13", features = ["stream"] }
 
 # Recording
 pcap-file = "2.0"
 percent-encoding = "2.3"
-etherparse = "0.19"
+etherparse = "0.20"
 
 # VAD
-earshot = "1.0"
+earshot = "1.1"
 
 # Base64
 base64 = "0.22"
 
 # SRTP crypto primitives
-aes = "0.8"
-hmac = "0.12"
-sha1 = "0.10"
-ctr = "0.9"
+aes = "0.9"
+hmac = "0.13"
+sha1 = "0.11"
+ctr = "0.10"
 subtle = "2.6"
 zeroize = "1.8"
 
@@ -73,7 +73,7 @@ zeroize = "1.8"
 time = { version = "0.3", features = ["formatting"] }
 
 # Metrics
-prometheus-client = "0.22"
+prometheus-client = "0.24"
 
 [features]
 vendored-openssl = ["openssl/vendored"]
@@ -84,7 +84,7 @@ optional = true
 
 [dev-dependencies]
 portpicker = "0.1"
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 tempfile = "3"
 
 [[bench]]

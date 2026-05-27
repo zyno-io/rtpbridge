@@ -3,7 +3,7 @@ use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use super::endpoint::RoutedRtpPacket;
 use super::endpoint_enum::{Endpoint, endpoint_rtp_clock_rate};
@@ -126,6 +126,12 @@ pub async fn process_dtmf_packets(
                 .map(endpoint_rtp_clock_rate)
                 .unwrap_or(8000);
             if let Some(evt) = ds.detector.process(&pkt.payload, pkt.timestamp, clock_rate) {
+                debug!(
+                    endpoint_id = %pkt.source_endpoint_id,
+                    digit = %evt.digit,
+                    duration_ms = evt.duration_ms,
+                    "DTMF detected"
+                );
                 metrics.dtmf_events.inc();
                 super::media_session::emit_event(
                     event_tx,
@@ -178,6 +184,12 @@ pub fn check_dtmf_timeouts(
             .map(endpoint_rtp_clock_rate)
             .unwrap_or(8000);
         if let Some(evt) = ds.detector.check_timeout(clock_rate) {
+            debug!(
+                endpoint_id = %eid,
+                digit = %evt.digit,
+                duration_ms = evt.duration_ms,
+                "DTMF detected (end-bit timeout)"
+            );
             metrics.dtmf_events.inc();
             super::media_session::emit_event(
                 event_tx,

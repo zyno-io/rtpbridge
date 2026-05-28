@@ -17,6 +17,11 @@ use super::stats::EndpointStats;
 use crate::control::protocol::{
     EndpointDirection, EndpointDirectionUpdate, EndpointId, EndpointState,
 };
+use crate::media::rtcp::RtcpStats;
+
+/// RTP timestamp clock for Opus, the only audio codec we negotiate for WebRTC.
+/// Kept in sync with `endpoint_enum::endpoint_rtp_clock_rate` for WebRTC.
+const WEBRTC_OPUS_RTP_CLOCK_HZ: u32 = 48_000;
 
 /// A WebRTC endpoint backed by str0m
 pub struct WebRtcEndpoint {
@@ -24,6 +29,10 @@ pub struct WebRtcEndpoint {
     pub config: EndpointConfig,
     pub state: EndpointState,
     pub stats: EndpointStats,
+    /// RFC 3550 §A.3/A.8 inbound stats (jitter, loss, sequence tracking).
+    /// str0m computes these internally but does not expose them on
+    /// MediaIngressStats, so we run our own pass over Event::RtpPacket.
+    pub rtcp_stats: RtcpStats,
     pub rtc: Rtc,
     pub socket: Arc<UdpSocket>,
     pub local_addr: SocketAddr,
@@ -88,6 +97,7 @@ impl WebRtcEndpoint {
             config: config.clone(),
             state: EndpointState::New,
             stats: EndpointStats::new(),
+            rtcp_stats: RtcpStats::new(),
             rtc,
             socket,
             local_addr,
@@ -481,6 +491,12 @@ impl WebRtcEndpoint {
                     }
                     Event::RtpPacket(pkt) => {
                         self.stats.record_inbound(pkt.payload.len());
+                        self.rtcp_stats.record_received(
+                            pkt.header.sequence_number,
+                            pkt.header.timestamp,
+                            pkt.payload.len(),
+                            WEBRTC_OPUS_RTP_CLOCK_HZ,
+                        );
                         events.push(WebRtcEvent::RtpPacket(RoutedRtpPacket {
                             source_endpoint_id: self.id,
                             payload_type: *pkt.header.payload_type,

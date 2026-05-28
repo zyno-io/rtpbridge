@@ -107,21 +107,23 @@ impl Endpoint {
         }
     }
 
-    /// Packets lost (from RTCP stats). Only available for RTP endpoints.
+    /// Packets lost (from RTCP stats). Available for any endpoint with an
+    /// inbound RTP stream we track (plain RTP and WebRTC).
     pub fn packets_lost(&self) -> u64 {
         match self {
             Endpoint::Rtp(ep) => ep.rtcp_stats.cumulative_lost() as u64,
+            Endpoint::WebRtc(ep) => ep.rtcp_stats.cumulative_lost() as u64,
             _ => 0,
         }
     }
 
-    /// Jitter in milliseconds (from RTCP stats). Only for RTP endpoints.
+    /// Jitter in milliseconds (from RTCP stats). Available for any endpoint
+    /// with an inbound RTP stream we track (plain RTP and WebRTC).
     pub fn jitter_ms(&self) -> f64 {
         match self {
-            Endpoint::Rtp(ep) => {
-                // Jitter is accumulated in microseconds — convert to ms
-                ep.rtcp_stats.jitter as f64 / 1000.0
-            }
+            // Jitter is accumulated in microseconds — convert to ms
+            Endpoint::Rtp(ep) => ep.rtcp_stats.jitter as f64 / 1000.0,
+            Endpoint::WebRtc(ep) => ep.rtcp_stats.jitter as f64 / 1000.0,
             _ => 0.0,
         }
     }

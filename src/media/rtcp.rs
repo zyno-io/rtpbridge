@@ -140,7 +140,12 @@ impl RtcpStats {
                 let d = (transit - self.last_transit)
                     .unsigned_abs()
                     .min(u32::MAX as u64) as u32;
-                self.jitter = self.jitter.wrapping_add(d.wrapping_sub(self.jitter) >> 4);
+                // RFC 3550 A.8: J += (|D| - J) / 16. Must be signed — when |D| < J the
+                // term is negative and pulls J downward. Doing this with u32 wrapping_sub
+                // wraps to ~UINT32_MAX/16 and J diverges to ~UINT32_MAX every time |D|
+                // dips below J.
+                let delta = (d as i64 - self.jitter as i64) >> 4;
+                self.jitter = (self.jitter as i64 + delta).max(0) as u32;
             }
             self.last_transit = transit;
         }
@@ -1081,6 +1086,49 @@ mod tests {
             frac >= 250,
             "massive loss should produce fraction_lost >= 250, got {}",
             frac
+        );
+    }
+
+    #[test]
+    fn test_jitter_does_not_diverge_when_d_drops_below_j() {
+        // Regression for the u32-wrap bug in the RFC 3550 A.8 smoothing step.
+        // Drive jitter up with a burst of high-|D| arrivals, then feed perfectly
+        // periodic packets (|D| ≈ 0). The recurrence must decay J toward 0;
+        // the old code wrapped (d - J) in u32 and J diverged to near UINT32_MAX.
+        let mut stats = RtcpStats::new();
+        let clock_rate = 8000u32; // G.722's RTP timestamp clock
+
+        // Seed with one packet at ts=0.
+        stats.record_received(0, 0, 160, clock_rate);
+
+        // Burst of jittery arrivals: 50 packets where arrival time and RTP timestamp
+        // are out of step, producing large |D| values.
+        for i in 1..=50u32 {
+            let ts = i.wrapping_mul(160);
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            stats.record_received(i as u16, ts, 160, clock_rate);
+        }
+        let jittered = stats.jitter;
+        assert!(jittered > 0, "burst should drive jitter above 0");
+
+        // Now feed periodic packets (|D| ≈ 0). Jitter should decay toward 0,
+        // never exceed any sane bound, and definitely never approach UINT32_MAX.
+        for i in 51..=500u32 {
+            let ts = i.wrapping_mul(160);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            stats.record_received(i as u16, ts, 160, clock_rate);
+            assert!(
+                stats.jitter < 10_000_000,
+                "jitter must not diverge — got {} µs at iteration {}",
+                stats.jitter,
+                i
+            );
+        }
+        assert!(
+            stats.jitter < jittered,
+            "jitter should decay below its peak ({}) once arrivals become periodic, got {}",
+            jittered,
+            stats.jitter
         );
     }
 }

@@ -81,6 +81,12 @@ pub struct RtpEndpoint {
     /// or discontinuity clamps. Falls back to `clock_rate / 50` (20ms) if
     /// no sane samples have been seen yet.
     learned_step: Option<u32>,
+    /// Constant wire timestamp for the in-progress RFC 4733 telephone-event
+    /// (DTMF) event. All packets of one event share a single timestamp, so we
+    /// anchor it once on the marker packet and hold it across the redundant
+    /// and continuation packets — even while normal audio is interleaved on
+    /// the same SSRC. Re-anchored on each new event (next marker packet).
+    dtmf_wire_ts: Option<u32>,
 
     /// SRTP context for outgoing packets (None = plain RTP)
     srtp_tx: Option<SrtpContext>,
@@ -157,6 +163,7 @@ impl RtpEndpoint {
             last_source_id: None,
             last_source_ts: None,
             learned_step: None,
+            dtmf_wire_ts: None,
             srtp_tx: None,
             srtp_rx: None,
             srtp_rx_new: None,
@@ -209,6 +216,7 @@ impl RtpEndpoint {
         self.last_outbound_ts = None;
         self.last_source_id = None;
         self.last_source_ts = None;
+        self.dtmf_wire_ts = None;
         self.last_rtp_timestamp = new_ts;
         debug!(
             endpoint_id = %self.id,
@@ -1007,6 +1015,43 @@ impl RtpEndpoint {
         (outbound_ts, source_marker || marker_override)
     }
 
+    /// Wire timestamp for an outbound RFC 4733 telephone-event (DTMF) packet.
+    ///
+    /// Every packet of one event shares a single RTP timestamp. We anchor it
+    /// once on the marker packet (to the next frame past our last output, so it
+    /// sits within the shared-SSRC timeline) and hold it across the continuation
+    /// and redundant end packets.
+    ///
+    /// The anchor also *advances* `last_outbound_ts` by one frame, claiming that
+    /// slot on the wire timeline. This is deliberate and serves two ends:
+    /// - back-to-back digits during silence get distinct timestamps (without it,
+    ///   both would re-anchor to the same `last_outbound_ts + bump`, and a
+    ///   receiver would dedup the second as a redundant copy of the first);
+    /// - a DTMF-first endpoint seeds the timeline, so the following audio packet
+    ///   advances from the anchor instead of jumping to the source timestamp.
+    ///
+    /// We do NOT touch `last_source_id`/`last_source_ts`, so interleaved audio
+    /// still sees the same source and never gets a spurious talk-spurt marker —
+    /// the property that fixes the "one digit arrives as many events" bug. The
+    /// cost is a single one-frame gap in the audio timeline per digit, which is
+    /// exactly the slot the DTMF event occupies and is benign for jitter buffers.
+    fn dtmf_outbound_ts(&mut self, marker: bool, fallback_ts: u32) -> u32 {
+        // Continuation / redundant end packets reuse the held event anchor.
+        if !marker && let Some(ts) = self.dtmf_wire_ts {
+            return ts;
+        }
+        // Marker packet (or the first packet ever): (re-)anchor.
+        let bump = self
+            .learned_step
+            .unwrap_or_else(|| self.send_codec.as_ref().map_or(160, |c| c.clock_rate / 50));
+        let anchor = self
+            .last_outbound_ts
+            .map_or(fallback_ts, |t| t.wrapping_add(bump));
+        self.dtmf_wire_ts = Some(anchor);
+        self.last_outbound_ts = Some(anchor);
+        anchor
+    }
+
     /// Write an RTP packet out through this endpoint.
     ///
     /// Returns `Ok(Some(unencrypted_bytes))` with the wire-format RTP packet that
@@ -1028,11 +1073,27 @@ impl RtpEndpoint {
 
         // Anchor the wire timestamp to our own previous output. See
         // `advance_outbound_timeline` for the full rationale.
-        let (outbound_ts, marker) = self.advance_outbound_timeline(
-            packet.source_endpoint_id,
-            packet.timestamp,
-            packet.marker,
-        );
+        //
+        // Telephone-event (RFC 4733 DTMF) packets are the exception: every
+        // packet of one event shares a single RTP timestamp with the marker
+        // set only on the first. Running them through the audio timeline would
+        // treat each audio↔DTMF source switch as a new talk-spurt — forcing
+        // the marker and bumping the timestamp on every interleaved DTMF
+        // packet, so one injected digit reaches the far end as many events.
+        // Instead, anchor the event's timestamp once (to the next audio frame)
+        // and hold it constant. See `dtmf_outbound_ts`.
+        let (outbound_ts, marker) = if Some(packet.payload_type) == self.telephone_event_pt {
+            (
+                self.dtmf_outbound_ts(packet.marker, packet.timestamp),
+                packet.marker,
+            )
+        } else {
+            self.advance_outbound_timeline(
+                packet.source_endpoint_id,
+                packet.timestamp,
+                packet.marker,
+            )
+        };
 
         let unencrypted = RtpHeader::build(
             packet.payload_type,
@@ -1929,6 +1990,111 @@ mod tests {
         assert_eq!(ep.last_outbound_ts, Some(12_345));
         assert_eq!(ep.last_source_id, Some(src));
         assert_eq!(ep.last_source_ts, Some(12_345));
+    }
+
+    /// Regression: a single injected DTMF digit (one RFC 4733 event) must reach
+    /// the wire as ONE event — one marker, one constant timestamp — even when
+    /// normal audio is interleaved on the same endpoint. Previously each DTMF
+    /// packet was run through `advance_outbound_timeline`, so every audio↔DTMF
+    /// switch forced a marker + timestamp bump and the far end saw the digit
+    /// many times.
+    #[tokio::test]
+    async fn test_dtmf_event_holds_one_ts_across_interleaved_audio() {
+        let mut ep = mk_ts_endpoint(52900, 53000).await;
+        ep.telephone_event_pt = Some(101);
+        let audio_src = EndpointId::new_v4();
+
+        // Audio flowing to this endpoint establishes the timeline.
+        ep.advance_outbound_timeline(audio_src, 1000, false);
+        ep.advance_outbound_timeline(audio_src, 1160, false);
+        let audio_anchor = ep.last_outbound_ts.unwrap();
+
+        // DTMF event begins (marker packet). The injected RTP timestamp is
+        // a random value unrelated to our audio timeline.
+        let injected_ts = 0xDEAD_BEEF;
+        let dtmf_ts0 = ep.dtmf_outbound_ts(true, injected_ts);
+        assert_eq!(
+            dtmf_ts0,
+            audio_anchor.wrapping_add(160),
+            "DTMF anchors to the next audio frame, not the injected TS"
+        );
+
+        // One audio packet is interleaved between DTMF packets (the real bug
+        // trigger). It advances the audio timeline but must not disturb DTMF.
+        ep.advance_outbound_timeline(audio_src, 1320, false);
+
+        // Continuation + redundant end packets (marker=false) reuse the anchor.
+        for _ in 0..4 {
+            let ts = ep.dtmf_outbound_ts(false, injected_ts);
+            assert_eq!(ts, dtmf_ts0, "all packets of one event share one TS");
+        }
+
+        // A second injected digit (new marker) re-anchors to the now-advanced
+        // audio timeline, so it's distinct from the first event.
+        let dtmf_ts1 = ep.dtmf_outbound_ts(true, injected_ts);
+        assert_ne!(dtmf_ts1, dtmf_ts0, "a new event gets a fresh anchor");
+    }
+
+    /// Regression: two DTMF events back-to-back with NO interleaved audio must
+    /// still get distinct timestamps. The marker anchor advances
+    /// `last_outbound_ts`, so the second event re-anchors past the first instead
+    /// of reusing the same value (which a receiver would dedup as a redundant
+    /// copy of the first event).
+    #[tokio::test]
+    async fn test_dtmf_back_to_back_during_silence_distinct_ts() {
+        let mut ep = mk_ts_endpoint(53000, 53100).await;
+        ep.telephone_event_pt = Some(101);
+        let audio_src = EndpointId::new_v4();
+
+        // Establish an audio timeline, then go silent (no more audio packets).
+        ep.advance_outbound_timeline(audio_src, 1000, false);
+        let silent_anchor = ep.last_outbound_ts.unwrap();
+
+        // First digit: one marker packet + two redundant end copies.
+        let d0 = ep.dtmf_outbound_ts(true, 0xAAAA);
+        assert_eq!(d0, silent_anchor.wrapping_add(160));
+        assert_eq!(ep.dtmf_outbound_ts(false, 0xAAAA), d0);
+        assert_eq!(ep.dtmf_outbound_ts(false, 0xAAAA), d0);
+
+        // Second digit immediately after, still no audio in between.
+        let d1 = ep.dtmf_outbound_ts(true, 0xBBBB);
+        assert_eq!(d1, d0.wrapping_add(160), "second event advances past first");
+        assert_ne!(d1, d0, "back-to-back silent digits must not share a TS");
+    }
+
+    /// Regression: when the first-ever outbound packet is DTMF, it seeds the
+    /// outbound timeline (`last_outbound_ts`) so the following audio packet
+    /// advances from the DTMF anchor with a marker, rather than taking the
+    /// first-packet arm and jumping to the source timestamp under the same SSRC.
+    #[tokio::test]
+    async fn test_dtmf_first_seeds_timeline_for_following_audio() {
+        let mut ep = mk_ts_endpoint(53100, 53200).await;
+        ep.telephone_event_pt = Some(101);
+        let audio_src = EndpointId::new_v4();
+
+        // No audio yet — DTMF is the first thing out. Anchor falls back to the
+        // injected timestamp and seeds the timeline.
+        let injected_ts = 0xC0FF_EE00;
+        let d0 = ep.dtmf_outbound_ts(true, injected_ts);
+        assert_eq!(
+            d0, injected_ts,
+            "first-ever DTMF seeds from the injected TS"
+        );
+        assert_eq!(
+            ep.last_outbound_ts,
+            Some(injected_ts),
+            "DTMF must seed the outbound timeline"
+        );
+
+        // Audio now starts. It must advance from the DTMF anchor (source change
+        // → one-frame bump + marker), not jump to the source's own timestamp.
+        let (ts, marker) = ep.advance_outbound_timeline(audio_src, 5_000, false);
+        assert_eq!(
+            ts,
+            injected_ts.wrapping_add(160),
+            "audio advances from the DTMF-seeded anchor, not the source TS"
+        );
+        assert!(marker, "first audio after DTMF re-anchors with a marker");
     }
 
     #[tokio::test]

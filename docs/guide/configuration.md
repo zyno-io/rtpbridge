@@ -180,7 +180,8 @@ The HTTP recording API (`GET /recordings/{path}`, `DELETE /recordings/{path}`) a
       "endpoint_id": null
     }
   ],
-  "vad_active": ["endpoint-id-1"]
+  "vad_active": ["endpoint-id-1"],
+  "fax_detect_active": ["endpoint-id-1"]
 }
 ```
 
@@ -192,6 +193,7 @@ The HTTP recording API (`GET /recordings/{path}`, `DELETE /recordings/{path}`) a
 | `endpoints` | array | List of endpoints in the session |
 | `recordings` | array | Active recordings |
 | `vad_active` | array of strings | Endpoint IDs with active VAD |
+| `fax_detect_active` | array of strings | Endpoint IDs with active fax tone detection |
 
 ### Recording Pagination
 

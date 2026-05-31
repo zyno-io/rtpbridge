@@ -186,6 +186,8 @@ pub async fn handle_request(
         "recording.stop" => handle_recording_stop(id, req.params, state).await,
         "vad.start" => handle_vad_start(id, req.params, state).await,
         "vad.stop" => handle_vad_stop(id, req.params, state).await,
+        "fax_detect.start" => handle_fax_detect_start(id, req.params, state).await,
+        "fax_detect.stop" => handle_fax_detect_stop(id, req.params, state).await,
 
         "endpoint.create_with_file" => handle_create_with_file(id, req.params, state).await,
         "endpoint.file.seek" => handle_file_seek(id, req.params, state).await,
@@ -357,6 +359,7 @@ async fn handle_session_info(
                 endpoints: details.endpoints,
                 recordings: details.recordings,
                 vad_active: details.vad_active,
+                fax_detect_active: details.fax_detect_active,
             },
         ),
         None => Response::err(id, "SESSION_GONE", "Session no longer exists"),
@@ -1011,6 +1014,72 @@ async fn handle_vad_stop(
     {
         Ok(Ok(())) => Response::ok(id, serde_json::json!({})),
         Ok(Err(e)) => Response::err(id, "VAD_ERROR", e.to_string()),
+        Err(resp) => resp,
+    }
+}
+
+async fn handle_fax_detect_start(
+    id: String,
+    params: serde_json::Value,
+    state: &mut ConnectionState,
+) -> Response {
+    let cmd_tx = match state.require_session(&id) {
+        Ok(tx) => tx.clone(),
+        Err(resp) => return resp,
+    };
+
+    let params: FaxDetectStartParams = match serde_json::from_value(params) {
+        Ok(p) => p,
+        Err(e) => return Response::err(id, "INVALID_PARAMS", e.to_string()),
+    };
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    match send_and_recv(
+        &cmd_tx,
+        SessionCommand::FaxDetectStart {
+            reply: reply_tx,
+            endpoint_id: params.endpoint_id,
+        },
+        reply_rx,
+        &id,
+    )
+    .await
+    {
+        Ok(Ok(())) => Response::ok(id, serde_json::json!({})),
+        Ok(Err(e)) => Response::err(id, "FAX_DETECT_ERROR", e.to_string()),
+        Err(resp) => resp,
+    }
+}
+
+async fn handle_fax_detect_stop(
+    id: String,
+    params: serde_json::Value,
+    state: &mut ConnectionState,
+) -> Response {
+    let cmd_tx = match state.require_session(&id) {
+        Ok(tx) => tx.clone(),
+        Err(resp) => return resp,
+    };
+
+    let params: FaxDetectStopParams = match serde_json::from_value(params) {
+        Ok(p) => p,
+        Err(e) => return Response::err(id, "INVALID_PARAMS", e.to_string()),
+    };
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    match send_and_recv(
+        &cmd_tx,
+        SessionCommand::FaxDetectStop {
+            reply: reply_tx,
+            endpoint_id: params.endpoint_id,
+        },
+        reply_rx,
+        &id,
+    )
+    .await
+    {
+        Ok(Ok(())) => Response::ok(id, serde_json::json!({})),
+        Ok(Err(e)) => Response::err(id, "FAX_DETECT_ERROR", e.to_string()),
         Err(resp) => resp,
     }
 }

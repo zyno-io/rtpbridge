@@ -4,3 +4,7 @@ docs/.vitepress/dist
 docs/.vitepress/cache
 libnull.rlib
 /tmp
+
+# Claude Code machine-local / transient state
+.claude/scheduled_tasks.lock
+.claude/settings.local.json

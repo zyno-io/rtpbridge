@@ -1,3 +1,4 @@
+pub mod audio_analysis;
 pub mod endpoint;
 pub mod endpoint_bridge;
 pub mod endpoint_enum;
@@ -5,6 +6,7 @@ pub mod endpoint_file;
 pub mod endpoint_rtp;
 pub mod endpoint_tone;
 pub mod endpoint_webrtc;
+pub mod fax_tap;
 pub mod file_poll;
 pub mod media_session;
 pub mod mixer;

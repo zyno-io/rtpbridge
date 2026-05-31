@@ -142,6 +142,8 @@ Most methods that require a session can return `NO_SESSION` (no session bound), 
 | `recording.stop` | `INVALID_PARAMS`, `RECORDING_ERROR` |
 | `vad.start` | `INVALID_PARAMS`, `VAD_ERROR` |
 | `vad.stop` | `INVALID_PARAMS`, `VAD_ERROR` |
+| `fax_detect.start` | `INVALID_PARAMS`, `FAX_DETECT_ERROR` |
+| `fax_detect.stop` | `INVALID_PARAMS`, `FAX_DETECT_ERROR` |
 | `stats.subscribe` | `INVALID_PARAMS`, `STATS_ERROR` |
 | `stats.unsubscribe` | `STATS_ERROR` |
 

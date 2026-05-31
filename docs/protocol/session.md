@@ -85,7 +85,8 @@ Get details about the current session.
     "created_at": "1711324800s",
     "endpoints": [],
     "recordings": [],
-    "vad_active": []
+    "vad_active": [],
+    "fax_detect_active": []
   }
 }
 ```

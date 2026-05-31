@@ -121,3 +121,19 @@ Periodic silence notification.
 ```json
 {"event":"vad.silence","data":{"endpoint_id":"...","silence_duration_ms":3000}}
 ```
+
+## fax.cng_detected
+
+Fax calling tone (CNG, 1100 Hz) detected on the endpoint. See [Fax Tone Detection](fax.md).
+
+```json
+{"event":"fax.cng_detected","data":{"endpoint_id":"..."}}
+```
+
+## fax.ced_detected
+
+Fax/modem answer tone (CED, 2100 Hz) detected on the endpoint. See [Fax Tone Detection](fax.md).
+
+```json
+{"event":"fax.ced_detected","data":{"endpoint_id":"..."}}
+```

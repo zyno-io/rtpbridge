@@ -114,6 +114,7 @@ pub struct SessionInfoResult {
     pub endpoints: Vec<EndpointInfo>,
     pub recordings: Vec<RecordingInfo>,
     pub vad_active: Vec<EndpointId>,
+    pub fax_detect_active: Vec<EndpointId>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -419,6 +420,18 @@ pub struct VadStopParams {
     pub endpoint_id: EndpointId,
 }
 
+// ── Fax tone detection ──────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct FaxDetectStartParams {
+    pub endpoint_id: EndpointId,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FaxDetectStopParams {
+    pub endpoint_id: EndpointId,
+}
+
 // ── Stats ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -614,6 +627,12 @@ pub struct VadSpeechStartedData {
 pub struct VadSilenceData {
     pub endpoint_id: EndpointId,
     pub silence_duration_ms: u64,
+}
+
+/// Payload for `fax.cng_detected` and `fax.ced_detected` events.
+#[derive(Debug, Serialize)]
+pub struct FaxDetectedData {
+    pub endpoint_id: EndpointId,
 }
 
 // ── Endpoint Transfer ──────────────────────────────────────────────────

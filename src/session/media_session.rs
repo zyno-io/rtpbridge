@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+use super::audio_analysis;
 use super::endpoint::{InboundPacket, RoutedRtpPacket};
 use super::endpoint_enum::{
     Endpoint, endpoint_audio_codec, endpoint_last_rtp_timestamp, endpoint_rtp_clock_rate,
@@ -15,6 +16,7 @@ use super::endpoint_enum::{
 use super::endpoint_file::FileEndpoint;
 use super::endpoint_rtp::RtpEndpoint;
 use super::endpoint_webrtc::{WebRtcEndpoint, WebRtcEvent};
+use super::fax_tap;
 use super::file_poll::FileRtpState;
 use super::routing::RoutingTable;
 use super::session_dtmf::{EndpointDtmf, PendingDtmfInjection};
@@ -22,6 +24,7 @@ use super::vad_tap;
 use crate::control::protocol::*;
 use crate::media::codec::AudioCodec;
 use crate::media::dtmf::DtmfDetector;
+use crate::media::fax::FaxDetector;
 use crate::media::sdp;
 use crate::media::transcode::TranscodePipeline;
 use crate::media::vad::VadMonitor;
@@ -52,7 +55,8 @@ pub struct EndpointTransferBundle {
     pub source_session_id: SessionId,
     pub dtmf_state: Option<EndpointDtmf>,
     pub vad_monitor: Option<VadMonitor>,
-    pub vad_decoder: Option<Box<dyn crate::media::codec::AudioDecoder>>,
+    pub fax_detector: Option<FaxDetector>,
+    pub analysis_decoder: Option<Box<dyn crate::media::codec::AudioDecoder>>,
     pub file_rtp_state: Option<FileRtpState>,
     pub url_source: Option<String>,
     pub media_timeout_was_emitted: bool,
@@ -128,6 +132,14 @@ pub enum SessionCommand {
         speech_threshold: f32,
     },
     VadStop {
+        reply: oneshot::Sender<anyhow::Result<()>>,
+        endpoint_id: EndpointId,
+    },
+    FaxDetectStart {
+        reply: oneshot::Sender<anyhow::Result<()>>,
+        endpoint_id: EndpointId,
+    },
+    FaxDetectStop {
         reply: oneshot::Sender<anyhow::Result<()>>,
         endpoint_id: EndpointId,
     },
@@ -223,6 +235,7 @@ pub struct SessionDetails {
     pub endpoints: Vec<EndpointInfo>,
     pub recordings: Vec<crate::control::protocol::RecordingInfo>,
     pub vad_active: Vec<EndpointId>,
+    pub fax_detect_active: Vec<EndpointId>,
 }
 
 use tokio::sync::oneshot;
@@ -254,8 +267,11 @@ struct SessionState {
     tone_rtp_states: HashMap<EndpointId, super::tone_poll::ToneRtpState>,
     transcode_cache: HashMap<(EndpointId, EndpointId), CachedTranscode>,
     url_sources: HashMap<EndpointId, String>,
-    /// Per-endpoint audio decoders for VAD (needed for G.722/Opus stateful decoding)
-    vad_decoders: HashMap<EndpointId, Box<dyn crate::media::codec::AudioDecoder>>,
+    fax_detectors: HashMap<EndpointId, FaxDetector>,
+    /// Per-endpoint audio decoders shared by VAD and fax detection. Inbound RTP
+    /// is decoded to PCM once per packet (needed for G.722/Opus stateful
+    /// decoding) and fed to whichever analysers are active.
+    analysis_decoders: HashMap<EndpointId, Box<dyn crate::media::codec::AudioDecoder>>,
     /// Tracks endpoints that have already emitted a media_timeout event.
     /// Cleared when the endpoint receives a packet again.
     media_timeout_emitted: std::collections::HashSet<EndpointId>,
@@ -462,6 +478,12 @@ impl SessionState {
             }
             SessionCommand::VadStop { reply, endpoint_id } => {
                 let _ = reply.send(self.handle_vad_stop(endpoint_id));
+            }
+            SessionCommand::FaxDetectStart { reply, endpoint_id } => {
+                let _ = reply.send(self.handle_fax_detect_start(endpoint_id));
+            }
+            SessionCommand::FaxDetectStop { reply, endpoint_id } => {
+                let _ = reply.send(self.handle_fax_detect_stop(endpoint_id));
             }
             SessionCommand::CreateWithFile {
                 reply,
@@ -1157,7 +1179,8 @@ impl SessionState {
         // Extract ancillary state
         let dtmf_state = self.dtmf_state.remove(&endpoint_id);
         let vad_monitor = self.vad_monitors.remove(&endpoint_id);
-        let vad_decoder = self.vad_decoders.remove(&endpoint_id);
+        let fax_detector = self.fax_detectors.remove(&endpoint_id);
+        let analysis_decoder = self.analysis_decoders.remove(&endpoint_id);
         let file_rtp_state = self.file_rtp_states.remove(&endpoint_id);
         let url_source = self.url_sources.remove(&endpoint_id);
         let media_timeout_was_emitted = self.media_timeout_emitted.remove(&endpoint_id);
@@ -1209,7 +1232,8 @@ impl SessionState {
             source_session_id: self.session_id,
             dtmf_state,
             vad_monitor,
-            vad_decoder,
+            fax_detector,
+            analysis_decoder,
             file_rtp_state,
             url_source,
             media_timeout_was_emitted,
@@ -1267,8 +1291,11 @@ impl SessionState {
         if let Some(vad) = bundle.vad_monitor.take() {
             self.vad_monitors.insert(endpoint_id, vad);
         }
-        if let Some(dec) = bundle.vad_decoder.take() {
-            self.vad_decoders.insert(endpoint_id, dec);
+        if let Some(fax) = bundle.fax_detector.take() {
+            self.fax_detectors.insert(endpoint_id, fax);
+        }
+        if let Some(dec) = bundle.analysis_decoder.take() {
+            self.analysis_decoders.insert(endpoint_id, dec);
         }
         if let Some(frs) = bundle.file_rtp_state.take() {
             self.file_rtp_states.insert(endpoint_id, frs);
@@ -1575,7 +1602,35 @@ impl SessionState {
     }
 
     fn handle_vad_stop(&mut self, endpoint_id: EndpointId) -> anyhow::Result<()> {
-        vad_tap::vad_stop(&mut self.vad_monitors, &mut self.vad_decoders, endpoint_id)
+        let result = vad_tap::vad_stop(&mut self.vad_monitors, endpoint_id);
+        self.prune_analysis_decoder(endpoint_id);
+        result
+    }
+
+    // ── Fax tone detection ───────────────────────────────────────────
+
+    fn handle_fax_detect_start(&mut self, endpoint_id: EndpointId) -> anyhow::Result<()> {
+        fax_tap::fax_start(&self.endpoints, &mut self.fax_detectors, endpoint_id)
+    }
+
+    fn handle_fax_detect_stop(&mut self, endpoint_id: EndpointId) -> anyhow::Result<()> {
+        let result = fax_tap::fax_stop(&mut self.fax_detectors, endpoint_id);
+        self.prune_analysis_decoder(endpoint_id);
+        result
+    }
+
+    /// Drop the shared analysis decoder once no analyser (VAD or fax) remains
+    /// on the endpoint. The decoder is stateful (G.722/Opus) and is not fed
+    /// while no analyser is active, so a stale instance must not survive to be
+    /// reused by a later `vad.start`/`fax_detect.start` — that would decode a
+    /// discontinuous bitstream and corrupt the PCM. While one analyser is still
+    /// active the decoder keeps being fed, so it stays valid and is retained.
+    fn prune_analysis_decoder(&mut self, endpoint_id: EndpointId) {
+        if !self.vad_monitors.contains_key(&endpoint_id)
+            && !self.fax_detectors.contains_key(&endpoint_id)
+        {
+            self.analysis_decoders.remove(&endpoint_id);
+        }
     }
 
     // ── WebRTC / SRTP ───────────────────────────────────────────────
@@ -1752,6 +1807,7 @@ impl SessionState {
             endpoints: ep_infos,
             recordings: self.recording_mgr.active_recordings(),
             vad_active: self.vad_monitors.keys().cloned().collect(),
+            fax_detect_active: self.fax_detectors.keys().cloned().collect(),
         }
     }
 
@@ -1770,7 +1826,8 @@ impl SessionState {
             self.dtmf_injection = None;
         }
         self.vad_monitors.remove(&endpoint_id);
-        self.vad_decoders.remove(&endpoint_id);
+        self.fax_detectors.remove(&endpoint_id);
+        self.analysis_decoders.remove(&endpoint_id);
         self.file_rtp_states.remove(&endpoint_id);
         self.tone_rtp_states.remove(&endpoint_id);
         self.media_timeout_emitted.remove(&endpoint_id);
@@ -1953,7 +2010,8 @@ pub async fn run_media_session(
         tone_rtp_states: HashMap::new(),
         transcode_cache: HashMap::new(),
         url_sources: HashMap::new(),
-        vad_decoders: HashMap::new(),
+        fax_detectors: HashMap::new(),
+        analysis_decoders: HashMap::new(),
         media_timeout_emitted: std::collections::HashSet::new(),
         dtmf_injection: None,
         last_timeout_check: Instant::now(),
@@ -2099,7 +2157,8 @@ pub async fn run_media_session(
             &state.dropped_events,
             &mut state.recording_mgr,
             &mut state.vad_monitors,
-            &mut state.vad_decoders,
+            &mut state.fax_detectors,
+            &mut state.analysis_decoders,
             &state.metrics,
             inbound_rtp,
             &mut state.file_rtp_states,
@@ -2130,6 +2189,7 @@ pub async fn run_media_session(
             &state.dropped_events,
             &state.metrics,
         );
+        fax_tap::check_fax_timeouts(&mut state.fax_detectors);
         super::session_dtmf::check_dtmf_timeouts(
             &mut state.dtmf_state,
             &state.endpoints,
@@ -2340,7 +2400,8 @@ async fn poll_and_route(
     dropped_events: &AtomicU64,
     recording_mgr: &mut RecordingManager,
     vad_monitors: &mut HashMap<EndpointId, VadMonitor>,
-    vad_decoders: &mut HashMap<EndpointId, Box<dyn crate::media::codec::AudioDecoder>>,
+    fax_detectors: &mut HashMap<EndpointId, FaxDetector>,
+    analysis_decoders: &mut HashMap<EndpointId, Box<dyn crate::media::codec::AudioDecoder>>,
     metrics: &crate::metrics::Metrics,
     inbound_rtp: Vec<RoutedRtpPacket>,
     file_rtp_states: &mut HashMap<EndpointId, FileRtpState>,
@@ -2465,12 +2526,13 @@ async fn poll_and_route(
         }
     }
 
-    // VAD tap: feed decoded PCM to VAD monitors
-    vad_tap::process_vad(
+    // Analysis tap: decode each packet to PCM once and feed VAD + fax detectors.
+    audio_analysis::process_analysis(
         &packets_to_route,
         endpoints,
         vad_monitors,
-        vad_decoders,
+        fax_detectors,
+        analysis_decoders,
         event_tx,
         dropped_events,
         metrics,
@@ -2882,7 +2944,8 @@ mod tests {
             tone_rtp_states: HashMap::new(),
             transcode_cache: HashMap::new(),
             url_sources: HashMap::new(),
-            vad_decoders: HashMap::new(),
+            fax_detectors: HashMap::new(),
+            analysis_decoders: HashMap::new(),
             media_timeout_emitted: std::collections::HashSet::new(),
             dtmf_injection: None,
             last_timeout_check: Instant::now(),
@@ -2994,6 +3057,56 @@ mod tests {
         let result = state.handle_vad_stop(EndpointId::new_v4());
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("VAD not active"));
+    }
+
+    #[test]
+    fn test_vad_stop_prunes_shared_decoder_when_no_fax() {
+        // VAD is the only analyser → stopping it must drop the shared decoder so
+        // a later vad.start gets a fresh (non-stale) stateful decoder.
+        let mut state = test_session_state();
+        let eid = EndpointId::new_v4();
+        state
+            .vad_monitors
+            .insert(eid, VadMonitor::new(16000, 0.5, 1000));
+        state.analysis_decoders.insert(
+            eid,
+            crate::media::codec::make_decoder(AudioCodec::G722).unwrap(),
+        );
+
+        state.handle_vad_stop(eid).unwrap();
+        assert!(
+            !state.analysis_decoders.contains_key(&eid),
+            "decoder should be pruned when no analyser remains"
+        );
+    }
+
+    #[test]
+    fn test_vad_stop_keeps_shared_decoder_when_fax_active() {
+        // Fax detection still active → the decoder is still being fed, so it
+        // must be retained when VAD stops.
+        let mut state = test_session_state();
+        let eid = EndpointId::new_v4();
+        state
+            .vad_monitors
+            .insert(eid, VadMonitor::new(16000, 0.5, 1000));
+        state.fax_detectors.insert(eid, FaxDetector::new(16000));
+        state.analysis_decoders.insert(
+            eid,
+            crate::media::codec::make_decoder(AudioCodec::G722).unwrap(),
+        );
+
+        state.handle_vad_stop(eid).unwrap();
+        assert!(
+            state.analysis_decoders.contains_key(&eid),
+            "decoder must be retained while fax detection is still active"
+        );
+
+        // Stopping fax too now prunes it.
+        state.handle_fax_detect_stop(eid).unwrap();
+        assert!(
+            !state.analysis_decoders.contains_key(&eid),
+            "decoder should be pruned once the last analyser stops"
+        );
     }
 
     #[test]
@@ -3276,21 +3389,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cleanup_endpoint_state_removes_vad_decoder() {
+    async fn test_cleanup_endpoint_state_removes_analysis_decoder() {
         let mut state = test_session_state();
         let eid = EndpointId::new_v4();
 
-        // Add a VAD decoder
-        state.vad_decoders.insert(
+        // Add a shared analysis decoder
+        state.analysis_decoders.insert(
             eid,
             crate::media::codec::make_decoder(AudioCodec::Pcmu).unwrap(),
         );
-        assert!(state.vad_decoders.contains_key(&eid));
+        assert!(state.analysis_decoders.contains_key(&eid));
 
         state.cleanup_endpoint_state(eid).await;
         assert!(
-            !state.vad_decoders.contains_key(&eid),
-            "cleanup should remove VAD decoder"
+            !state.analysis_decoders.contains_key(&eid),
+            "cleanup should remove the shared analysis decoder"
         );
     }
 

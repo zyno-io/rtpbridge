@@ -51,3 +51,4 @@ Full plan at `~/.claude/plans/happy-finding-abelson.md`. Progress tracked in Cla
 - Empty session event: `session.empty_timeout` (fired when `empty_session_timeout_secs` triggers)
 - `endpoint.create_tone` creates a tone generator (sendonly): `tone` = `ringback`/`ringing`/`busy`/`beep`/`sine`, optional `frequency` (for sine), optional `duration_ms`
 - Tone finished event: `endpoint.tone.finished` (fired when `duration_ms` expires)
+- `fax_detect.start`/`fax_detect.stop` arm Goertzel fax-tone detection on an endpoint (CNG 1100Hz, CED 2100Hz). Events: `fax.cng_detected`, `fax.ced_detected`. Detection is notification-only (no T.38/passthrough action). VAD and fax share one PCM decode per packet via `session/audio_analysis.rs`; `feed_vad`/`feed_fax` consume that PCM. `fax_detect_active` lists monitored endpoints in `session.info`.

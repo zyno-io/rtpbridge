@@ -1,5 +1,6 @@
 pub mod codec;
 pub mod dtmf;
+pub mod fax;
 pub mod resample;
 pub mod rtcp;
 pub mod rtp;

@@ -340,6 +340,7 @@ async fn handle_http_request(
                         "endpoints": details.endpoints,
                         "recordings": details.recordings,
                         "vad_active": details.vad_active,
+                        "fax_detect_active": details.fax_detect_active,
                     });
                     (
                         "200 OK",

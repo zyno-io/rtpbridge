@@ -115,6 +115,8 @@ All communication uses JSON over WebSocket. Each connection is bound to exactly 
 | `recording.stop` | Stop recording |
 | `vad.start` | Start voice activity detection on endpoint |
 | `vad.stop` | Stop voice activity detection |
+| `fax_detect.start` | Start fax tone detection (CNG/CED) on endpoint |
+| `fax_detect.stop` | Stop fax tone detection |
 | `stats.subscribe` | Subscribe to periodic session statistics |
 | `stats.unsubscribe` | Unsubscribe from statistics |
 
@@ -137,6 +139,8 @@ All communication uses JSON over WebSocket. Each connection is bound to exactly 
 | `stats` | Periodic session statistics |
 | `vad.speech_started` | Speech detected after silence |
 | `vad.silence` | Periodic silence notification |
+| `fax.cng_detected` | Fax calling tone (CNG, 1100 Hz) detected |
+| `fax.ced_detected` | Fax/modem answer tone (CED, 2100 Hz) detected |
 
 See [Events Reference](docs/protocol/events.md) for detailed payload schemas.
 

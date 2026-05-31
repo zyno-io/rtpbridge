@@ -123,6 +123,12 @@ impl TestRtpPeer {
 
     /// Send RTP packets with a 440Hz sine tone encoded as PCMU for the given duration
     pub async fn send_tone_for(&mut self, duration: Duration) {
+        self.send_tone_freq_for(440.0, duration).await;
+    }
+
+    /// Send RTP packets with a sine tone at `freq_hz` encoded as PCMU for the
+    /// given duration. Used by fax-detection tests (CNG=1100Hz, CED=2100Hz).
+    pub async fn send_tone_freq_for(&mut self, freq_hz: f64, duration: Duration) {
         let ptime = Duration::from_millis(20);
         let mut elapsed = Duration::ZERO;
         while elapsed < duration {
@@ -130,7 +136,7 @@ impl TestRtpPeer {
                 .map(|i| {
                     let t = (self.timestamp as f64 + i as f64) / 8000.0;
                     let sample =
-                        (f64::sin(2.0 * std::f64::consts::PI * 440.0 * t) * 16000.0) as i16;
+                        (f64::sin(2.0 * std::f64::consts::PI * freq_hz * t) * 16000.0) as i16;
                     linear_to_ulaw(sample)
                 })
                 .collect();

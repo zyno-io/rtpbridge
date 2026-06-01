@@ -195,6 +195,7 @@ pub async fn handle_request(
         "endpoint.file.resume" => handle_file_resume(id, req.params, state).await,
 
         "endpoint.create_tone" => handle_create_tone(id, req.params, state).await,
+        "endpoint.create_websocket" => handle_create_websocket(id, req.params, state).await,
 
         "endpoint.ice_restart" => handle_ice_restart(id, req.params, state).await,
         "endpoint.webrtc.ice_restart" => handle_ice_restart(id, req.params, state).await,
@@ -1181,6 +1182,61 @@ async fn handle_create_tone(
             EndpointCreateToneResult {
                 endpoint_id,
                 tone: tone_type,
+            },
+        ),
+        Ok(Err(e)) => Response::err(id, "ENDPOINT_ERROR", e.to_string()),
+        Err(resp) => resp,
+    }
+}
+
+async fn handle_create_websocket(
+    id: String,
+    params: serde_json::Value,
+    state: &mut ConnectionState,
+) -> Response {
+    let cmd_tx = match state.require_session(&id) {
+        Ok(tx) => tx.clone(),
+        Err(resp) => return resp,
+    };
+
+    let params: EndpointCreateWebSocketParams = match serde_json::from_value(params) {
+        Ok(p) => p,
+        Err(e) => return Response::err(id, "INVALID_PARAMS", e.to_string()),
+    };
+
+    if !matches!(params.sample_rate, 8000 | 16000 | 48000) {
+        return Response::err(
+            id,
+            "INVALID_PARAMS",
+            "sample_rate must be 8000, 16000, or 48000",
+        );
+    }
+    if !params.flush_ms.is_multiple_of(20) {
+        return Response::err(id, "INVALID_PARAMS", "flush_ms must be a multiple of 20");
+    }
+    if params.flush_ms > 1000 {
+        return Response::err(id, "INVALID_PARAMS", "flush_ms must not exceed 1000");
+    }
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    match send_and_recv(
+        &cmd_tx,
+        SessionCommand::CreateWebSocket {
+            reply: reply_tx,
+            direction: params.direction,
+            sample_rate: params.sample_rate,
+            flush_ms: params.flush_ms,
+        },
+        reply_rx,
+        &id,
+    )
+    .await
+    {
+        Ok(Ok((endpoint_id, connect_token))) => Response::ok(
+            id,
+            EndpointCreateWebSocketResult {
+                endpoint_id,
+                connect_token: connect_token.to_string(),
             },
         ),
         Ok(Err(e)) => Response::err(id, "ENDPOINT_ERROR", e.to_string()),

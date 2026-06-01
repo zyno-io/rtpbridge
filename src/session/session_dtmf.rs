@@ -96,7 +96,10 @@ pub async fn drain_dtmf_injection(
             let result: anyhow::Result<Option<Vec<u8>>> = match ep {
                 Endpoint::WebRtc(wep) => wep.write_rtp(pkt).map(|()| None),
                 Endpoint::Rtp(rep) => rep.write_rtp(pkt).await,
-                Endpoint::File(_) | Endpoint::Tone(_) | Endpoint::Bridge(_) => Ok(None),
+                Endpoint::File(_)
+                | Endpoint::Tone(_)
+                | Endpoint::Bridge(_)
+                | Endpoint::WebSocket(_) => Ok(None),
             };
             if let Err(e) = result {
                 warn!(endpoint_id = %injection.endpoint_id, error = %e, "DTMF inject write error");
@@ -158,7 +161,10 @@ pub async fn process_dtmf_packets(
                     let result: anyhow::Result<Option<Vec<u8>>> = match dest_ep {
                         Endpoint::WebRtc(wep) => wep.write_rtp(&forwarded).map(|()| None),
                         Endpoint::Rtp(rep) => rep.write_rtp(&forwarded).await,
-                        Endpoint::File(_) | Endpoint::Tone(_) | Endpoint::Bridge(_) => Ok(None),
+                        Endpoint::File(_)
+                        | Endpoint::Tone(_)
+                        | Endpoint::Bridge(_)
+                        | Endpoint::WebSocket(_) => Ok(None),
                     };
                     if let Err(e) = result {
                         warn!(dst = %dest_id, error = %e, "DTMF forward error");

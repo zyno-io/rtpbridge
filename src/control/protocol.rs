@@ -256,6 +256,29 @@ pub struct EndpointCreateToneResult {
     pub tone: crate::session::endpoint_tone::ToneType,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct EndpointCreateWebSocketParams {
+    #[serde(default = "default_direction")]
+    pub direction: EndpointDirection,
+    /// Wire PCM sample rate in Hz (8000 / 16000 / 48000). Mono, 16-bit LE.
+    #[serde(default = "default_ws_sample_rate")]
+    pub sample_rate: u32,
+    /// Outbound coalescing window in ms (multiple of 20). 0 = passthrough.
+    #[serde(default)]
+    pub flush_ms: u32,
+}
+
+fn default_ws_sample_rate() -> u32 {
+    8000
+}
+
+#[derive(Debug, Serialize)]
+pub struct EndpointCreateWebSocketResult {
+    pub endpoint_id: EndpointId,
+    /// Single-use token; the audio peer dials in to `/audio/<connect_token>`.
+    pub connect_token: String,
+}
+
 fn default_timeout_ms() -> u32 {
     10000
 }
@@ -632,6 +655,18 @@ pub struct VadSilenceData {
 /// Payload for `fax.cng_detected` and `fax.ced_detected` events.
 #[derive(Debug, Serialize)]
 pub struct FaxDetectedData {
+    pub endpoint_id: EndpointId,
+}
+
+/// Payload for `endpoint.ws.connected` (audio socket attached).
+#[derive(Debug, Serialize)]
+pub struct WsConnectedData {
+    pub endpoint_id: EndpointId,
+}
+
+/// Payload for `endpoint.ws.disconnected` (audio socket closed).
+#[derive(Debug, Serialize)]
+pub struct WsDisconnectedData {
     pub endpoint_id: EndpointId,
 }
 

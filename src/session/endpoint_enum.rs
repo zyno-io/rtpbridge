@@ -6,6 +6,7 @@ use super::endpoint_file::FileEndpoint;
 use super::endpoint_rtp::RtpEndpoint;
 use super::endpoint_tone::ToneEndpoint;
 use super::endpoint_webrtc::WebRtcEndpoint;
+use super::endpoint_websocket::WebSocketEndpoint;
 use super::stats::EndpointStats;
 use crate::control::protocol::{EndpointDirection, EndpointId, EndpointState};
 use crate::media::codec::AudioCodec;
@@ -17,6 +18,7 @@ pub enum Endpoint {
     File(Box<FileEndpoint>),
     Tone(Box<ToneEndpoint>),
     Bridge(Box<BridgeEndpoint>),
+    WebSocket(Box<WebSocketEndpoint>),
 }
 
 impl Endpoint {
@@ -27,6 +29,7 @@ impl Endpoint {
             Endpoint::File(ep) => ep.id,
             Endpoint::Tone(ep) => ep.id,
             Endpoint::Bridge(ep) => ep.id,
+            Endpoint::WebSocket(ep) => ep.id,
         }
     }
 
@@ -37,6 +40,7 @@ impl Endpoint {
             Endpoint::File(ep) => ep.config.direction,
             Endpoint::Tone(ep) => ep.config.direction,
             Endpoint::Bridge(ep) => ep.config.direction,
+            Endpoint::WebSocket(ep) => ep.config.direction,
         }
     }
 
@@ -47,6 +51,7 @@ impl Endpoint {
             Endpoint::File(ep) => ep.state,
             Endpoint::Tone(ep) => ep.state,
             Endpoint::Bridge(ep) => ep.state,
+            Endpoint::WebSocket(ep) => ep.state,
         }
     }
 
@@ -57,6 +62,7 @@ impl Endpoint {
             Endpoint::File(ep) => &ep.stats,
             Endpoint::Tone(ep) => &ep.stats,
             Endpoint::Bridge(ep) => &ep.stats,
+            Endpoint::WebSocket(ep) => &ep.stats,
         }
     }
 
@@ -64,7 +70,10 @@ impl Endpoint {
         match self {
             Endpoint::WebRtc(ep) => ep.accept_answer(sdp),
             Endpoint::Rtp(ep) => ep.accept_answer(sdp),
-            Endpoint::File(_) | Endpoint::Tone(_) | Endpoint::Bridge(_) => Err(anyhow::anyhow!(
+            Endpoint::File(_)
+            | Endpoint::Tone(_)
+            | Endpoint::Bridge(_)
+            | Endpoint::WebSocket(_) => Err(anyhow::anyhow!(
                 "This endpoint type doesn't accept SDP answers"
             )),
         }
@@ -88,7 +97,10 @@ impl Endpoint {
         match self {
             Endpoint::WebRtc(_) => Some(101),
             Endpoint::Rtp(ep) => ep.telephone_event_pt,
-            Endpoint::File(_) | Endpoint::Tone(_) | Endpoint::Bridge(_) => None,
+            Endpoint::File(_)
+            | Endpoint::Tone(_)
+            | Endpoint::Bridge(_)
+            | Endpoint::WebSocket(_) => None,
         }
     }
 
@@ -104,6 +116,7 @@ impl Endpoint {
             Endpoint::File(ep) => format!("pcm/{}Hz", ep.sample_rate()),
             Endpoint::Tone(ep) => format!("tone/{}Hz", ep.sample_rate()),
             Endpoint::Bridge(_) => "L16/48000".to_string(),
+            Endpoint::WebSocket(ep) => ep.codec_label(),
         }
     }
 
@@ -146,6 +159,7 @@ impl Endpoint {
         match self {
             Endpoint::WebRtc(ep) => ep.stop_recv_tasks().await,
             Endpoint::Rtp(ep) => ep.stop_recv_tasks().await,
+            Endpoint::WebSocket(ep) => ep.stop_io_task().await,
             Endpoint::File(_) | Endpoint::Tone(_) | Endpoint::Bridge(_) => {} // no recv tasks
         }
     }
@@ -155,7 +169,11 @@ impl Endpoint {
         match self {
             Endpoint::WebRtc(ep) => ep.restart_recv_tasks(packet_tx),
             Endpoint::Rtp(ep) => ep.restart_recv_tasks(packet_tx),
-            Endpoint::File(_) | Endpoint::Tone(_) | Endpoint::Bridge(_) => {} // no recv tasks
+            // WebSocket endpoints can't be transferred, so this is never reached for them.
+            Endpoint::File(_)
+            | Endpoint::Tone(_)
+            | Endpoint::Bridge(_)
+            | Endpoint::WebSocket(_) => {}
         }
     }
 }
@@ -171,6 +189,7 @@ pub fn endpoint_audio_codec(ep: &Endpoint) -> Option<AudioCodec> {
         Endpoint::File(_) => Some(AudioCodec::Pcmu),
         Endpoint::Tone(_) => Some(AudioCodec::Pcmu),
         Endpoint::Bridge(_) => Some(AudioCodec::L16),
+        Endpoint::WebSocket(_) => Some(AudioCodec::L16),
     }
 }
 
@@ -182,6 +201,7 @@ pub fn endpoint_send_pt(ep: &Endpoint) -> Option<u8> {
         Endpoint::File(_) => Some(0),
         Endpoint::Tone(_) => Some(0),
         Endpoint::Bridge(_) => Some(127),
+        Endpoint::WebSocket(_) => Some(127),
     }
 }
 
@@ -197,6 +217,7 @@ pub fn endpoint_rtp_clock_rate(ep: &Endpoint) -> u32 {
         Endpoint::File(_) => 8000,
         Endpoint::Tone(_) => 8000,
         Endpoint::Bridge(_) => 48000,
+        Endpoint::WebSocket(_) => 48000,
     }
 }
 

@@ -16,6 +16,7 @@ use super::endpoint_enum::{
 use super::endpoint_file::FileEndpoint;
 use super::endpoint_rtp::RtpEndpoint;
 use super::endpoint_webrtc::{WebRtcEndpoint, WebRtcEvent};
+use super::endpoint_websocket::{AudioWsStream, WebSocketEndpoint};
 use super::fax_tap;
 use super::file_poll::FileRtpState;
 use super::routing::RoutingTable;
@@ -42,6 +43,7 @@ fn endpoint_type_label(endpoint: &Endpoint) -> &'static str {
         Endpoint::File(_) => "file",
         Endpoint::Tone(_) => "tone",
         Endpoint::Bridge(_) => "bridge",
+        Endpoint::WebSocket(_) => "websocket",
     }
 }
 
@@ -227,6 +229,26 @@ pub enum SessionCommand {
         reply: oneshot::Sender<anyhow::Result<EndpointId>>,
         bridge: super::endpoint_bridge::BridgeEndpoint,
     },
+    /// Create a WebSocket audio endpoint (dial-in). Returns (endpoint_id, connect_token).
+    CreateWebSocket {
+        reply: oneshot::Sender<anyhow::Result<(EndpointId, uuid::Uuid)>>,
+        direction: EndpointDirection,
+        sample_rate: u32,
+        flush_ms: u32,
+    },
+    /// Bind a dialed-in audio WebSocket to its endpoint. `ws`/`permit` are dropped
+    /// (closing the socket, releasing the slot) if the endpoint is gone or already bound.
+    AttachWebSocketAudio {
+        reply: oneshot::Sender<anyhow::Result<()>>,
+        endpoint_id: EndpointId,
+        // Boxed: a WebSocketStream is large and would bloat every SessionCommand.
+        ws: Box<AudioWsStream>,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    },
+    /// Notification from a WS audio IO task that its socket closed.
+    WebSocketDisconnected {
+        endpoint_id: EndpointId,
+    },
 }
 
 /// Detailed session state returned by GetInfo
@@ -286,7 +308,14 @@ struct SessionState {
     /// Per-destination audio mixers for multi-party conferences (3+ endpoints).
     /// Active only for destinations receiving from 2+ sources.
     mixers: HashMap<EndpointId, super::mixer::DestinationMixer>,
+    /// Shared registry of pending WebSocket audio connect tokens. The session
+    /// inserts a token per WS endpoint and removes it on endpoint/session teardown.
+    ws_audio_registry: Arc<crate::control::ws_audio::WsAudioRegistry>,
 }
+
+/// A WS audio endpoint that never receives its dial-in within this window is
+/// auto-removed, freeing its endpoint slot and pending connect token.
+const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Event names that should be routed to the critical channel first.
 const CRITICAL_EVENTS: &[&str] = &[
@@ -612,6 +641,35 @@ impl SessionState {
                     self.metrics.endpoints_active.inc();
                 }
                 let _ = reply.send(result);
+            }
+            SessionCommand::CreateWebSocket {
+                reply,
+                direction,
+                sample_rate,
+                flush_ms,
+            } => {
+                let result = self.handle_create_websocket(direction, sample_rate, flush_ms);
+                if result.is_ok() {
+                    self.metrics.endpoints_total.inc();
+                    self.metrics.endpoints_active.inc();
+                }
+                let _ = reply.send(result);
+            }
+            SessionCommand::AttachWebSocketAudio {
+                reply,
+                endpoint_id,
+                ws,
+                permit,
+            } => {
+                let _ = reply.send(self.handle_attach_websocket_audio(
+                    endpoint_id,
+                    *ws,
+                    permit,
+                    packet_tx,
+                ));
+            }
+            SessionCommand::WebSocketDisconnected { endpoint_id } => {
+                self.handle_websocket_disconnected(endpoint_id);
             }
         }
         true
@@ -1079,6 +1137,120 @@ impl SessionState {
         Ok(id)
     }
 
+    fn handle_create_websocket(
+        &mut self,
+        direction: EndpointDirection,
+        sample_rate: u32,
+        flush_ms: u32,
+    ) -> anyhow::Result<(EndpointId, uuid::Uuid)> {
+        if self.max_endpoints > 0 && self.endpoints.len() >= self.max_endpoints {
+            anyhow::bail!("max endpoints reached");
+        }
+        let id = EndpointId::new_v4();
+        let ep = WebSocketEndpoint::new(id, direction, sample_rate, flush_ms);
+        let token = ep.connect_token;
+        self.endpoints.insert(id, Endpoint::WebSocket(Box::new(ep)));
+        // Register the single-use connect token so the dialed-in audio socket
+        // can be routed back to this session and endpoint.
+        self.ws_audio_registry.insert(
+            token,
+            crate::control::ws_audio::WsAudioTicket {
+                cmd_tx: self.cmd_tx.clone(),
+                session_id: self.session_id,
+                endpoint_id: id,
+            },
+        );
+        // Endpoint is Connecting (not yet routed) until the audio socket attaches.
+        self.rebuild_routing();
+        info!(
+            session_id = %self.session_id,
+            endpoint_id = %id,
+            endpoint_type = "websocket",
+            sample_rate,
+            flush_ms,
+            "websocket endpoint created (awaiting audio connection)"
+        );
+        Ok((id, token))
+    }
+
+    fn handle_attach_websocket_audio(
+        &mut self,
+        endpoint_id: EndpointId,
+        ws: AudioWsStream,
+        permit: tokio::sync::OwnedSemaphorePermit,
+        packet_tx: &mpsc::Sender<InboundPacket>,
+    ) -> anyhow::Result<()> {
+        let cmd_tx = self.cmd_tx.clone();
+        match self.endpoints.get_mut(&endpoint_id) {
+            Some(Endpoint::WebSocket(wsep)) => {
+                wsep.attach_io(ws, packet_tx.clone(), cmd_tx, permit)?;
+            }
+            Some(_) => anyhow::bail!("endpoint is not a websocket endpoint"),
+            None => anyhow::bail!("Endpoint not found"),
+        }
+        // Now Connected — include it in routing and notify the controller.
+        self.rebuild_routing();
+        self.send_event("endpoint.ws.connected", WsConnectedData { endpoint_id });
+        info!(
+            session_id = %self.session_id,
+            endpoint_id = %endpoint_id,
+            "websocket audio connected"
+        );
+        Ok(())
+    }
+
+    /// Remove WS endpoints stuck in `Connecting` past the dial-in deadline,
+    /// reclaiming their endpoint slot and connect token.
+    async fn check_ws_connect_timeouts(&mut self) {
+        let now = Instant::now();
+        let expired: Vec<EndpointId> = self
+            .endpoints
+            .iter()
+            .filter_map(|(id, ep)| match ep {
+                Endpoint::WebSocket(w)
+                    if w.state == EndpointState::Connecting
+                        && now.duration_since(w.stats.created_at) >= WS_CONNECT_TIMEOUT =>
+                {
+                    Some(*id)
+                }
+                _ => None,
+            })
+            .collect();
+        for id in expired {
+            warn!(
+                session_id = %self.session_id,
+                endpoint_id = %id,
+                "websocket endpoint dial-in timed out; removing"
+            );
+            self.send_event(
+                "endpoint.ws.connect_timeout",
+                WsDisconnectedData { endpoint_id: id },
+            );
+            let _ = self.handle_remove_endpoint(id).await;
+        }
+    }
+
+    fn handle_websocket_disconnected(&mut self, endpoint_id: EndpointId) {
+        // Only acts if the endpoint still exists (it may have been removed, which
+        // is what triggered the IO task to exit in the first place).
+        if let Some(Endpoint::WebSocket(wsep)) = self.endpoints.get_mut(&endpoint_id) {
+            if wsep.state == EndpointState::Disconnected {
+                return; // already handled
+            }
+            wsep.state = EndpointState::Disconnected;
+            self.rebuild_routing();
+            self.send_event(
+                "endpoint.ws.disconnected",
+                WsDisconnectedData { endpoint_id },
+            );
+            info!(
+                session_id = %self.session_id,
+                endpoint_id = %endpoint_id,
+                "websocket audio disconnected"
+            );
+        }
+    }
+
     async fn handle_remove_endpoint(&mut self, endpoint_id: EndpointId) -> anyhow::Result<()> {
         if let Some(ep) = self.endpoints.get(&endpoint_id) {
             let ep_type = match ep {
@@ -1087,6 +1259,7 @@ impl SessionState {
                 Endpoint::File(_) => "file",
                 Endpoint::Tone(_) => "tone",
                 Endpoint::Bridge(_) => "bridge",
+                Endpoint::WebSocket(_) => "websocket",
             };
             info!(
                 session_id = %self.session_id,
@@ -1096,6 +1269,10 @@ impl SessionState {
             );
         }
         let mut removed = self.endpoints.remove(&endpoint_id);
+        // Drop any pending WS audio connect token so it can't be claimed after removal.
+        if let Some(Endpoint::WebSocket(ref wsep)) = removed {
+            self.ws_audio_registry.remove(&wsep.connect_token);
+        }
         // Explicitly clean up shared playback subscriber before general cleanup,
         // so the async ref_count decrement happens reliably (not via Drop spawn).
         if let Some(Endpoint::File(ref mut fep)) = removed
@@ -1149,9 +1326,9 @@ impl SessionState {
         // Reject file/tone endpoints
         if matches!(
             self.endpoints.get(&endpoint_id),
-            Some(Endpoint::File(_) | Endpoint::Tone(_))
+            Some(Endpoint::File(_) | Endpoint::Tone(_) | Endpoint::WebSocket(_))
         ) {
-            anyhow::bail!("File endpoints cannot be transferred");
+            anyhow::bail!("File, tone, and websocket endpoints cannot be transferred");
         }
 
         let mut endpoint = self
@@ -1165,6 +1342,7 @@ impl SessionState {
             Endpoint::File(_) => "file",
             Endpoint::Tone(_) => "tone",
             Endpoint::Bridge(_) => "bridge",
+            Endpoint::WebSocket(_) => "websocket",
         };
         info!(
             session_id = %self.session_id,
@@ -1259,6 +1437,7 @@ impl SessionState {
             Endpoint::File(_) => "file",
             Endpoint::Tone(_) => "tone",
             Endpoint::Bridge(_) => "bridge",
+            Endpoint::WebSocket(_) => "websocket",
         };
 
         info!(
@@ -1684,6 +1863,9 @@ impl SessionState {
             Some(Endpoint::Bridge(bep)) => {
                 bep.set_direction_override(direction);
             }
+            Some(Endpoint::WebSocket(wsep)) => {
+                wsep.set_direction_override(direction);
+            }
             Some(Endpoint::File(_) | Endpoint::Tone(_)) => {
                 anyhow::bail!("Cannot update direction on file/tone endpoints");
             }
@@ -1787,6 +1969,9 @@ impl SessionState {
                     Endpoint::Tone(_) => ("tone".to_string(), None, None),
                     Endpoint::Bridge(_) => {
                         ("bridge".to_string(), Some("L16/48000".to_string()), None)
+                    }
+                    Endpoint::WebSocket(w) => {
+                        ("websocket".to_string(), Some(w.codec_label()), None)
                     }
                 };
                 EndpointInfo {
@@ -1961,6 +2146,7 @@ pub async fn run_media_session(
     transcode_cache_size: usize,
     metrics: Arc<crate::metrics::Metrics>,
     shared_playback: Arc<crate::playback::shared_playback::SharedPlaybackManager>,
+    ws_audio_registry: Arc<crate::control::ws_audio::WsAudioRegistry>,
     cmd_tx: mpsc::Sender<SessionCommand>,
     mut cmd_rx: mpsc::Receiver<SessionCommand>,
 ) {
@@ -2017,6 +2203,7 @@ pub async fn run_media_session(
         last_timeout_check: Instant::now(),
         empty_since: Some(Instant::now()),
         mixers: HashMap::new(),
+        ws_audio_registry,
     };
 
     info!(session_id = %session_id, "media session started");
@@ -2181,6 +2368,7 @@ pub async fn run_media_session(
                 &state.metrics,
             );
             check_connecting_watchdog(&mut state.endpoints, &state.metrics);
+            state.check_ws_connect_timeouts().await;
             state.last_timeout_check = Instant::now();
         }
         vad_tap::check_vad_timeouts(
@@ -2269,6 +2457,11 @@ pub async fn run_media_session(
             }
         }
     }
+
+    // Drop all pending WS audio connect tokens for this session up front, before
+    // the teardown awaits below, so a racing audio connect can't claim a token
+    // for a session that has stopped servicing commands.
+    state.ws_audio_registry.remove_session(&session_id);
 
     let stopped_recs = state.recording_mgr.stop_all();
     for info in &stopped_recs {
@@ -2380,6 +2573,15 @@ fn handle_inbound_packet(
                         marker: false,
                         payload: pkt.data.clone(),
                     }),
+                    None,
+                    None,
+                );
+            }
+            Endpoint::WebSocket(wsep) => {
+                // Inbound 48kHz L16 frame from the WS IO task. Synthesize a
+                // monotonic RTP timeline (Bridge's ts=0 would freeze downstream).
+                return (
+                    Some(wsep.build_inbound_packet(pkt.data.clone())),
                     None,
                     None,
                 );
@@ -2684,6 +2886,7 @@ async fn poll_and_route(
                         Endpoint::Rtp(rep) => rep.write_rtp(&routed).await,
                         Endpoint::File(_) | Endpoint::Tone(_) => Ok(None),
                         Endpoint::Bridge(bep) => bep.write_rtp(&routed).await.map(|()| None),
+                        Endpoint::WebSocket(wsep) => wsep.write_rtp(&routed),
                     };
                     match result {
                         Err(e) => {
@@ -2717,6 +2920,7 @@ async fn poll_and_route(
                     Endpoint::Rtp(rep) => rep.write_rtp(&routed).await,
                     Endpoint::File(_) | Endpoint::Tone(_) => Ok(None),
                     Endpoint::Bridge(bep) => bep.write_rtp(&routed).await.map(|()| None),
+                    Endpoint::WebSocket(wsep) => wsep.write_rtp(&routed),
                 };
                 match result {
                     Err(e) => warn!(dst = %dest_id, error = %e, "mixer route error"),
@@ -2954,6 +3158,7 @@ mod tests {
             ),
             empty_since: None,
             mixers: HashMap::new(),
+            ws_audio_registry: Arc::new(crate::control::ws_audio::WsAudioRegistry::new()),
         }
     }
 

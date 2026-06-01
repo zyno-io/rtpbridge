@@ -85,8 +85,10 @@ pub async fn run_websocket_server(
                 let ws_max_size = ws_max_message_size_kb;
 
                 tokio::spawn(async move {
-                    handle_incoming(stream, peer_addr, manager, shutdown, metrics, recording_dir, ws_max_size, max_recording_download_bytes, ws_ping_interval_secs, event_channel_size, critical_event_channel_size).await;
-                    drop(permit); // release connection slot
+                    // The permit travels with the connection: for control/HTTP it drops
+                    // when handle_incoming returns; for an audio WS it is handed to the
+                    // endpoint's IO task and held for the audio socket's lifetime.
+                    handle_incoming(stream, peer_addr, manager, shutdown, metrics, recording_dir, ws_max_size, max_recording_download_bytes, ws_ping_interval_secs, event_channel_size, critical_event_channel_size, permit).await;
                 });
             }
             _ = shutdown.wait_for_shutdown() => {
@@ -127,12 +129,15 @@ async fn handle_incoming(
     ws_ping_interval_secs: u64,
     event_channel_size: usize,
     critical_event_channel_size: usize,
+    permit: tokio::sync::OwnedSemaphorePermit,
 ) {
     // Classify the connection as HTTP or WebSocket within 5 seconds.
     // Only the peek/classification is time-bounded; HTTP handlers run without timeout.
     enum Classification {
         Http(String, String),
-        NotHttp,
+        /// Not an HTTP REST request (WebSocket upgrade or unknown). Carries the
+        /// request target path if one could be parsed, for audio-plane routing.
+        NotHttp(Option<String>),
         PeekFailed,
     }
 
@@ -146,11 +151,17 @@ async fn handle_incoming(
         let request_line = String::from_utf8_lossy(&peek_buf[..n]);
         match extract_http_request(&request_line) {
             Some((method, path)) => Classification::Http(method, path),
-            _ => Classification::NotHttp,
+            None => Classification::NotHttp(extract_request_path(&request_line)),
         }
     })
     .await;
 
+    // Request path for an inbound WebSocket, captured during classification and
+    // used to route audio-plane connections (`/audio/<token>`) vs control. The
+    // HTTP / failure arms diverge (return); only the WebSocket arm assigns it,
+    // so the late init can't be folded into the match expression.
+    #[allow(clippy::needless_late_init)]
+    let ws_path: Option<String>;
     match classification {
         Ok(Classification::Http(method, path)) => {
             // HTTP route — consume the peeked request, handle it, and respond.
@@ -180,9 +191,8 @@ async fn handle_incoming(
             debug!(peer = %peer_addr, "connection timed out during HTTP classification");
             return;
         }
-        Ok(Classification::NotHttp) => {
-            // Fall through to WebSocket upgrade
-        }
+        // Fall through to WebSocket upgrade, remembering the request path.
+        Ok(Classification::NotHttp(path)) => ws_path = path,
     }
 
     // WebSocket upgrade with timeout to prevent slowloris-style DoS on the handshake.
@@ -197,16 +207,27 @@ async fn handle_incoming(
     .await;
     match ws_result {
         Ok(Ok(ws)) => {
-            handle_connection(
-                ws,
-                peer_addr,
-                manager,
-                shutdown,
-                ws_ping_interval_secs,
-                event_channel_size,
-                critical_event_channel_size,
-            )
-            .await;
+            // Any `/audio/...` path is an audio-plane connection (handed to the owning
+            // session, or rejected if the token is malformed/unknown). Everything else
+            // is a control connection.
+            match ws_path.as_deref().and_then(classify_audio_path) {
+                Some(token) => {
+                    crate::control::ws_audio::handle_audio_connection(ws, token, permit, &manager)
+                        .await;
+                }
+                None => {
+                    handle_connection(
+                        ws,
+                        peer_addr,
+                        manager,
+                        shutdown,
+                        ws_ping_interval_secs,
+                        event_channel_size,
+                        critical_event_channel_size,
+                    )
+                    .await;
+                }
+            }
         }
         Ok(Err(e)) => {
             debug!(peer = %peer_addr, error = %e, "WebSocket handshake failed");
@@ -215,6 +236,30 @@ async fn handle_incoming(
             debug!(peer = %peer_addr, "WebSocket handshake timed out");
         }
     }
+}
+
+/// Path prefix for WebSocket audio-plane connections.
+const AUDIO_PATH_PREFIX: &str = "/audio/";
+
+/// Extract the request-target path from an HTTP/WS request's first line.
+fn extract_request_path(data: &str) -> Option<String> {
+    let first_line = data.lines().next()?;
+    let mut parts = first_line.split_whitespace();
+    let method = parts.next()?;
+    if method != "GET" {
+        return None;
+    }
+    parts.next().map(|target| target.to_string())
+}
+
+/// Classify a WS request path. Returns `None` for non-audio (control) paths;
+/// `Some(Some(token))` for a well-formed `/audio/<uuid>`; `Some(None)` for an
+/// `/audio/...` path whose token is malformed (still an audio-plane request, to
+/// be rejected rather than mistaken for control).
+fn classify_audio_path(path: &str) -> Option<Option<Uuid>> {
+    let path = path.split('?').next().unwrap_or(path);
+    let rest = path.strip_prefix(AUDIO_PATH_PREFIX)?;
+    Some(Uuid::parse_str(rest).ok())
 }
 
 /// Extract the method and path from an HTTP request line, if not a WS upgrade

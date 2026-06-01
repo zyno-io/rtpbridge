@@ -6,6 +6,7 @@ pub mod endpoint_file;
 pub mod endpoint_rtp;
 pub mod endpoint_tone;
 pub mod endpoint_webrtc;
+pub mod endpoint_websocket;
 pub mod fax_tap;
 pub mod file_poll;
 pub mod media_session;
@@ -82,6 +83,8 @@ pub struct SessionManager {
     recording_dir: PathBuf,
     /// Atomic session count for race-free max_sessions enforcement
     session_count: AtomicUsize,
+    /// Pending WebSocket audio connect tokens (dial-in rendezvous)
+    ws_audio_registry: Arc<crate::control::ws_audio::WsAudioRegistry>,
 }
 
 impl SessionManager {
@@ -135,11 +138,17 @@ impl SessionManager {
             ),
             recording_dir,
             session_count: AtomicUsize::new(0),
+            ws_audio_registry: Arc::new(crate::control::ws_audio::WsAudioRegistry::new()),
         }))
     }
 
     pub fn recording_dir(&self) -> &Path {
         &self.recording_dir
+    }
+
+    /// Pending WebSocket audio connect tokens (used by the audio-plane handler).
+    pub fn ws_audio_registry(&self) -> &Arc<crate::control::ws_audio::WsAudioRegistry> {
+        &self.ws_audio_registry
     }
 
     /// Maximum SDP size in bytes (derived from max_sdp_size_kb config)
@@ -194,6 +203,7 @@ impl SessionManager {
         let transcode_cache_size = self.transcode_cache_size;
         let metrics = Arc::clone(&self.metrics);
         let shared_playback = Arc::clone(&self.shared_playback);
+        let ws_audio_registry = Arc::clone(&self.ws_audio_registry);
         let session_span = tracing::info_span!("session", %session_id);
         // Drop guard ensures session cleanup runs even if the media task panics.
         // On normal completion, the guard runs when it goes out of scope after
@@ -218,6 +228,9 @@ impl SessionManager {
                     manager.session_count.fetch_sub(1, Ordering::AcqRel);
                     manager.shutdown.session_ended();
                     metrics.sessions_active.dec();
+                    // Drop any pending WS audio connect tokens for this session, so
+                    // they can't outlive it even on the panic/abort path.
+                    manager.ws_audio_registry.remove_session(&session_id);
                 }));
                 let result = std::panic::AssertUnwindSafe(media_session::run_media_session(
                     session_id,
@@ -236,6 +249,7 @@ impl SessionManager {
                     transcode_cache_size,
                     Arc::clone(&metrics),
                     shared_playback,
+                    ws_audio_registry,
                     cmd_tx_clone,
                     cmd_rx,
                 ))
@@ -487,6 +501,7 @@ mod tests {
             ),
             recording_dir: std::env::temp_dir().join("rtpbridge_test_recordings"),
             session_count: AtomicUsize::new(0),
+            ws_audio_registry: Arc::new(crate::control::ws_audio::WsAudioRegistry::new()),
         })
     }
 

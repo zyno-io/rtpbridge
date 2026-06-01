@@ -112,8 +112,9 @@ async fn ws_audio_routes_pcm_between_two_ws_endpoints() {
         .map(|c| i16::from_le_bytes([c[0], c[1]]))
         .collect();
     let mean = samples.iter().map(|&s| s as i64).sum::<i64>() / samples.len() as i64;
-    // 8k->48k->8k roundtrip of a constant preserves the DC level (a few
-    // boundary samples are near zero, so use a loose floor well above silence).
+    // Both legs are 8 kHz, so this now routes as L16{8000} passthrough (no
+    // resampling); a constant DC level is preserved (a few boundary samples are
+    // near zero, so use a loose floor well above silence).
     assert!(
         mean > 500,
         "expected ~1000 DC level routed through, got mean {mean} over {} samples",

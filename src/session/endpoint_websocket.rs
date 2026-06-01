@@ -15,18 +15,11 @@ use super::stats::EndpointStats;
 use crate::control::protocol::{
     EndpointDirection, EndpointDirectionUpdate, EndpointId, EndpointState,
 };
-use crate::media::resample::Resampler;
 
 /// The concrete WebSocket type handed to a WS audio endpoint after the
 /// HTTP upgrade completes on the control/HTTP listener.
 pub type AudioWsStream = WebSocketStream<TcpStream>;
 
-/// Internal audio runs at 48 kHz L16 (PT 127), identical to bridge endpoints.
-const INTERNAL_RATE: u32 = 48_000;
-/// PCM samples in one 20 ms frame at the internal rate.
-const FRAME_SAMPLES_48K: usize = (INTERNAL_RATE / 50) as usize; // 960
-/// RTP timestamp ticks per 20 ms frame at the internal clock.
-const TS_STEP: u32 = FRAME_SAMPLES_48K as u32; // 960
 /// L16 payload type used internally (matches bridge endpoints).
 const L16_PT: u8 = 127;
 /// Bounded outbound queue (session -> IO task), in 20 ms frames (~2 s).
@@ -34,14 +27,18 @@ const OUTBOUND_QUEUE_FRAMES: usize = 100;
 
 /// A WebSocket audio-streaming endpoint.
 ///
-/// Internally this is an L16@48k endpoint (PT 127), like [`super::endpoint_bridge::BridgeEndpoint`],
-/// but its transport is a WebSocket binary stream rather than an in-process channel, and it
-/// synthesizes its own monotonic inbound RTP timeline (Bridge's `ts=0` would freeze the wire
-/// timestamp at any downstream RTP endpoint — see `RtpEndpoint::advance_outbound_timeline`).
+/// Internally this is an L16 endpoint (PT 127) at the wire `sample_rate`, like
+/// [`super::endpoint_bridge::BridgeEndpoint`] (which is pinned to 48 kHz), but its transport is a
+/// WebSocket binary stream rather than an in-process channel, and it synthesizes its own monotonic
+/// inbound RTP timeline (Bridge's `ts=0` would freeze the wire timestamp at any downstream RTP
+/// endpoint — see `RtpEndpoint::advance_outbound_timeline`). Running internally at the wire rate
+/// means the session's per-edge resampling converts to peers directly (e.g. 16 kHz↔8 kHz) instead
+/// of detouring every frame through 48 kHz.
 ///
 /// The peer dials in to `/audio/<connect_token>`; the audio socket is then handed to this
 /// endpoint via [`WebSocketEndpoint::attach_io`], which spawns a single IO task that pumps
-/// audio in both directions, resampling between the wire `sample_rate` and the internal 48 kHz.
+/// audio in both directions, reframing the wire stream into 20 ms L16 packets (no resampling —
+/// the internal rate is the wire rate).
 pub struct WebSocketEndpoint {
     pub id: EndpointId,
     pub config: EndpointConfig,
@@ -62,7 +59,7 @@ pub struct WebSocketEndpoint {
     in_ts: u32,
     in_ssrc: u32,
 
-    /// Session -> IO task: 48 kHz L16 frames awaiting WS transmission.
+    /// Session -> IO task: native-rate L16 frames awaiting WS transmission.
     outbound_tx: mpsc::Sender<Vec<u8>>,
     /// Taken by `attach_io` when the audio socket connects.
     outbound_rx: Option<mpsc::Receiver<Vec<u8>>>,
@@ -119,9 +116,10 @@ impl WebSocketEndpoint {
     }
 
     /// Queue an outbound frame for the WS peer. The routed payload is already
-    /// L16@48k (the WS endpoint's send codec), so the IO task only resamples to
-    /// the wire rate. Returns `Ok(None)` — nothing is written to the wire here
-    /// (no recording tap), matching bridge semantics. Drops newest on full.
+    /// native-rate L16 (the WS endpoint's send codec), so the IO task only
+    /// reframes/coalesces for the wire. Returns `Ok(None)` — nothing is written
+    /// to the wire here (no recording tap), matching bridge semantics. Drops
+    /// newest on full.
     pub fn write_rtp(&mut self, packet: &RoutedRtpPacket) -> anyhow::Result<Option<Vec<u8>>> {
         match self.outbound_tx.try_send(packet.payload.clone()) {
             Ok(()) => self.stats.record_outbound(packet.payload.len()),
@@ -135,8 +133,10 @@ impl WebSocketEndpoint {
         Ok(None)
     }
 
-    /// Build the next inbound `RoutedRtpPacket` from one 48 kHz L16 frame, advancing
-    /// the synthesized monotonic timeline (`ts += 960`, `seq += 1`).
+    /// Build the next inbound `RoutedRtpPacket` from one native-rate L16 frame,
+    /// advancing the synthesized monotonic timeline (`ts += sample_rate/50`,
+    /// `seq += 1`). The timestamp step matches the endpoint's RTP clock rate
+    /// (= `sample_rate`), so downstream timestamp scaling stays consistent.
     pub fn build_inbound_packet(&mut self, payload: Vec<u8>) -> RoutedRtpPacket {
         self.stats.record_inbound(payload.len());
         let pkt = RoutedRtpPacket {
@@ -149,7 +149,7 @@ impl WebSocketEndpoint {
             payload,
         };
         self.in_seq = self.in_seq.wrapping_add(1);
-        self.in_ts = self.in_ts.wrapping_add(TS_STEP);
+        self.in_ts = self.in_ts.wrapping_add(self.sample_rate / 50);
         pkt
     }
 
@@ -237,7 +237,8 @@ fn samples_to_l16(samples: &[i16], out: &mut Vec<u8>) {
 }
 
 /// Single combined IO task: pumps audio both directions over one WS, handles
-/// Ping/Pong/Close, resamples between wire `sample_rate` and internal 48 kHz, and
+/// Ping/Pong/Close, reframes the wire stream into exact 20 ms L16 packets at the
+/// wire `sample_rate` (no resampling — the internal rate is the wire rate), and
 /// coalesces outbound frames per `flush_frames` (0 = passthrough). Owns the
 /// connection-limit permit for the socket's lifetime.
 #[allow(clippy::too_many_arguments)]
@@ -255,20 +256,19 @@ async fn ws_io_task(
     let (mut ws_tx, mut ws_rx) = ws.split();
     let null_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
 
-    // 20 ms of audio at the wire rate (samples / bytes).
+    // 20 ms of audio at the wire rate (samples / bytes). The session's internal
+    // L16 format for this endpoint is the wire rate itself, so the IO task does
+    // no resampling — it only reframes into exact 20 ms chunks.
     let frame_native = (sample_rate / 50) as usize;
     let flush_bytes = flush_frames * frame_native * 2;
 
-    // Inbound: wire rate -> 48 kHz.
-    let mut in_resampler = Resampler::new(sample_rate, INTERNAL_RATE);
+    // Inbound: reassemble wire bytes into 20 ms L16 frames.
     let mut in_samples: Vec<i16> = Vec::with_capacity(frame_native * 2);
     let mut in_byte_rem: Vec<u8> = Vec::new(); // trailing odd byte across reads
 
-    // Outbound: 48 kHz -> wire rate.
-    let mut out_resampler = Resampler::new(INTERNAL_RATE, sample_rate);
+    // Outbound coalescing buffers.
     let mut out_coalesce: Vec<u8> = Vec::new();
     let mut native_buf: Vec<i16> = Vec::with_capacity(frame_native + 8);
-    let mut resampled_48k: Vec<i16> = Vec::with_capacity(FRAME_SAMPLES_48K + 8);
     let mut frame_bytes: Vec<u8> = Vec::with_capacity(frame_native * 2);
 
     'io: loop {
@@ -287,13 +287,11 @@ async fn ws_io_task(
                     if usable < bytes.len() {
                         in_byte_rem.push(bytes[usable]);
                     }
-                    // Emit exact 20 ms frames upsampled to 48 kHz.
+                    // Emit exact 20 ms L16 frames at the wire/native rate.
                     while in_samples.len() >= frame_native {
                         let frame: Vec<i16> = in_samples.drain(..frame_native).collect();
-                        in_resampler.process(&frame, &mut resampled_48k);
-                        resampled_48k.resize(FRAME_SAMPLES_48K, 0);
-                        let mut payload = Vec::with_capacity(FRAME_SAMPLES_48K * 2);
-                        samples_to_l16(&resampled_48k, &mut payload);
+                        let mut payload = Vec::with_capacity(frame_native * 2);
+                        samples_to_l16(&frame, &mut payload);
                         let pkt = InboundPacket {
                             endpoint_id,
                             source: null_addr,
@@ -320,10 +318,10 @@ async fn ws_io_task(
             },
 
             frame = outbound_rx.recv() => match frame {
-                Some(l16_48k) => {
+                Some(l16_frame) => {
+                    // Already native-rate L16; just guarantee an exact 20 ms frame.
                     native_buf.clear();
-                    let samples = l16_to_samples(&l16_48k);
-                    out_resampler.process(&samples, &mut native_buf);
+                    native_buf.extend(l16_to_samples(&l16_frame));
                     native_buf.resize(frame_native, 0);
                     samples_to_l16(&native_buf, &mut frame_bytes);
                     if flush_bytes == 0 {
@@ -401,7 +399,7 @@ mod tests {
             timestamp: 0,
             ssrc: 0,
             marker: false,
-            payload: vec![0u8; 1920],
+            payload: vec![0u8; 320], // one 20 ms L16 frame at 8 kHz (160 samples)
         };
         // Queue capacity is bounded; pushing far more than capacity must not panic
         // or block (drop-newest on full).
@@ -415,11 +413,12 @@ mod tests {
     #[test]
     fn build_inbound_packet_advances_timeline() {
         let mut e = ep(8000, 0);
-        let p0 = e.build_inbound_packet(vec![0u8; 1920]);
-        let p1 = e.build_inbound_packet(vec![0u8; 1920]);
+        let p0 = e.build_inbound_packet(vec![0u8; 320]);
+        let p1 = e.build_inbound_packet(vec![0u8; 320]);
         assert_eq!(p0.payload_type, 127);
         assert_eq!(p1.sequence_number, p0.sequence_number.wrapping_add(1));
-        assert_eq!(p1.timestamp, p0.timestamp.wrapping_add(960));
+        // 8 kHz wire rate → 160 ticks per 20 ms frame (sample_rate / 50).
+        assert_eq!(p1.timestamp, p0.timestamp.wrapping_add(160));
         assert_eq!(p1.ssrc, p0.ssrc, "ssrc is stable across frames");
         assert_eq!(e.stats.inbound_packets, 2);
     }

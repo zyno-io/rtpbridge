@@ -6,7 +6,12 @@ pub enum AudioCodec {
     Pcmu, // G.711 mu-law, 8kHz
     G722, // G.722, 16kHz (SDP clock rate is 8kHz but actual audio is 16kHz)
     Opus, // Opus, 48kHz
-    L16,  // Raw PCM, 48kHz (internal only, used for bridge endpoints)
+    /// Raw PCM at an explicit sample rate (internal only: bridge + websocket
+    /// endpoints). The rate is carried in the variant so a 16 kHz WebSocket leg
+    /// isn't forced through a 48 kHz pivot just because it's "L16".
+    L16 {
+        sample_rate: u32,
+    },
 }
 
 impl AudioCodec {
@@ -15,7 +20,8 @@ impl AudioCodec {
         match self {
             AudioCodec::Pcmu => 8000,
             AudioCodec::G722 => 16000,
-            AudioCodec::Opus | AudioCodec::L16 => 48000,
+            AudioCodec::Opus => 48000,
+            AudioCodec::L16 { sample_rate } => *sample_rate,
         }
     }
 
@@ -24,7 +30,8 @@ impl AudioCodec {
         match self {
             AudioCodec::Pcmu => 8000,
             AudioCodec::G722 => 8000, // SDP says 8000 even though audio is 16kHz
-            AudioCodec::Opus | AudioCodec::L16 => 48000,
+            AudioCodec::Opus => 48000,
+            AudioCodec::L16 { sample_rate } => *sample_rate, // L16 clock == sample rate
         }
     }
 
@@ -264,10 +271,14 @@ impl AudioEncoder for OpusEncoder {
     }
 }
 
-// ── L16 (raw PCM, 48kHz) — internal bridge codec ───────────────────────
+// ── L16 (raw PCM, rate-carrying) — internal bridge/websocket codec ─────
 
-/// L16 "decoder": payload is raw LE i16 bytes, just reinterpret as samples
-pub struct L16Decoder;
+/// L16 "decoder": payload is raw LE i16 bytes, just reinterpret as samples.
+/// The byte→sample reinterpret is rate-agnostic; the rate is tracked only so
+/// `codec()` reports the correct format for resampling/framing decisions.
+pub struct L16Decoder {
+    sample_rate: u32,
+}
 
 impl AudioDecoder for L16Decoder {
     fn decode(&mut self, encoded: &[u8], pcm_out: &mut Vec<i16>) -> Result<()> {
@@ -280,12 +291,18 @@ impl AudioDecoder for L16Decoder {
     }
 
     fn codec(&self) -> AudioCodec {
-        AudioCodec::L16
+        AudioCodec::L16 {
+            sample_rate: self.sample_rate,
+        }
     }
 }
 
-/// L16 "encoder": just serialize i16 samples as LE bytes
-pub struct L16Encoder;
+/// L16 "encoder": just serialize i16 samples as LE bytes. Carries its rate so
+/// `codec().ptime_samples()` (used by the transcode pipeline to pad/truncate)
+/// reflects the real frame size, not a hardcoded 48 kHz.
+pub struct L16Encoder {
+    sample_rate: u32,
+}
 
 impl AudioEncoder for L16Encoder {
     fn encode(&mut self, pcm_in: &[i16], encoded_out: &mut Vec<u8>) -> Result<()> {
@@ -298,7 +315,9 @@ impl AudioEncoder for L16Encoder {
     }
 
     fn codec(&self) -> AudioCodec {
-        AudioCodec::L16
+        AudioCodec::L16 {
+            sample_rate: self.sample_rate,
+        }
     }
 }
 
@@ -309,7 +328,7 @@ pub fn make_decoder(codec: AudioCodec) -> Result<Box<dyn AudioDecoder>> {
         AudioCodec::Pcmu => Ok(Box::new(PcmuDecoder::new())),
         AudioCodec::G722 => Ok(Box::new(G722Decoder::new())),
         AudioCodec::Opus => Ok(Box::new(OpusDecoder::new()?)),
-        AudioCodec::L16 => Ok(Box::new(L16Decoder)),
+        AudioCodec::L16 { sample_rate } => Ok(Box::new(L16Decoder { sample_rate })),
     }
 }
 
@@ -318,7 +337,7 @@ pub fn make_encoder(codec: AudioCodec) -> Result<Box<dyn AudioEncoder>> {
         AudioCodec::Pcmu => Ok(Box::new(PcmuEncoder::new())),
         AudioCodec::G722 => Ok(Box::new(G722Encoder::new())),
         AudioCodec::Opus => Ok(Box::new(OpusEncoder::new()?)),
-        AudioCodec::L16 => Ok(Box::new(L16Encoder)),
+        AudioCodec::L16 { sample_rate } => Ok(Box::new(L16Encoder { sample_rate })),
     }
 }
 

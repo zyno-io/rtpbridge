@@ -2578,7 +2578,7 @@ fn handle_inbound_packet(
                 );
             }
             Endpoint::WebSocket(wsep) => {
-                // Inbound 48kHz L16 frame from the WS IO task. Synthesize a
+                // Inbound native-rate L16 frame from the WS IO task. Synthesize a
                 // monotonic RTP timeline (Bridge's ts=0 would freeze downstream).
                 return (
                     Some(wsep.build_inbound_packet(pkt.data.clone())),

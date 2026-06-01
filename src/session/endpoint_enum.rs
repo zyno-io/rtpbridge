@@ -188,8 +188,12 @@ pub fn endpoint_audio_codec(ep: &Endpoint) -> Option<AudioCodec> {
         Endpoint::WebRtc(_) => Some(AudioCodec::Opus),
         Endpoint::File(_) => Some(AudioCodec::Pcmu),
         Endpoint::Tone(_) => Some(AudioCodec::Pcmu),
-        Endpoint::Bridge(_) => Some(AudioCodec::L16),
-        Endpoint::WebSocket(_) => Some(AudioCodec::L16),
+        Endpoint::Bridge(_) => Some(AudioCodec::L16 { sample_rate: 48000 }),
+        // WebSocket runs internally at its wire rate (no 48 kHz pivot); the
+        // session's per-edge resampling handles any rate difference to peers.
+        Endpoint::WebSocket(ep) => Some(AudioCodec::L16 {
+            sample_rate: ep.sample_rate,
+        }),
     }
 }
 
@@ -217,7 +221,7 @@ pub fn endpoint_rtp_clock_rate(ep: &Endpoint) -> u32 {
         Endpoint::File(_) => 8000,
         Endpoint::Tone(_) => 8000,
         Endpoint::Bridge(_) => 48000,
-        Endpoint::WebSocket(_) => 48000,
+        Endpoint::WebSocket(ep) => ep.sample_rate,
     }
 }
 

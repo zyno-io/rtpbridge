@@ -2,8 +2,11 @@
 
 A `websocket` endpoint streams raw PCM audio to/from an external peer over a
 WebSocket, instead of negotiating RTP/SRTP via SDP. Internally it behaves like a
-bridge endpoint (L16 at 48 kHz, payload type 127), so it participates in routing,
-transcoding, and multi-party mixing exactly like any other endpoint.
+bridge endpoint (L16, payload type 127) but at the wire `sample_rate` rather than a
+fixed 48 kHz, so it participates in routing, transcoding, and multi-party mixing
+exactly like any other endpoint. Running at the wire rate means the session's
+per-edge resampling converts directly to each peer (e.g. an 8 kHz PCMU leg goes
+16 kHz↔8 kHz, not 16→48→8) — no unnecessary 48 kHz detour.
 
 ## Lifecycle
 
@@ -54,11 +57,12 @@ inbound stream to 20 ms internally (a trailing partial sample is buffered until 
 next frame). Text frames are ignored; Ping is answered with Pong; Close ends the
 session.
 
-- **Inbound** (peer → rtpbridge): resampled to 48 kHz, carried as L16, and routed
-  to destinations (transcoded to their codecs as needed). rtpbridge synthesizes a
-  monotonic RTP timeline so downstream RTP/WebRTC peers see advancing timestamps.
+- **Inbound** (peer → rtpbridge): carried as L16 at `sample_rate` (no resampling at
+  the socket) and routed to destinations (resampled/transcoded to their codecs as
+  needed). rtpbridge synthesizes a monotonic RTP timeline so downstream RTP/WebRTC
+  peers see advancing timestamps.
 - **Outbound** (rtpbridge → peer): each source is transcoded to the WS endpoint's
-  L16 stream, resampled to `sample_rate`, and written as binary frames. Output is
+  L16 stream at `sample_rate` and written as binary frames. Output is
   **source-clocked**: a frame is produced for each 20 ms of routed audio (no
   synthetic silence is sent when sources are idle). With `flush_ms > 0`, that many
   milliseconds of audio are coalesced into a single WebSocket message

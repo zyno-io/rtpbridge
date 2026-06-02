@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use futures_util::FutureExt;
 use str0m::change::{SdpAnswer, SdpOffer, SdpPendingOffer};
@@ -10,7 +11,7 @@ use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig}
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, trace, warn};
 
 use super::endpoint::{EndpointConfig, InboundPacket, RoutedRtpPacket};
 use super::stats::EndpointStats;
@@ -18,10 +19,20 @@ use crate::control::protocol::{
     EndpointDirection, EndpointDirectionUpdate, EndpointId, EndpointState,
 };
 use crate::media::rtcp::RtcpStats;
+use crate::metrics::Metrics;
 
 /// RTP timestamp clock for Opus, the only audio codec we negotiate for WebRTC.
 /// Kept in sync with `endpoint_enum::endpoint_rtp_clock_rate` for WebRTC.
 const WEBRTC_OPUS_RTP_CLOCK_HZ: u32 = 48_000;
+
+/// Grace window for a per-endpoint UDP recv task to reach its receive loop after
+/// being spawned. The task normally starts in well under a millisecond; if it
+/// has not signalled liveness within this window the session's liveness sweep
+/// flags the never-started variant (the runtime did not schedule/register the
+/// socket reader) and increments `webrtc_recv_task_start_timeout`. Checked off
+/// the hot path (in the 1 Hz sweep), so it never blocks endpoint creation or the
+/// session task. See docs/WEBRTC_RECV_TASK_WEDGE.md.
+const RECV_TASK_START_GRACE: Duration = Duration::from_secs(2);
 
 /// A WebRTC endpoint backed by str0m
 pub struct WebRtcEndpoint {
@@ -69,6 +80,23 @@ pub struct WebRtcEndpoint {
     /// Cancellation token for cooperative recv task shutdown (cloned in start_recv_task, cancelled in drop)
     #[allow(dead_code)]
     cancel_token: CancellationToken,
+    /// Shared metrics so the per-endpoint recv task can record its own lifecycle
+    /// (started / exited / overflow) without threading metrics through every
+    /// transfer/restart path.
+    metrics: Arc<Metrics>,
+    /// Set true by the recv task the instant it reaches its receive loop, before
+    /// its first await. The session liveness sweep reads it: a task still false
+    /// past `recv_start_deadline` means the runtime never scheduled/registered
+    /// the reader instead of silently dropping all media.
+    recv_started: Arc<AtomicBool>,
+    /// When the current recv task must have signalled `recv_started` by. Set on
+    /// each (re)start; `None` before the first start. The sweep flags a wedge if
+    /// the deadline passes with `recv_started` still false.
+    recv_start_deadline: Option<Instant>,
+    /// Whether the session liveness sweep has already reported (once) that this
+    /// endpoint's recv task is wedged — died, or never started — while the
+    /// endpoint was still active.
+    recv_dead_reported: bool,
 }
 
 fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
@@ -87,6 +115,7 @@ impl WebRtcEndpoint {
         id: EndpointId,
         config: EndpointConfig,
         bind_addr: SocketAddr,
+        metrics: Arc<Metrics>,
     ) -> anyhow::Result<Self> {
         // WebRTC endpoints use OS-assigned ephemeral ports (not rtp_port_range).
         // ICE negotiates connectivity dynamically, so fixed port ranges don't apply.
@@ -118,6 +147,10 @@ impl WebRtcEndpoint {
             packet_error_warned: false,
             recv_task: None,
             cancel_token: CancellationToken::new(),
+            metrics,
+            recv_started: Arc::new(AtomicBool::new(false)),
+            recv_start_deadline: None,
+            recv_dead_reported: false,
         })
     }
 
@@ -176,14 +209,36 @@ impl WebRtcEndpoint {
         Ok(())
     }
 
-    /// Start the recv task that reads UDP packets and sends them to the session
+    /// Start (or restart) the recv task that reads UDP packets and forwards them
+    /// to the session. The receive path is otherwise fire-and-forget: a task the
+    /// runtime never schedules silently blackholes all media for the endpoint
+    /// (see docs/WEBRTC_RECV_TASK_WEDGE.md). To make that observable, the task
+    /// flips `recv_started` the instant it reaches its loop and this arms
+    /// `recv_start_deadline`; the session liveness sweep (`supervise_recv`) then
+    /// flags a task that never starts or later dies — off the hot path, so
+    /// nothing here blocks creation or the session task.
     pub fn start_recv_task(&mut self, packet_tx: mpsc::Sender<InboundPacket>) {
         let socket = Arc::clone(&self.socket);
         let endpoint_id = self.id;
+        let local_addr = self.local_addr;
         let token = self.cancel_token.clone();
+        let metrics = Arc::clone(&self.metrics);
+        let recv_started = Arc::clone(&self.recv_started);
+        // Fresh attempt: clear the liveness flag (a prior task on transfer
+        // restart set it true), arm the start-grace deadline, and let the sweep
+        // report this attempt afresh.
+        recv_started.store(false, Ordering::Relaxed);
+        self.recv_start_deadline = Some(Instant::now() + RECV_TASK_START_GRACE);
+        self.recv_dead_reported = false;
 
         let handle = tokio::spawn(async move {
             let result = std::panic::AssertUnwindSafe(async move {
+                // Signal liveness the instant the loop is reachable, BEFORE the
+                // first await, so a task the runtime cannot schedule is caught by
+                // the sweep rather than silently dropping all inbound media.
+                recv_started.store(true, Ordering::Relaxed);
+                metrics.webrtc_recv_task_started.inc();
+
                 let mut buf = vec![0u8; 4096];
                 let mut exit_reason = "cancelled";
                 loop {
@@ -197,9 +252,27 @@ impl WebRtcEndpoint {
                                         data: buf[..n].to_vec(),
                                         is_rtcp: false,
                                     };
-                                    if packet_tx.send(packet).await.is_err() {
-                                        exit_reason = "session_dropped";
-                                        break;
+                                    // Non-blocking: a full session channel must
+                                    // never PARK the reader — a parked reader
+                                    // stops servicing the socket and blackholes
+                                    // the endpoint entirely (the very wedge this
+                                    // guards against), so we drop under
+                                    // backpressure. NOTE this drops STUN/DTLS as
+                                    // well as RTP/SRTP; a full 256-deep channel is
+                                    // itself an overload signal
+                                    // (`webrtc_recv_overflow`), and dropping a
+                                    // setup packet is strictly better than wedging
+                                    // the socket. Class-aware priority for
+                                    // STUN/DTLS is a documented follow-up (runbook).
+                                    match packet_tx.try_send(packet) {
+                                        Ok(()) => {}
+                                        Err(mpsc::error::TrySendError::Full(_)) => {
+                                            metrics.webrtc_recv_overflow.inc();
+                                        }
+                                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                                            exit_reason = "session_dropped";
+                                            break;
+                                        }
                                     }
                                 }
                                 Err(e) => {
@@ -215,15 +288,21 @@ impl WebRtcEndpoint {
                     }
                 }
 
+                // Counts COOPERATIVE loop exits only (cancellation observed in
+                // the select!, session-channel close, UDP error). A `Drop`-driven
+                // teardown aborts the JoinHandle and does NOT run this.
+                metrics.webrtc_recv_task_exited.inc();
                 if exit_reason == "cancelled" {
                     debug!(
                         endpoint_id = %endpoint_id,
+                        %local_addr,
                         reason = exit_reason,
                         "WebRTC recv task exiting"
                     );
                 } else {
-                    info!(
+                    warn!(
                         endpoint_id = %endpoint_id,
+                        %local_addr,
                         reason = exit_reason,
                         "WebRTC recv task exiting"
                     );
@@ -244,6 +323,48 @@ impl WebRtcEndpoint {
         self.recv_task = Some(handle);
     }
 
+    /// Session liveness sweep (called ~1×/s by `run_media_session`). Reports —
+    /// once — a recv task that is wedged while its endpoint is still active, the
+    /// "task gone/never-started, endpoint live = guaranteed media blackhole"
+    /// condition. Covers BOTH failure modes and all (re)start paths off the hot
+    /// path. See docs/WEBRTC_RECV_TASK_WEDGE.md.
+    pub fn supervise_recv(&mut self) {
+        if self.recv_dead_reported {
+            return;
+        }
+        // (a) Task started, then exited/panicked while the endpoint is live.
+        if let Some(handle) = &self.recv_task
+            && handle.is_finished()
+        {
+            self.recv_dead_reported = true;
+            self.metrics.webrtc_recv_task_dead.inc();
+            error!(
+                endpoint_id = %self.id,
+                local_addr = %self.local_addr,
+                state = ?self.state,
+                "WebRTC recv task is gone but endpoint is still active — media will \
+                 blackhole (see docs/WEBRTC_RECV_TASK_WEDGE.md)"
+            );
+            return;
+        }
+        // (b) Task spawned but never reached its loop within the grace window.
+        // Count this never-started variant so a pod can be alerted/drained.
+        if !self.recv_started.load(Ordering::Relaxed)
+            && let Some(deadline) = self.recv_start_deadline
+            && Instant::now() > deadline
+        {
+            self.recv_dead_reported = true;
+            self.metrics.webrtc_recv_task_start_timeout.inc();
+            error!(
+                endpoint_id = %self.id,
+                local_addr = %self.local_addr,
+                grace_ms = RECV_TASK_START_GRACE.as_millis() as u64,
+                "WebRTC recv task never started within the grace window — media \
+                 datapath wedge (see docs/WEBRTC_RECV_TASK_WEDGE.md)"
+            );
+        }
+    }
+
     /// Create from a remote SDP offer, returning the SDP answer string
     pub async fn from_offer(
         id: EndpointId,
@@ -251,9 +372,10 @@ impl WebRtcEndpoint {
         offer_sdp: &str,
         bind_addr: SocketAddr,
         packet_tx: mpsc::Sender<InboundPacket>,
+        metrics: Arc<Metrics>,
     ) -> anyhow::Result<(Self, String)> {
         let config = EndpointConfig { direction };
-        let mut endpoint = Self::new_with_socket(id, config, bind_addr).await?;
+        let mut endpoint = Self::new_with_socket(id, config, bind_addr, metrics).await?;
 
         // Add local ICE candidate
         let candidate = Candidate::host(endpoint.local_addr, "udp")?;
@@ -281,9 +403,10 @@ impl WebRtcEndpoint {
         direction: EndpointDirection,
         bind_addr: SocketAddr,
         packet_tx: mpsc::Sender<InboundPacket>,
+        metrics: Arc<Metrics>,
     ) -> anyhow::Result<(Self, String)> {
         let config = EndpointConfig { direction };
-        let mut endpoint = Self::new_with_socket(id, config, bind_addr).await?;
+        let mut endpoint = Self::new_with_socket(id, config, bind_addr, metrics).await?;
 
         // Add local ICE candidate
         let candidate = Candidate::host(endpoint.local_addr, "udp")?;
@@ -591,6 +714,9 @@ impl WebRtcEndpoint {
 
     /// Restart recv tasks with a new packet_tx (after transfer to a new session).
     pub fn restart_recv_tasks(&mut self, packet_tx: mpsc::Sender<InboundPacket>) {
+        // Transfer path. `start_recv_task` re-arms the start-grace deadline and
+        // resets the report flag, so the liveness sweep (`supervise_recv`) covers
+        // a restarted task that never reaches its loop just like a fresh one.
         self.start_recv_task(packet_tx);
     }
 }
@@ -617,6 +743,124 @@ pub enum WebRtcEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The recv task starts promptly after creation, signals liveness, and a
+    /// healthy task within the grace window is NOT flagged by the liveness sweep.
+    /// See docs/WEBRTC_RECV_TASK_WEDGE.md.
+    #[tokio::test]
+    async fn test_recv_task_starts_and_is_not_flagged() {
+        let id = uuid::Uuid::new_v4();
+        let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let (tx, _rx) = mpsc::channel(16);
+        let metrics = Arc::new(Metrics::new());
+
+        let mut ep = WebRtcEndpoint::create_offer(
+            id,
+            EndpointDirection::SendRecv,
+            bind_addr,
+            tx,
+            metrics.clone(),
+        )
+        .await
+        .expect("create_offer should succeed")
+        .0;
+
+        // The recv task starts asynchronously; it should reach its loop promptly.
+        for _ in 0..200 {
+            if ep.recv_started.load(Ordering::Relaxed) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            ep.recv_started.load(Ordering::Relaxed),
+            "recv task should start"
+        );
+        assert_eq!(metrics.webrtc_recv_task_started.get(), 1);
+
+        // A started task is never flagged, and start_timeout stays zero.
+        ep.supervise_recv();
+        assert!(!ep.recv_dead_reported);
+        assert_eq!(metrics.webrtc_recv_task_start_timeout.get(), 0);
+    }
+
+    /// The liveness sweep flags (and counts, once) a recv task that was spawned
+    /// but never reached its loop past the grace deadline — the receive-task
+    /// wedge, including the transfer-restart path. See docs/WEBRTC_RECV_TASK_WEDGE.md.
+    #[tokio::test]
+    async fn test_supervise_recv_detects_never_started() {
+        let id = uuid::Uuid::new_v4();
+        let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let metrics = Arc::new(Metrics::new());
+        let mut ep = WebRtcEndpoint::new_with_socket(
+            id,
+            EndpointConfig {
+                direction: EndpointDirection::SendRecv,
+            },
+            bind_addr,
+            metrics.clone(),
+        )
+        .await
+        .expect("new_with_socket should succeed");
+
+        // Simulate a spawned-but-never-polled recv task: a live (unfinished) task
+        // that never sets `recv_started`, with the grace deadline already past.
+        ep.recv_task = Some(tokio::spawn(std::future::pending::<()>()));
+        ep.recv_started.store(false, Ordering::Relaxed);
+        ep.recv_start_deadline = Some(Instant::now() - Duration::from_secs(1));
+
+        ep.supervise_recv();
+        assert!(
+            ep.recv_dead_reported,
+            "a never-started task must be flagged"
+        );
+        assert_eq!(metrics.webrtc_recv_task_start_timeout.get(), 1);
+
+        // Idempotent: a second sweep does not re-count.
+        ep.supervise_recv();
+        assert_eq!(metrics.webrtc_recv_task_start_timeout.get(), 1);
+    }
+
+    /// The session liveness sweep flags (once) a recv task that exited while its
+    /// endpoint is still active — the "task gone, endpoint live" blackhole.
+    #[tokio::test]
+    async fn test_supervise_recv_detects_dead_task() {
+        let id = uuid::Uuid::new_v4();
+        let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let (tx, _rx) = mpsc::channel(16);
+        let metrics = Arc::new(Metrics::new());
+
+        let mut ep = WebRtcEndpoint::create_offer(
+            id,
+            EndpointDirection::SendRecv,
+            bind_addr,
+            tx,
+            metrics.clone(),
+        )
+        .await
+        .expect("create_offer should succeed")
+        .0;
+
+        // Force the recv task to exit while the endpoint stays in place.
+        ep.cancel_token.cancel();
+        for _ in 0..200 {
+            if ep.recv_task.as_ref().unwrap().is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        assert!(!ep.recv_dead_reported);
+        ep.supervise_recv();
+        assert!(ep.recv_dead_reported, "a dead recv task must be reported");
+        assert_eq!(metrics.webrtc_recv_task_exited.get(), 1);
+        assert_eq!(metrics.webrtc_recv_task_dead.get(), 1);
+
+        // Idempotent: a second sweep does not re-log.
+        ep.supervise_recv();
+        assert!(ep.recv_dead_reported);
+        assert_eq!(metrics.webrtc_recv_task_dead.get(), 1);
+    }
     use str0m::change::{SdpAnswer, SdpOffer};
     use str0m::media::{Direction, MediaKind};
 
@@ -778,10 +1022,15 @@ mod tests {
         let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
         let (tx, _rx) = mpsc::channel(16);
 
-        let (ep, offer_sdp) =
-            WebRtcEndpoint::create_offer(id, EndpointDirection::RecvOnly, bind_addr, tx)
-                .await
-                .expect("create_offer should succeed");
+        let (ep, offer_sdp) = WebRtcEndpoint::create_offer(
+            id,
+            EndpointDirection::RecvOnly,
+            bind_addr,
+            tx,
+            Arc::new(Metrics::new()),
+        )
+        .await
+        .expect("create_offer should succeed");
 
         // SDP must be sendrecv — mixing direction is routing-table-only
         assert!(
@@ -809,10 +1058,15 @@ mod tests {
         let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
         let (tx, _rx) = mpsc::channel(16);
 
-        let (_ep, offer_sdp) =
-            WebRtcEndpoint::create_offer(id, EndpointDirection::SendOnly, bind_addr, tx)
-                .await
-                .expect("create_offer should succeed");
+        let (_ep, offer_sdp) = WebRtcEndpoint::create_offer(
+            id,
+            EndpointDirection::SendOnly,
+            bind_addr,
+            tx,
+            Arc::new(Metrics::new()),
+        )
+        .await
+        .expect("create_offer should succeed");
 
         assert!(
             offer_sdp.contains("a=sendrecv"),
@@ -962,10 +1216,15 @@ mod tests {
         let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
         let (tx, _rx) = mpsc::channel(16);
 
-        let (mut ep, _offer_sdp) =
-            WebRtcEndpoint::create_offer(id, EndpointDirection::SendRecv, bind_addr, tx)
-                .await
-                .expect("create_offer should succeed");
+        let (mut ep, _offer_sdp) = WebRtcEndpoint::create_offer(
+            id,
+            EndpointDirection::SendRecv,
+            bind_addr,
+            tx,
+            Arc::new(Metrics::new()),
+        )
+        .await
+        .expect("create_offer should succeed");
 
         assert!(
             ep.connecting_since.is_none(),
@@ -1001,10 +1260,15 @@ mod tests {
         let (tx, _rx) = mpsc::channel(16);
 
         // create_offer leaves an unanswered pending offer.
-        let (mut ep, _offer) =
-            WebRtcEndpoint::create_offer(id, EndpointDirection::SendRecv, bind_addr, tx)
-                .await
-                .expect("create_offer should succeed");
+        let (mut ep, _offer) = WebRtcEndpoint::create_offer(
+            id,
+            EndpointDirection::SendRecv,
+            bind_addr,
+            tx,
+            Arc::new(Metrics::new()),
+        )
+        .await
+        .expect("create_offer should succeed");
         assert!(ep.pending_offer.is_some());
 
         // A second outstanding offer would discard str0m's pending offer and
@@ -1028,10 +1292,15 @@ mod tests {
         let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
         let (tx, _rx) = mpsc::channel(16);
 
-        let (mut ep, _offer) =
-            WebRtcEndpoint::create_offer(id, EndpointDirection::SendRecv, bind_addr, tx)
-                .await
-                .expect("create_offer should succeed");
+        let (mut ep, _offer) = WebRtcEndpoint::create_offer(
+            id,
+            EndpointDirection::SendRecv,
+            bind_addr,
+            tx,
+            Arc::new(Metrics::new()),
+        )
+        .await
+        .expect("create_offer should succeed");
         assert!(ep.pending_offer.is_some());
 
         // A malformed answer must be rejected BEFORE the pending offer is taken,
@@ -1055,10 +1324,15 @@ mod tests {
         let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
         let (tx, _rx) = mpsc::channel(16);
 
-        let (mut ep, _offer) =
-            WebRtcEndpoint::create_offer(id, EndpointDirection::SendRecv, bind_addr, tx)
-                .await
-                .expect("create_offer should succeed");
+        let (mut ep, _offer) = WebRtcEndpoint::create_offer(
+            id,
+            EndpointDirection::SendRecv,
+            bind_addr,
+            tx,
+            Arc::new(Metrics::new()),
+        )
+        .await
+        .expect("create_offer should succeed");
         assert_eq!(ep.offer_generation, 0, "the initial offer is generation 0");
 
         // Simulate the initial answer clearing the pending offer.

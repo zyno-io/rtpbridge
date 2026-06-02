@@ -719,9 +719,15 @@ impl SessionState {
 
         let (answer, te_pt) = if parsed.is_webrtc {
             let ep_bind = SocketAddr::new(self.media_ip, 0);
-            let (ep, answer) =
-                WebRtcEndpoint::from_offer(id, direction, sdp_str, ep_bind, packet_tx.clone())
-                    .await?;
+            let (ep, answer) = WebRtcEndpoint::from_offer(
+                id,
+                direction,
+                sdp_str,
+                ep_bind,
+                packet_tx.clone(),
+                self.metrics.clone(),
+            )
+            .await?;
             info!(
                 session_id = %self.session_id,
                 endpoint_id = %id,
@@ -785,8 +791,14 @@ impl SessionState {
         let (offer, te_pt) = match endpoint_type {
             EndpointType::Webrtc => {
                 let ep_bind = SocketAddr::new(self.media_ip, 0);
-                let (ep, offer) =
-                    WebRtcEndpoint::create_offer(id, direction, ep_bind, packet_tx.clone()).await?;
+                let (ep, offer) = WebRtcEndpoint::create_offer(
+                    id,
+                    direction,
+                    ep_bind,
+                    packet_tx.clone(),
+                    self.metrics.clone(),
+                )
+                .await?;
                 info!(
                     session_id = %self.session_id,
                     endpoint_id = %id,
@@ -2427,6 +2439,16 @@ pub async fn run_media_session(
                 &state.metrics,
             );
             check_connecting_watchdog(&mut state.endpoints, &state.metrics);
+            // Recv-task liveness: flag any WebRTC endpoint whose UDP receive task
+            // never started or died (the media-datapath wedge). Runs on this
+            // reliable 1 Hz elapsed gate — not the `sleep` select arm — so
+            // co-session media load cannot starve it. See
+            // docs/WEBRTC_RECV_TASK_WEDGE.md.
+            for ep in state.endpoints.values_mut() {
+                if let Endpoint::WebRtc(wep) = ep {
+                    wep.supervise_recv();
+                }
+            }
             state.check_ws_connect_timeouts().await;
             state.last_timeout_check = Instant::now();
         }

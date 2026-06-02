@@ -47,6 +47,33 @@ pub struct Metrics {
     /// (credential divergence → silent media blackhole). A non-zero value
     /// means a caller issued overlapping ICE restarts.
     pub webrtc_ice_restart_conflicts: Counter,
+    /// WebRTC per-endpoint UDP recv task reached its receive loop. The
+    /// receive loop is the ONLY thing that pulls inbound ICE/STUN/SRTP off an
+    /// endpoint's socket, so this is the heartbeat of the media datapath.
+    pub webrtc_recv_task_started: Counter,
+    /// WebRTC recv loop exited COOPERATIVELY (cancellation observed in the
+    /// `select!`, session-channel close, or UDP error). Does NOT count
+    /// `Drop`-driven teardown, which aborts the task — so this sits well below
+    /// `_started`, it does not mirror it. A spike means tasks ending abnormally
+    /// (e.g. `udp_error`).
+    pub webrtc_recv_task_exited: Counter,
+    /// WebRTC endpoints whose recv task had already finished while the endpoint
+    /// was still active in the session. This covers panics, UDP-error exits,
+    /// session-channel closes, and unexpected cooperative exits that leave a live
+    /// endpoint with no socket reader.
+    pub webrtc_recv_task_dead: Counter,
+    /// WebRTC endpoints whose recv task never reached its receive loop within the
+    /// grace window. The session liveness sweep observes this AFTER creation (it
+    /// does not block/abort creation). A non-zero value proves the never-started
+    /// receive-task variant; a media blackhole where the task starts but never
+    /// gets socket readiness must be diagnosed with the live probe/runbook.
+    /// See docs/WEBRTC_RECV_TASK_WEDGE.md.
+    pub webrtc_recv_task_start_timeout: Counter,
+    /// Inbound WebRTC packets dropped because the session packet channel was
+    /// full (would have blocked `send`). Switching to `try_send` keeps a full
+    /// channel from PARKING the UDP reader; sustained non-zero means the session
+    /// task is behind, not that the datapath is wedged.
+    pub webrtc_recv_overflow: Counter,
 
     /// The Prometheus registry.  Wrapped in a `Mutex` because
     /// `encode()` requires `&Registry` but we need interior mutability
@@ -83,6 +110,11 @@ impl Metrics {
         let webrtc_packet_errors = Counter::default();
         let webrtc_connecting_stuck = Counter::default();
         let webrtc_ice_restart_conflicts = Counter::default();
+        let webrtc_recv_task_started = Counter::default();
+        let webrtc_recv_task_exited = Counter::default();
+        let webrtc_recv_task_dead = Counter::default();
+        let webrtc_recv_task_start_timeout = Counter::default();
+        let webrtc_recv_overflow = Counter::default();
 
         // Note: prometheus-client automatically appends `_total` to counter
         // names in the encoded output, so we register without that suffix.
@@ -156,6 +188,31 @@ impl Metrics {
             "ICE-restart requests rejected because an unanswered offer was already pending",
             webrtc_ice_restart_conflicts.clone(),
         );
+        registry.register(
+            "rtpbridge_webrtc_recv_task_started",
+            "WebRTC recv tasks that reached their receive loop",
+            webrtc_recv_task_started.clone(),
+        );
+        registry.register(
+            "rtpbridge_webrtc_recv_task_exited",
+            "WebRTC recv tasks that exited their receive loop",
+            webrtc_recv_task_exited.clone(),
+        );
+        registry.register(
+            "rtpbridge_webrtc_recv_task_dead",
+            "WebRTC recv tasks found finished while their endpoint was still active",
+            webrtc_recv_task_dead.clone(),
+        );
+        registry.register(
+            "rtpbridge_webrtc_recv_task_start_timeout",
+            "WebRTC endpoints whose recv task never reached its receive loop within the grace window",
+            webrtc_recv_task_start_timeout.clone(),
+        );
+        registry.register(
+            "rtpbridge_webrtc_recv_overflow",
+            "Inbound WebRTC packets dropped because the session packet channel was full",
+            webrtc_recv_overflow.clone(),
+        );
         Self {
             sessions_total,
             sessions_active,
@@ -171,6 +228,11 @@ impl Metrics {
             webrtc_packet_errors,
             webrtc_connecting_stuck,
             webrtc_ice_restart_conflicts,
+            webrtc_recv_task_started,
+            webrtc_recv_task_exited,
+            webrtc_recv_task_dead,
+            webrtc_recv_task_start_timeout,
+            webrtc_recv_overflow,
             registry: Mutex::new(registry),
         }
     }
@@ -203,6 +265,11 @@ mod tests {
         assert!(output.contains("rtpbridge_dtmf_events_total"));
         assert!(output.contains("rtpbridge_transcode_errors_total"));
         assert!(output.contains("rtpbridge_events_dropped_total"));
+        assert!(output.contains("rtpbridge_webrtc_recv_task_started_total"));
+        assert!(output.contains("rtpbridge_webrtc_recv_task_exited_total"));
+        assert!(output.contains("rtpbridge_webrtc_recv_task_dead_total"));
+        assert!(output.contains("rtpbridge_webrtc_recv_task_start_timeout_total"));
+        assert!(output.contains("rtpbridge_webrtc_recv_overflow_total"));
     }
 
     #[test]

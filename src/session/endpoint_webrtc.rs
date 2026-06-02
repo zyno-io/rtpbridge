@@ -43,6 +43,13 @@ pub struct WebRtcEndpoint {
     pub audio_mid: Option<Mid>,
     /// Pending offer (when we created an offer, waiting for answer)
     pub pending_offer: Option<SdpPendingOffer>,
+    /// Monotonic generation of the most recently minted server offer.
+    /// Incremented on each `ice_restart`. Returned to the caller so a later
+    /// `accept_answer` can be tagged with the generation it answers; the
+    /// session rejects an answer whose generation no longer matches (a stale
+    /// answer for an offer that has since been superseded). The initial offer
+    /// is generation 0 and is not verified (no overlap risk before connect).
+    pub offer_generation: u64,
     /// Baseline direction this endpoint uses in auto mode.
     auto_direction: EndpointDirection,
     /// When the most-recent negotiation attempt (initial offer/answer, re-offer,
@@ -104,6 +111,7 @@ impl WebRtcEndpoint {
             remote_addr: None,
             audio_mid: None,
             pending_offer: None,
+            offer_generation: 0,
             auto_direction: config.direction,
             connecting_since: None,
             connecting_warned: false,
@@ -308,15 +316,19 @@ impl WebRtcEndpoint {
 
     /// Accept a remote SDP answer (after we created an offer)
     pub fn accept_answer(&mut self, answer_sdp: &str) -> anyhow::Result<()> {
-        let pending = self
-            .pending_offer
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("No pending offer to accept answer for"))?;
-
+        // Parse the answer BEFORE taking `pending_offer`. If parsing fails, the
+        // pending offer must survive so a later, well-formed retry of the same
+        // answer can still be applied — taking first would discard it on a
+        // malformed body and wedge the endpoint with no way to complete.
         let answer = SdpAnswer::from_sdp_string(answer_sdp).or_else(|_| {
             serde_json::from_str::<SdpAnswer>(answer_sdp)
                 .map_err(|e| anyhow::anyhow!("Failed to parse SDP answer: {e}"))
         })?;
+
+        let pending = self
+            .pending_offer
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("No pending offer to accept answer for"))?;
 
         self.rtc.sdp_api().accept_answer(pending, answer)?;
 
@@ -352,8 +364,23 @@ impl WebRtcEndpoint {
         Ok(answer.to_sdp_string())
     }
 
-    /// Perform an ICE restart, returning a new SDP offer
-    pub fn ice_restart(&mut self) -> anyhow::Result<String> {
+    /// Perform an ICE restart, returning the new SDP offer and its generation.
+    /// The generation is monotonic per endpoint; the caller echoes it back on
+    /// `accept_answer` so a stale answer for a superseded offer is rejected.
+    pub fn ice_restart(&mut self) -> anyhow::Result<(String, u64)> {
+        // str0m keeps only ONE pending offer per peer connection. Starting a new
+        // ICE restart while a prior offer is still unanswered would discard that
+        // offer; a later answer to it would then be applied against this new
+        // offer, diverging the two peers' ICE credentials so no candidate pair
+        // validates and media silently dies (no error, only a media timeout,
+        // recovered only by tearing down the call). Refuse instead — the caller
+        // must apply the outstanding answer first. The RPC layer
+        // (`handle_ice_restart`) also enforces this and counts conflicts; this
+        // guard keeps the endpoint method correct in isolation.
+        // See docs/protocol/endpoints.md → endpoint.webrtc.ice_restart.
+        if self.pending_offer.is_some() {
+            anyhow::bail!("ICE restart already pending; outstanding offer must be answered first");
+        }
         let mut api = self.rtc.sdp_api();
         let _creds = api.ice_restart(true); // keep local candidates
         let (offer, pending) = api
@@ -362,11 +389,12 @@ impl WebRtcEndpoint {
 
         let offer_str = offer.to_sdp_string();
         self.pending_offer = Some(pending);
+        self.offer_generation += 1;
         // Watchdog is NOT armed here: like create_offer, the restart offer
         // can sit indefinitely if the remote never answers. Arming happens
         // on accept_answer or when ICE re-enters Checking — both fire only
         // once the negotiation is genuinely in flight.
-        Ok(offer_str)
+        Ok((offer_str, self.offer_generation))
     }
 
     /// Feed a received UDP packet into the str0m state machine
@@ -964,5 +992,84 @@ mod tests {
              while pending_offer is still Some (regression for unanswered-call \
              false positive)"
         );
+    }
+
+    #[tokio::test]
+    async fn test_ice_restart_rejected_while_offer_pending() {
+        let id = uuid::Uuid::new_v4();
+        let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let (tx, _rx) = mpsc::channel(16);
+
+        // create_offer leaves an unanswered pending offer.
+        let (mut ep, _offer) =
+            WebRtcEndpoint::create_offer(id, EndpointDirection::SendRecv, bind_addr, tx)
+                .await
+                .expect("create_offer should succeed");
+        assert!(ep.pending_offer.is_some());
+
+        // A second outstanding offer would discard str0m's pending offer and
+        // let a later answer apply against the wrong one — must be refused.
+        let err = ep
+            .ice_restart()
+            .expect_err("ice_restart must be rejected while an offer is pending");
+        assert!(
+            err.to_string().contains("already pending"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            ep.pending_offer.is_some(),
+            "the rejected ice_restart must NOT have disturbed the existing pending offer"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_accept_answer_malformed_preserves_pending_offer() {
+        let id = uuid::Uuid::new_v4();
+        let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let (tx, _rx) = mpsc::channel(16);
+
+        let (mut ep, _offer) =
+            WebRtcEndpoint::create_offer(id, EndpointDirection::SendRecv, bind_addr, tx)
+                .await
+                .expect("create_offer should succeed");
+        assert!(ep.pending_offer.is_some());
+
+        // A malformed answer must be rejected BEFORE the pending offer is taken,
+        // so a later well-formed retry can still complete the negotiation.
+        let err = ep
+            .accept_answer("this is not valid sdp")
+            .expect_err("malformed answer must be rejected");
+        assert!(
+            err.to_string().contains("parse SDP answer"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            ep.pending_offer.is_some(),
+            "a malformed answer must NOT consume the pending offer"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ice_restart_increments_and_returns_offer_generation() {
+        let id = uuid::Uuid::new_v4();
+        let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let (tx, _rx) = mpsc::channel(16);
+
+        let (mut ep, _offer) =
+            WebRtcEndpoint::create_offer(id, EndpointDirection::SendRecv, bind_addr, tx)
+                .await
+                .expect("create_offer should succeed");
+        assert_eq!(ep.offer_generation, 0, "the initial offer is generation 0");
+
+        // Simulate the initial answer clearing the pending offer.
+        ep.pending_offer = None;
+        let (_o1, g1) = ep.ice_restart().expect("first ice_restart");
+        assert_eq!(g1, 1, "first ICE restart is generation 1");
+        assert_eq!(ep.offer_generation, 1);
+
+        // Simulate that restart being answered, then restart again.
+        ep.pending_offer = None;
+        let (_o2, g2) = ep.ice_restart().expect("second ice_restart");
+        assert_eq!(g2, 2, "generation is monotonic across restarts");
     }
 }

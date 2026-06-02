@@ -100,6 +100,11 @@ pub enum SessionCommand {
         endpoint_id: EndpointId,
         sdp: String,
         expected_type: Option<EndpointType>,
+        /// For WebRTC ICE-restart answers: the offer generation this answer is
+        /// for. `None` for the initial answer (no overlap risk). When `Some`,
+        /// the session rejects the answer unless it matches the endpoint's
+        /// current `offer_generation`.
+        expected_generation: Option<u64>,
     },
     AcceptOffer {
         reply: oneshot::Sender<anyhow::Result<String>>,
@@ -183,7 +188,7 @@ pub enum SessionCommand {
         endpoint_id: EndpointId,
     },
     IceRestart {
-        reply: oneshot::Sender<anyhow::Result<String>>,
+        reply: oneshot::Sender<anyhow::Result<(String, u64)>>,
         endpoint_id: EndpointId,
     },
     SrtpRekey {
@@ -429,8 +434,14 @@ impl SessionState {
                 endpoint_id,
                 sdp,
                 expected_type,
+                expected_generation,
             } => {
-                let _ = reply.send(self.handle_accept_answer(endpoint_id, &sdp, expected_type));
+                let _ = reply.send(self.handle_accept_answer(
+                    endpoint_id,
+                    &sdp,
+                    expected_type,
+                    expected_generation,
+                ));
             }
             SessionCommand::AcceptOffer {
                 reply,
@@ -961,6 +972,7 @@ impl SessionState {
         endpoint_id: EndpointId,
         sdp: &str,
         expected_type: Option<EndpointType>,
+        expected_generation: Option<u64>,
     ) -> anyhow::Result<()> {
         let endpoint_type = self
             .endpoints
@@ -980,6 +992,29 @@ impl SessionState {
         let result = match self.endpoints.get_mut(&endpoint_id) {
             Some(ep) => {
                 let old_state = ep.state();
+                // Reject a stale WebRTC ICE-restart answer before touching the
+                // endpoint: the offer it answers must still be the endpoint's
+                // current pending offer. A mismatch means the offer was
+                // superseded (or caller and session desynced across the control
+                // link). Done up front so it covers both the typed
+                // (endpoint.webrtc.accept_answer) and untyped paths, and so a
+                // mismatch leaves the pending offer untouched. None (initial
+                // answer) skips the check.
+                if let (Some(g), Endpoint::WebRtc(wep)) = (expected_generation, &*ep)
+                    && g != wep.offer_generation
+                {
+                    let current = wep.offer_generation;
+                    warn!(
+                        session_id = %self.session_id,
+                        endpoint_id = %endpoint_id,
+                        answer_generation = g,
+                        current_generation = current,
+                        "rejecting stale ICE-restart answer (generation mismatch)"
+                    );
+                    return Err(anyhow::anyhow!(
+                        "stale ICE-restart answer: generation {g} != current pending offer generation {current}"
+                    ));
+                }
                 let r = match (expected_type, &mut *ep) {
                     (Some(EndpointType::Webrtc), Endpoint::WebRtc(wep)) => wep.accept_answer(sdp),
                     (Some(EndpointType::Rtp), Endpoint::Rtp(rep)) => rep.accept_answer(sdp),
@@ -1814,11 +1849,35 @@ impl SessionState {
 
     // ── WebRTC / SRTP ───────────────────────────────────────────────
 
-    fn handle_ice_restart(&mut self, endpoint_id: EndpointId) -> anyhow::Result<String> {
+    fn handle_ice_restart(&mut self, endpoint_id: EndpointId) -> anyhow::Result<(String, u64)> {
+        // Reject an ICE restart while a prior offer is still unanswered. str0m
+        // keeps only one pending offer; overwriting it lets a later answer apply
+        // against the wrong offer and silently kill media (see
+        // WebRtcEndpoint::ice_restart and docs/protocol/endpoints.md). Two
+        // overlapping ICE restarts only happen when a caller races them — the
+        // softphone-bridge coalesces concurrent cRequestIceRestart — so a
+        // non-zero rtpbridge_webrtc_ice_restart_conflicts means a caller bug.
+        // A separate `get` keeps the conflict counter (on self.metrics)
+        // borrow-disjoint from the `get_mut` below.
+        let already_pending = match self.endpoints.get(&endpoint_id) {
+            Some(Endpoint::WebRtc(wep)) => wep.pending_offer.is_some(),
+            Some(_) => return Err(anyhow::anyhow!("Not a WebRTC endpoint")),
+            None => return Err(anyhow::anyhow!("Endpoint not found")),
+        };
+        if already_pending {
+            self.metrics.webrtc_ice_restart_conflicts.inc();
+            warn!(
+                session_id = %self.session_id,
+                endpoint_id = %endpoint_id,
+                "ICE restart requested while a prior offer is still pending; rejecting to avoid pending-offer overwrite"
+            );
+            anyhow::bail!("ICE restart already pending for this endpoint");
+        }
         match self.endpoints.get_mut(&endpoint_id) {
             Some(Endpoint::WebRtc(wep)) => wep.ice_restart(),
-            Some(_) => Err(anyhow::anyhow!("Not a WebRTC endpoint")),
-            None => Err(anyhow::anyhow!("Endpoint not found")),
+            // Type can't change between the two lookups: the session task is the
+            // sole mutator of `endpoints` and never yields between them.
+            _ => Err(anyhow::anyhow!("Endpoint not found")),
         }
     }
 
@@ -2958,6 +3017,29 @@ fn check_media_timeouts(
             continue;
         }
         let eid = ep.id();
+        // A WebRTC endpoint with an in-flight (re)negotiation (e.g. an ICE
+        // restart) is briefly without inbound media by design, while its
+        // top-level state stays `Connected`. Don't reap it on the media-timeout
+        // path *during the negotiation window* — reaping at the shorter media
+        // timeout would tear down a call that is mid-recovery and mask the
+        // negotiation as a generic media gap. We reset the emitted entry so a
+        // fresh window starts once it settles.
+        //
+        // BUT only suppress within the connecting-watchdog window. A healthy
+        // ICE (re)negotiation completes in ~1–3s; if `connecting_since` is still
+        // set past `WEBRTC_CONNECTING_WATCHDOG_SECS`, the negotiation is stuck
+        // (str0m emitted neither Connected nor Disconnected), and the
+        // connecting-watchdog only bumps a metric — it does NOT notify the
+        // controller. So past that point we must let `endpoint.media_timeout`
+        // fire, otherwise a blackholed call is suppressed indefinitely and loses
+        // its only external recovery signal.
+        if let Endpoint::WebRtc(wep) = ep
+            && let Some(since) = wep.connecting_since
+            && since.elapsed() < Duration::from_secs(WEBRTC_CONNECTING_WATCHDOG_SECS)
+        {
+            emitted.remove(&eid);
+            continue;
+        }
         let stats = ep.stats();
         let ms = stats
             .ms_since_last_received()
@@ -3207,7 +3289,7 @@ mod tests {
     #[test]
     fn test_handle_accept_answer_not_found() {
         let mut state = test_session_state();
-        let result = state.handle_accept_answer(EndpointId::new_v4(), "v=0\r\n", None);
+        let result = state.handle_accept_answer(EndpointId::new_v4(), "v=0\r\n", None, None);
         assert!(result.is_err());
         assert!(
             result

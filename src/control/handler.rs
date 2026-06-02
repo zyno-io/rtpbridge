@@ -630,6 +630,7 @@ async fn handle_endpoint_accept_answer_inner(
             endpoint_id: params.endpoint_id,
             sdp: params.sdp,
             expected_type,
+            expected_generation: params.offer_generation,
         },
         reply_rx,
         &id,
@@ -1371,7 +1372,13 @@ async fn handle_ice_restart(
     )
     .await
     {
-        Ok(Ok(sdp_offer)) => Response::ok(id, EndpointIceRestartResult { sdp_offer }),
+        Ok(Ok((sdp_offer, offer_generation))) => Response::ok(
+            id,
+            EndpointIceRestartResult {
+                sdp_offer,
+                offer_generation,
+            },
+        ),
         Ok(Err(e)) => Response::err(id, "ENDPOINT_ERROR", e.to_string()),
         Err(resp) => resp,
     }

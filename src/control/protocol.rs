@@ -204,6 +204,12 @@ pub struct EndpointCreateOfferResult {
 pub struct EndpointAcceptAnswerParams {
     pub endpoint_id: EndpointId,
     pub sdp: String,
+    /// Offer generation this answer is for (from a prior `ice_restart` result).
+    /// Optional and absent for the initial answer; when present the session
+    /// rejects the answer unless it matches the endpoint's current pending
+    /// offer generation. See docs/protocol/endpoints.md.
+    #[serde(default)]
+    pub offer_generation: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -306,6 +312,9 @@ pub struct EndpointIceRestartParams {
 #[derive(Debug, Serialize)]
 pub struct EndpointIceRestartResult {
     pub sdp_offer: String,
+    /// Monotonic generation of this offer. Echo back on `accept_answer` as
+    /// `offer_generation` so a stale answer for a superseded offer is rejected.
+    pub offer_generation: u64,
 }
 
 // ── SRTP Rekey ──────────────────────────────────────────────────────────

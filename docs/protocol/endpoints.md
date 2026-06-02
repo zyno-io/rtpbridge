@@ -65,10 +65,13 @@ Accept a remote SDP answer for an endpoint created with `endpoint.webrtc.create_
   "method": "endpoint.webrtc.accept_answer",
   "params": {
     "endpoint_id": "...",
-    "sdp": "v=0\r\no=..."
+    "sdp": "v=0\r\no=...",
+    "offer_generation": 2
   }
 }
 ```
+
+`offer_generation` (optional) is the generation returned by the `ice_restart` whose offer this answer responds to. When present, the answer is **rejected** unless it matches the endpoint's current pending offer generation — this prevents an answer for a superseded offer from being applied to a newer one (which would diverge ICE credentials and silently kill media). Omit it for the initial answer (no overlap risk). The generation is checked before the SDP is parsed, so a mismatch leaves the pending offer untouched and a correct retry can still be applied.
 
 **Response:**
 ```json
@@ -106,8 +109,12 @@ Perform an ICE restart on a WebRTC endpoint. Returns a new SDP offer with fresh 
 
 **Response:**
 ```json
-{"id":"5","result":{"sdp_offer":"v=0\r\no=..."}}
+{"id":"5","result":{"sdp_offer":"v=0\r\no=...","offer_generation":2}}
 ```
+
+`offer_generation` is a monotonic per-endpoint counter (incremented on each ICE restart). Echo it back as `offer_generation` on the matching `accept_answer` so a stale answer for a superseded offer is rejected — see `endpoint.webrtc.accept_answer`.
+
+**Single outstanding offer per endpoint.** The underlying WebRTC engine keeps only one pending offer per peer connection. An `ice_restart` (or `create_offer`) issued while a prior offer is still unanswered would discard that offer; a later answer to it would then apply against the newer offer, diverging the two peers' ICE credentials so no candidate pair validates and media silently dies (no error event, only an eventual `endpoint.media_timeout`, recoverable only by tearing the call down). To prevent that, `ice_restart` **rejects with an error when the endpoint already has an unanswered offer** — the caller must submit the outstanding answer (via `accept_answer`) before requesting another restart. Callers must therefore serialize the restart→answer cycle per endpoint and coalesce concurrent restart requests for the same endpoint. Each rejected request increments `rtpbridge_webrtc_ice_restart_conflicts`.
 
 #### ICE Restart Workflow
 
@@ -120,10 +127,10 @@ Perform an ICE restart on a WebRTC endpoint. Returns a new SDP offer with fresh 
 ```json
 // Step 2
 {"id":"5","method":"endpoint.webrtc.ice_restart","params":{"endpoint_id":"ep-abc"}}
-{"id":"5","result":{"sdp_offer":"v=0\r\no=..."}}
+{"id":"5","result":{"sdp_offer":"v=0\r\no=...","offer_generation":2}}
 
-// Step 4
-{"id":"6","method":"endpoint.webrtc.accept_answer","params":{"endpoint_id":"ep-abc","sdp":"v=0\r\n..."}}
+// Step 4 — echo the offer_generation from step 2
+{"id":"6","method":"endpoint.webrtc.accept_answer","params":{"endpoint_id":"ep-abc","sdp":"v=0\r\n...","offer_generation":2}}
 {"id":"6","result":{}}
 ```
 

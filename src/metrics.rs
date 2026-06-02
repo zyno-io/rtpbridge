@@ -41,6 +41,12 @@ pub struct Metrics {
     /// threshold without reaching `Connected`. One increment per stuck
     /// endpoint (the watchdog only fires once per Connecting period).
     pub webrtc_connecting_stuck: Counter,
+    /// ICE-restart requests rejected because the endpoint already had an
+    /// unanswered pending offer. str0m keeps only one pending offer, so
+    /// overwriting it would let a later answer apply against the wrong offer
+    /// (credential divergence → silent media blackhole). A non-zero value
+    /// means a caller issued overlapping ICE restarts.
+    pub webrtc_ice_restart_conflicts: Counter,
 
     /// The Prometheus registry.  Wrapped in a `Mutex` because
     /// `encode()` requires `&Registry` but we need interior mutability
@@ -76,6 +82,7 @@ impl Metrics {
         let events_dropped = Counter::default();
         let webrtc_packet_errors = Counter::default();
         let webrtc_connecting_stuck = Counter::default();
+        let webrtc_ice_restart_conflicts = Counter::default();
 
         // Note: prometheus-client automatically appends `_total` to counter
         // names in the encoded output, so we register without that suffix.
@@ -144,6 +151,11 @@ impl Metrics {
             "WebRTC endpoints that stayed in Connecting past the watchdog threshold",
             webrtc_connecting_stuck.clone(),
         );
+        registry.register(
+            "rtpbridge_webrtc_ice_restart_conflicts",
+            "ICE-restart requests rejected because an unanswered offer was already pending",
+            webrtc_ice_restart_conflicts.clone(),
+        );
         Self {
             sessions_total,
             sessions_active,
@@ -158,6 +170,7 @@ impl Metrics {
             events_dropped,
             webrtc_packet_errors,
             webrtc_connecting_stuck,
+            webrtc_ice_restart_conflicts,
             registry: Mutex::new(registry),
         }
     }

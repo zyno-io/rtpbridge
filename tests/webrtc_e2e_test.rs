@@ -231,6 +231,90 @@ async fn test_webrtc_ice_restart_new_credentials() {
     client.request_ok("session.destroy", json!({})).await;
 }
 
+/// Test: an ICE-restart answer carrying a stale `offer_generation` is rejected,
+/// while the matching generation is accepted. This is the bridge-owned
+/// offer/answer correlation that prevents an answer for a superseded offer from
+/// being applied to a newer one (which would diverge ICE credentials and kill
+/// media silently).
+#[tokio::test]
+async fn test_ice_restart_answer_rejected_on_stale_generation() {
+    let server = TestServer::start().await;
+    let mut client = TestControlClient::connect(&server.addr).await;
+    client.request_ok("session.create", json!({})).await;
+
+    // create_from_offer: rtpbridge is the answerer, so there is no pending
+    // offer and we can ICE-restart immediately.
+    let webrtc_offer = "\
+        v=0\r\n\
+        o=- 5555 1 IN IP4 127.0.0.1\r\n\
+        s=-\r\n\
+        t=0 0\r\n\
+        a=group:BUNDLE 0\r\n\
+        m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+        c=IN IP4 0.0.0.0\r\n\
+        a=mid:0\r\n\
+        a=sendrecv\r\n\
+        a=rtpmap:111 opus/48000/2\r\n\
+        a=ice-ufrag:origufrag1234\r\n\
+        a=ice-pwd:origpassword1234567890123\r\n\
+        a=fingerprint:sha-256 AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99\r\n\
+        a=setup:actpass\r\n\
+        a=rtcp-mux\r\n";
+    let result = client
+        .request_ok(
+            "endpoint.create_from_offer",
+            json!({"sdp": webrtc_offer, "direction": "sendrecv"}),
+        )
+        .await;
+    let ep_id = result["endpoint_id"].as_str().unwrap().to_string();
+
+    // ICE restart returns a monotonic generation.
+    let result = client
+        .request("endpoint.ice_restart", json!({"endpoint_id": ep_id}))
+        .await;
+    let generation = result["result"]["offer_generation"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("ice_restart must return offer_generation: {result}"));
+    assert_eq!(generation, 1, "first ICE restart is generation 1");
+    let restart_offer = result["result"]["sdp_offer"].as_str().unwrap().to_string();
+
+    // A stale answer (wrong generation) is rejected. The generation is checked
+    // before the SDP is parsed, so a dummy body is sufficient.
+    let stale = client
+        .request(
+            "endpoint.webrtc.accept_answer",
+            json!({"endpoint_id": ep_id, "sdp": "v=0\r\n", "offer_generation": generation + 1}),
+        )
+        .await;
+    assert!(
+        !stale["error"].is_null(),
+        "an answer with a stale generation must be rejected: {stale}"
+    );
+    assert!(
+        stale["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("generation"),
+        "rejection should cite the generation mismatch: {stale}"
+    );
+
+    // The matching generation is accepted (str0m peer answers the restart offer).
+    let peer_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let peer_addr = peer_socket.local_addr().unwrap();
+    let mut rtc = RtcConfig::new().set_rtp_mode(true).build(Instant::now());
+    rtc.add_local_candidate(Candidate::host(peer_addr, "udp").unwrap());
+    let offer = SdpOffer::from_sdp_string(&restart_offer).unwrap();
+    let answer = rtc.sdp_api().accept_offer(offer).unwrap().to_sdp_string();
+    client
+        .request_ok(
+            "endpoint.webrtc.accept_answer",
+            json!({"endpoint_id": ep_id, "sdp": answer, "offer_generation": generation}),
+        )
+        .await;
+
+    client.request_ok("session.destroy", json!({})).await;
+}
+
 /// Test: session.info correctly reports WebRTC endpoint types
 #[tokio::test]
 async fn test_session_info_shows_webrtc_type() {
@@ -497,7 +581,7 @@ async fn setup_connected_webrtc_endpoint(
 
     client
         .request_ok(
-            "endpoint.accept_answer",
+            "endpoint.webrtc.accept_answer",
             json!({"endpoint_id": ep_id, "sdp": answer_str}),
         )
         .await;
@@ -934,7 +1018,7 @@ async fn test_double_ice_restart() {
     let answer = rtc.sdp_api().accept_offer(offer).unwrap();
     client
         .request_ok(
-            "endpoint.accept_answer",
+            "endpoint.webrtc.accept_answer",
             json!({"endpoint_id": ep_id, "sdp": answer.to_sdp_string()}),
         )
         .await;
@@ -955,7 +1039,7 @@ async fn test_double_ice_restart() {
     let answer1 = rtc.sdp_api().accept_offer(offer1_parsed).unwrap();
     client
         .request_ok(
-            "endpoint.accept_answer",
+            "endpoint.webrtc.accept_answer",
             json!({"endpoint_id": ep_id, "sdp": answer1.to_sdp_string()}),
         )
         .await;

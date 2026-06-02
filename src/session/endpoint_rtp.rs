@@ -218,6 +218,30 @@ impl RtpEndpoint {
         self.last_source_ts = None;
         self.dtmf_wire_ts = None;
         self.last_rtp_timestamp = new_ts;
+
+        // A new SSRC starts a fresh SRTP cryptographic context on the wire: the
+        // peer (re-)initialises its per-SSRC rollover counter (ROC) at 0 when it
+        // first sees the new SSRC. Reset our TX sequence/ROC state to match.
+        //
+        // Without this the prior stream's `roc`/`highest_seq` carry over, and
+        // because `update_roc` keys ROC globally (not per-SSRC) it can even
+        // spuriously increment ROC on the first packet when the new random seq
+        // is < 0x8000 while the stale `highest_seq` is > 0x8000. The auth tag
+        // covers the ROC, so any ROC disagreement makes EVERY outbound SRTP
+        // packet fail the peer's auth check — the peer silently drops them and
+        // hears nothing while still being heard. This is the one-way-audio seen
+        // after a hold long enough to drive the direction back through
+        // recvonly→sendrecv (which is what triggers this SSRC rotation). Mirrors
+        // the RX-side `reset_sequence_state()` already done in `update_remote_sdp`.
+        //
+        // SRTCP TX index is intentionally NOT reset: the index travels on the
+        // wire and the IV is keyed by (ssrc, wire-index), so a new SSRC stays
+        // decryptable, and keeping the index monotonic avoids tripping the
+        // peer's SRTCP replay window.
+        if let Some(ref mut tx) = self.srtp_tx {
+            tx.reset_sequence_state();
+        }
+
         debug!(
             endpoint_id = %self.id,
             prev_ssrc = prev,
@@ -1539,6 +1563,52 @@ mod tests {
             30000,
             "accept_answer with rtcp-mux should set RTCP addr = RTP addr"
         );
+    }
+
+    #[tokio::test]
+    async fn test_bump_outbound_ssrc_resets_srtp_tx_roc() {
+        // Regression for post-hold one-way audio. On unhold the outbound SSRC is
+        // rotated via bump_outbound_ssrc(); the peer re-initialises its per-SSRC
+        // ROC at 0 for the new SSRC, so our SRTP TX ROC must reset too. Without
+        // the reset, a stale highest_seq in the upper half (> 0x8000) plus the
+        // post-bump low sequence number spuriously bumps TX ROC to 1. The auth
+        // tag covers the ROC, so a fresh receiver (ROC 0) rejects every packet —
+        // the just-unheld peer hears nothing while still being heard.
+        let pool =
+            crate::net::socket_pool::SocketPool::new("127.0.0.1".parse().unwrap(), 52100, 52200)
+                .unwrap();
+        let pair = pool.allocate_pair().await.unwrap();
+        let mut ep = RtpEndpoint::new(EndpointId::new_v4(), EndpointDirection::SendRecv, pair);
+
+        let key_material: [u8; 30] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+            0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C,
+            0x1D, 0x1E,
+        ];
+        let key = base64_encode(&key_material);
+        ep.srtp_tx = Some(SrtpContext::from_sdes_key(&key).unwrap());
+
+        // Drive the TX context's highest_seq into the upper half (> 0x8000) — the
+        // state a hold's worth of outbound (hold music) leaves behind.
+        let high =
+            crate::media::rtp::RtpHeader::build(0, 0xFFF0, 1600, 0x1111_1111, false, &[0x11; 160]);
+        ep.srtp_tx.as_mut().unwrap().protect(&high).unwrap();
+
+        // Unhold: rotate the outbound SSRC.
+        ep.bump_outbound_ssrc();
+
+        // Next outbound packet rides the new SSRC with a fresh low sequence.
+        let low =
+            crate::media::rtp::RtpHeader::build(0, 0x0001, 160, ep.our_ssrc, false, &[0xAA; 160]);
+        let encrypted = ep.srtp_tx.as_mut().unwrap().protect(&low).unwrap();
+
+        // A brand-new receiver (ROC 0, as the peer derives for the new SSRC) must
+        // authenticate + decrypt. Fails if TX ROC was left/bumped to 1.
+        let mut fresh_rx = SrtpContext::from_sdes_key(&key).unwrap();
+        let decrypted = fresh_rx
+            .unprotect(&encrypted)
+            .expect("fresh receiver must decrypt post-bump packet (TX ROC must reset to 0)");
+        assert_eq!(decrypted, low);
     }
 
     #[tokio::test]

@@ -516,13 +516,12 @@ pub struct OutboundStats {
 /// identical to the SDP `a=` attribute the peer negotiated. This is the single
 /// convention used throughout the media plane (routing, file/tone sources, spy
 /// sinks):
-///   - `SendOnly`  — the peer sends; the endpoint is a routing **source**
-///                   (rtpbridge receives from the peer and forwards), and
-///                   rtpbridge does NOT transmit to the peer.
-///   - `RecvOnly`  — the peer receives; the endpoint is a routing **destination**
-///                   (rtpbridge transmits to the peer), and its inbound is NOT
-///                   forwarded.
-///   - `SendRecv`  — both. `Inactive` — neither.
+/// - `SendOnly` — the peer sends; the endpoint is a routing **source**
+///   (rtpbridge receives from the peer and forwards), and rtpbridge does NOT
+///   transmit to the peer.
+/// - `RecvOnly` — the peer receives; the endpoint is a routing **destination**
+///   (rtpbridge transmits to the peer), and its inbound is NOT forwarded.
+/// - `SendRecv` — both. `Inactive` — neither.
 ///
 /// `routing.rs` is the source of truth for this convention; the SDP→enum parse
 /// (`endpoint_direction_from_sdp`) and `is_sending()` are kept consistent with it.

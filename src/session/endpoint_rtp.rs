@@ -353,7 +353,7 @@ impl RtpEndpoint {
         if let Some(dir) = parsed
             .direction
             .as_deref()
-            .and_then(map_remote_direction_to_local)
+            .and_then(endpoint_direction_from_sdp)
         {
             endpoint.last_remote_direction = Some(dir);
             if endpoint.direction_auto {
@@ -512,7 +512,7 @@ impl RtpEndpoint {
         if let Some(dir) = parsed
             .direction
             .as_deref()
-            .and_then(map_remote_direction_to_local)
+            .and_then(endpoint_direction_from_sdp)
         {
             self.last_remote_direction = Some(dir);
             if self.direction_auto {
@@ -644,7 +644,7 @@ impl RtpEndpoint {
         if let Some(dir) = parsed
             .direction
             .as_deref()
-            .and_then(map_remote_direction_to_local)
+            .and_then(endpoint_direction_from_sdp)
         {
             self.last_remote_direction = Some(dir);
             if self.direction_auto {
@@ -1304,11 +1304,18 @@ impl RtpEndpoint {
     }
 }
 
-fn map_remote_direction_to_local(remote_dir: &str) -> Option<EndpointDirection> {
+/// Parse a peer's SDP `a=` direction attribute into an `EndpointDirection`.
+///
+/// `EndpointDirection` is expressed from the peer's perspective (see its doc in
+/// `protocol.rs`), which is exactly what the SDP attribute already encodes, so
+/// this is a direct mapping — NOT a mirror. e.g. a peer offering `a=sendonly`
+/// (the peer sends, won't receive) becomes `SendOnly`, which `routing.rs` treats
+/// as a source that rtpbridge does not transmit to.
+fn endpoint_direction_from_sdp(remote_dir: &str) -> Option<EndpointDirection> {
     match remote_dir {
         "sendrecv" => Some(EndpointDirection::SendRecv),
-        "recvonly" => Some(EndpointDirection::SendOnly), // remote receives -> we send
-        "sendonly" => Some(EndpointDirection::RecvOnly), // remote sends -> we receive
+        "recvonly" => Some(EndpointDirection::RecvOnly),
+        "sendonly" => Some(EndpointDirection::SendOnly),
         "inactive" => Some(EndpointDirection::Inactive),
         _ => None,
     }
@@ -1540,8 +1547,8 @@ mod tests {
 
         assert_eq!(
             ep.config.direction,
-            EndpointDirection::SendOnly,
-            "initial remote recvonly should map to local sendonly"
+            EndpointDirection::RecvOnly,
+            "remote a=recvonly parses directly to RecvOnly (peer-perspective)"
         );
     }
 
@@ -1654,8 +1661,8 @@ mod tests {
 
         assert_eq!(
             ep.config.direction,
-            EndpointDirection::RecvOnly,
-            "initial remote sendonly should map to local recvonly"
+            EndpointDirection::SendOnly,
+            "remote a=sendonly parses directly to SendOnly (peer-perspective)"
         );
     }
 
@@ -1779,8 +1786,8 @@ mod tests {
         ep.update_remote_sdp(reinvite_sendonly).unwrap();
         assert_eq!(
             ep.config.direction,
-            EndpointDirection::RecvOnly,
-            "remote sendonly should map to local recvonly in auto mode"
+            EndpointDirection::SendOnly,
+            "remote a=sendonly parses directly to SendOnly in auto mode (peer-perspective)"
         );
     }
 
@@ -1792,8 +1799,10 @@ mod tests {
         let pair = pool.allocate_pair().await.unwrap();
         let mut ep = RtpEndpoint::new(EndpointId::new_v4(), EndpointDirection::SendRecv, pair);
 
-        ep.set_direction_override(EndpointDirectionUpdate::SendOnly);
-        assert_eq!(ep.config.direction, EndpointDirection::SendOnly);
+        // Override to RecvOnly so it differs from the direction the SDP below
+        // parses to (a=sendonly -> SendOnly), making the override-wins check real.
+        ep.set_direction_override(EndpointDirectionUpdate::RecvOnly);
+        assert_eq!(ep.config.direction, EndpointDirection::RecvOnly);
 
         let reinvite_sendonly = "\
             v=0\r\n\
@@ -1810,15 +1819,15 @@ mod tests {
         ep.update_remote_sdp(reinvite_sendonly).unwrap();
         assert_eq!(
             ep.config.direction,
-            EndpointDirection::SendOnly,
+            EndpointDirection::RecvOnly,
             "manual override must win over remote SDP direction"
         );
 
         ep.set_direction_override(EndpointDirectionUpdate::Auto);
         assert_eq!(
             ep.config.direction,
-            EndpointDirection::RecvOnly,
-            "switching back to auto should apply last remote SDP direction"
+            EndpointDirection::SendOnly,
+            "switching back to auto should apply last remote SDP direction (a=sendonly -> SendOnly)"
         );
     }
 
@@ -2364,9 +2373,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_direction_is_sending_classification() {
+        // is_sending() == "rtpbridge transmits to the peer" == the peer is
+        // willing to receive (peer-perspective: SendRecv or RecvOnly).
         assert!(EndpointDirection::SendRecv.is_sending());
-        assert!(EndpointDirection::SendOnly.is_sending());
-        assert!(!EndpointDirection::RecvOnly.is_sending());
+        assert!(EndpointDirection::RecvOnly.is_sending());
+        assert!(!EndpointDirection::SendOnly.is_sending());
         assert!(!EndpointDirection::Inactive.is_sending());
     }
 }

@@ -274,6 +274,24 @@ Change endpoint direction policy in the routing table.
 - Explicit directions (`sendrecv`, `sendonly`, `recvonly`, `inactive`) set a manual override.
 - `auto` clears the manual override.
 
+**Direction convention (peer-perspective).** Endpoint direction is expressed from
+the *peer's* point of view — identical to the SDP `a=` attribute the peer
+negotiated — and is the single convention used across the whole media plane
+(routing, file/tone sources, listen/spy sinks):
+
+| Direction  | Meaning (peer's view) | Routing role |
+|------------|-----------------------|--------------|
+| `sendonly` | peer sends, won't receive | **source** — rtpbridge receives from the peer and forwards; does NOT transmit to the peer |
+| `recvonly` | peer receives, won't send | **destination** — rtpbridge transmits to the peer; does NOT forward the peer's inbound |
+| `sendrecv` | both | source + destination |
+| `inactive` | neither | isolated (no media in either direction) |
+
+So to stop transmitting to a leg, mark it `sendonly` (or `inactive`); to fully
+isolate a leg (e.g. a held party that should neither hear nor be heard), use
+`inactive`. A controller's hold policy is expressed here — rtpbridge does not
+infer it from `a=sendonly` alone (which per SDP would still forward the peer's
+audio as a source).
+
 ```json
 {
   "id": "4",

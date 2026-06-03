@@ -512,6 +512,20 @@ pub struct OutboundStats {
 
 // ── Shared Enums ────────────────────────────────────────────────────────
 
+/// Media direction of an endpoint, expressed from the **peer's perspective** —
+/// identical to the SDP `a=` attribute the peer negotiated. This is the single
+/// convention used throughout the media plane (routing, file/tone sources, spy
+/// sinks):
+///   - `SendOnly`  — the peer sends; the endpoint is a routing **source**
+///                   (rtpbridge receives from the peer and forwards), and
+///                   rtpbridge does NOT transmit to the peer.
+///   - `RecvOnly`  — the peer receives; the endpoint is a routing **destination**
+///                   (rtpbridge transmits to the peer), and its inbound is NOT
+///                   forwarded.
+///   - `SendRecv`  — both. `Inactive` — neither.
+///
+/// `routing.rs` is the source of truth for this convention; the SDP→enum parse
+/// (`endpoint_direction_from_sdp`) and `is_sending()` are kept consistent with it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EndpointDirection {
     #[serde(rename = "sendrecv")]
@@ -526,8 +540,10 @@ pub enum EndpointDirection {
 
 impl EndpointDirection {
     /// Whether this direction permits the endpoint to transmit to its peer.
+    /// Peer-perspective: rtpbridge transmits to a peer that is willing to
+    /// receive, i.e. `SendRecv` or `RecvOnly`.
     pub fn is_sending(self) -> bool {
-        matches!(self, Self::SendRecv | Self::SendOnly)
+        matches!(self, Self::SendRecv | Self::RecvOnly)
     }
 }
 

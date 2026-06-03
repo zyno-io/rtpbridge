@@ -384,10 +384,11 @@ async fn test_unhold_rotates_outbound_ssrc() {
 /// must also rotate the outbound SSRC. Mirror of the RPC-driven test above
 /// for the SDP-driven path that classic SIP devices actually use.
 ///
-/// Hold from the remote's perspective is `a=sendonly` (it sends hold music or
-/// nothing, doesn't receive). That maps to local `RecvOnly` — not sending.
-/// Unhold is `a=sendrecv` again. Locally `SendRecv` — sending. The non-sending
-/// → sending transition must trigger the bump.
+/// Hold from the remote's perspective is `a=sendonly` (the peer sends hold music
+/// or nothing, and won't receive). Peer-perspective parsing maps that directly to
+/// `SendOnly`, for which `is_sending()` is false (rtpbridge does not transmit to a
+/// peer that won't receive). Unhold is `a=sendrecv` → `SendRecv`, `is_sending()`
+/// true. The non-sending → sending transition must trigger the bump.
 #[tokio::test]
 async fn test_unhold_via_reinvite_rotates_outbound_ssrc() {
     fn ssrc_of(pkt: &[u8]) -> Option<u32> {

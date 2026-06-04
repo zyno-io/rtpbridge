@@ -50,6 +50,9 @@ const REORDER_MAX_FRAMES: usize = 256;
 /// Reorder-mode hold: release the head across a sequence gap once this many packets pile up
 /// behind it (bounds reorder tolerance without wall-clock pacing).
 const REORDER_DEPTH: usize = 3;
+/// A wall-clock arrival gap longer than this starts a new talkspurt: the paced anchor is reset
+/// so a resumed stream isn't scheduled against a stale (pre-silence) reference.
+const TRACKED_GAP_RESET: Duration = Duration::from_millis(200);
 
 /// Which clock model a source's buffer uses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,6 +123,7 @@ impl PlayoutBuffer {
             max_seq: 0,
             seen_any: false,
             last_emitted_ext: None,
+            last_arrival: None,
             anchor: None,
             target_delay: Duration::from_millis(target_ms),
             max_delay: Duration::from_millis(if mixer_fed {
@@ -177,6 +181,12 @@ impl PlayoutBuffer {
     /// (the latter to keep a mixer's sources frame-aligned).
     pub fn drains_burst(&self) -> bool {
         matches!(self, PlayoutBuffer::Tracked(t) if !t.mixer_fed)
+    }
+
+    /// Whether this is a mixer-fed (paced) Tracked buffer. Used to detect a shallow↔deep mode
+    /// change so the buffer is rebuilt (Synth is never mixer-fed).
+    pub fn is_mixer_fed(&self) -> bool {
+        matches!(self, PlayoutBuffer::Tracked(t) if t.mixer_fed)
     }
 
     /// Take and reset the cumulative counters' delta since the last call.
@@ -313,6 +323,8 @@ pub struct TrackedClock {
     max_seq: u16,
     seen_any: bool,
     last_emitted_ext: Option<u64>,
+    /// Wall-clock arrival of the previous push, to detect a talkspurt gap and re-anchor.
+    last_arrival: Option<Instant>,
     // Playout anchor: (sender ts at anchor, local play time of that ts).
     anchor: Option<(u32, Instant)>,
     target_delay: Duration,
@@ -334,6 +346,7 @@ impl TrackedClock {
         self.roc = 0;
         self.seen_any = false;
         self.last_emitted_ext = None;
+        self.last_arrival = None;
         self.anchor = None;
         self.queue.clear();
         self.pending_marker = true;
@@ -341,12 +354,14 @@ impl TrackedClock {
     }
 
     /// Extend a 16-bit sequence number to a monotonic 64-bit value, tracking rollover.
-    /// Does not mutate state for reordered (older) packets.
-    fn extend_seq(&mut self, seq: u16) -> u64 {
+    /// Does not mutate state for reordered (older) packets. Returns `None` when the packet
+    /// predates the stream's first epoch (a reorder that would underflow the rollover counter)
+    /// — the caller drops it as late.
+    fn extend_seq(&mut self, seq: u16) -> Option<u64> {
         if !self.seen_any {
             self.seen_any = true;
             self.max_seq = seq;
-            return ((self.roc as u64) << 16) | seq as u64;
+            return Some(((self.roc as u64) << 16) | seq as u64);
         }
         let forward = seq.wrapping_sub(self.max_seq); // 0..=0x7fff = forward/equal
         if forward < 0x8000 {
@@ -354,15 +369,17 @@ impl TrackedClock {
                 self.roc = self.roc.wrapping_add(1); // wrapped past 0xffff
             }
             self.max_seq = seq;
-            ((self.roc as u64) << 16) | seq as u64
-        } else {
-            // Reordered/older: compute ext relative to current roc, dropping a rollover if
-            // this older packet sits in the previous 16-bit epoch.
-            if seq > self.max_seq && self.roc > 0 {
-                (((self.roc - 1) as u64) << 16) | seq as u64
+            Some(((self.roc as u64) << 16) | seq as u64)
+        } else if seq > self.max_seq {
+            // Reordered/older, wrapped back into the previous 16-bit epoch.
+            if self.roc == 0 {
+                None // predates epoch 0 → genuinely old, drop as late
             } else {
-                ((self.roc as u64) << 16) | seq as u64
+                Some((((self.roc - 1) as u64) << 16) | seq as u64)
             }
+        } else {
+            // Reordered/older within the current epoch.
+            Some(((self.roc as u64) << 16) | seq as u64)
         }
     }
 
@@ -373,7 +390,22 @@ impl TrackedClock {
             None => self.ssrc = Some(pkt.ssrc),
         }
 
-        let ext = self.extend_seq(pkt.sequence_number);
+        // Talkspurt gap: a long arrival silence means the stream paused; drop the stale paced
+        // anchor so the resumed stream re-anchors to now (and re-marks). Harmless in reorder
+        // mode (no anchor), where it just re-marks the resume.
+        if let Some(last) = self.last_arrival
+            && arrival.saturating_duration_since(last) > TRACKED_GAP_RESET
+        {
+            self.anchor = None;
+            self.pending_marker = true;
+            self.underflow_run = 0;
+        }
+        self.last_arrival = Some(arrival);
+
+        let Some(ext) = self.extend_seq(pkt.sequence_number) else {
+            self.counters.late_drops += 1; // predates the stream → too old
+            return;
+        };
         if let Some(last) = self.last_emitted_ext
             && ext <= last
         {
@@ -431,23 +463,36 @@ impl TrackedClock {
         }
     }
 
-    /// Mixer-fed: emit at most one frame, when its sender-clock play time has arrived. Grows
-    /// the target delay on repeated underflow (Phase 5 adaptivity).
+    /// Mixer-fed: emit at most one frame, when its sender-clock play time has arrived. Drops a
+    /// head that is stale beyond a full buffer depth (event-loop/network stall — playing it
+    /// would only add latency). Grows the target delay on repeated underflow (Phase 5).
     fn drain_paced(&mut self, grid_now: Instant) -> Option<RoutedRtpPacket> {
         let (anchor_ts, anchor_play) = self.anchor?;
-        let Some((&head_ext, head)) = self.queue.iter().next() else {
-            self.underflow_run += 1;
-            if self.underflow_run >= 3 && self.target_delay < self.max_delay {
-                self.target_delay = (self.target_delay + FRAME).min(self.max_delay);
-                self.underflow_run = 0;
+        loop {
+            let (head_ext, head_ts) = match self.queue.iter().next() {
+                Some((&ext, pkt)) => (ext, pkt.timestamp),
+                None => {
+                    self.underflow_run += 1;
+                    if self.underflow_run >= 3 && self.target_delay < self.max_delay {
+                        self.target_delay = (self.target_delay + FRAME).min(self.max_delay);
+                        self.underflow_run = 0;
+                    }
+                    return None;
+                }
+            };
+            let play = self.play_time(head_ts, anchor_ts, anchor_play);
+            if play > grid_now {
+                return None; // not due yet
             }
-            return None;
-        };
-        if self.play_time(head.timestamp, anchor_ts, anchor_play) <= grid_now {
+            if grid_now.saturating_duration_since(play) > self.max_delay {
+                // Stale: skip it and try the next, catching up instead of replaying old audio.
+                self.queue.remove(&head_ext);
+                self.last_emitted_ext = Some(head_ext);
+                self.counters.late_drops += 1;
+                continue;
+            }
             self.underflow_run = 0;
-            Some(self.take_head(head_ext))
-        } else {
-            None
+            return Some(self.take_head(head_ext));
         }
     }
 
@@ -457,8 +502,10 @@ impl TrackedClock {
     fn drain_reorder(&mut self) -> Option<RoutedRtpPacket> {
         let head_ext = *self.queue.keys().next()?;
         let releasable = match self.last_emitted_ext {
-            // Stream start: hold until the reorder window fills, then release the lowest seq.
-            None => self.queue.len() >= REORDER_DEPTH,
+            // Stream start: release the lowest seq immediately (1:1 cadence, no startup hold).
+            None => true,
+            // In stream: the contiguous successor, or — across a gap — force-release the head
+            // once the reorder window has filled behind it.
             Some(last) => head_ext == last.wrapping_add(1) || self.queue.len() >= REORDER_DEPTH,
         };
         releasable.then(|| self.take_head(head_ext))
@@ -716,16 +763,55 @@ mod tests {
     }
 
     #[test]
+    fn paced_reanchors_after_talkspurt_gap() {
+        let mut b = PlayoutBuffer::tracked(Uuid::new_v4(), 8000, true);
+        let t0 = Instant::now();
+        // A short early spurt (e.g. NAT-latch packets) sets the anchor.
+        b.push(rtp(0, 0, 42), t0);
+        assert!(
+            b.drain_tick(t0 + Duration::from_millis(TRACKED_MIXER_TARGET_MS))
+                .is_some()
+        );
+        // Long silence, then the real stream resumes. Without re-anchoring, these frames would
+        // be scheduled against the stale anchor and stale-dropped, delivering nothing.
+        let resume = t0 + Duration::from_secs(1);
+        b.push(rtp(1, 160, 42), resume);
+        let due = resume + Duration::from_millis(TRACKED_MIXER_TARGET_MS) + FRAME;
+        let p = b
+            .drain_tick(due)
+            .expect("resumed stream must play, not be stale-dropped");
+        assert_eq!(p.sequence_number, 1);
+        assert!(p.marker, "resume after a gap re-marks the talkspurt");
+        assert_eq!(
+            b.take_counters().late_drops,
+            0,
+            "no frames dropped on resume"
+        );
+    }
+
+    #[test]
     fn extend_seq_handles_wrap() {
         let mut t = match PlayoutBuffer::tracked(Uuid::new_v4(), 8000, false) {
             PlayoutBuffer::Tracked(t) => t,
             _ => unreachable!(),
         };
-        assert_eq!(t.extend_seq(65534), 65534);
-        assert_eq!(t.extend_seq(65535), 65535);
-        assert_eq!(t.extend_seq(0), 65536); // rolled over
-        assert_eq!(t.extend_seq(1), 65537);
+        assert_eq!(t.extend_seq(65534), Some(65534));
+        assert_eq!(t.extend_seq(65535), Some(65535));
+        assert_eq!(t.extend_seq(0), Some(65536)); // rolled over
+        assert_eq!(t.extend_seq(1), Some(65537));
         // A reordered older packet from the previous epoch extends below the rollover.
-        assert_eq!(t.extend_seq(65535), 65535);
+        assert_eq!(t.extend_seq(65535), Some(65535));
+    }
+
+    #[test]
+    fn extend_seq_drops_packet_predating_first_epoch() {
+        let mut t = match PlayoutBuffer::tracked(Uuid::new_v4(), 8000, false) {
+            PlayoutBuffer::Tracked(t) => t,
+            _ => unreachable!(),
+        };
+        // Stream starts at seq 0 (roc 0). A reordered older seq 65535 has no prior epoch to
+        // extend into — it must be dropped, not treated as a far-future packet.
+        assert_eq!(t.extend_seq(0), Some(0));
+        assert_eq!(t.extend_seq(65535), None);
     }
 }

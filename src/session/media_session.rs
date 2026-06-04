@@ -2198,16 +2198,16 @@ impl SessionState {
         for (id, policy) in &decisions {
             match policy {
                 Policy::Engaged(kind) => {
-                    let matches_existing = self
-                        .playout_buffers
-                        .get(id)
-                        .is_some_and(|b| b.kind() == *kind);
-                    if !matches_existing {
-                        // (Re)create the buffer; an existing one of the right kind is kept so
-                        // its timeline/SSRC stays stable across unrelated routing rebuilds.
-                        if let Some(buf) = self.make_playout_buffer(*id, *kind) {
-                            self.playout_buffers.insert(*id, buf);
-                        }
+                    // Keep an existing buffer of the right kind AND mode so its timeline/SSRC
+                    // stays stable across unrelated rebuilds; rebuild on a shallow↔deep
+                    // (mixer-fed) transition so the mixer one-frame-per-tick invariant holds.
+                    let matches_existing = self.playout_buffers.get(id).is_some_and(|b| {
+                        b.kind() == *kind
+                            && (*kind != PlayoutKind::Tracked
+                                || b.is_mixer_fed() == self.source_is_mixer_fed(*id))
+                    });
+                    if !matches_existing && let Some(buf) = self.make_playout_buffer(*id, *kind) {
+                        self.playout_buffers.insert(*id, buf);
                     }
                 }
                 Policy::Bypass => {
@@ -2236,14 +2236,20 @@ impl SessionState {
             Endpoint::File(_) | Endpoint::Tone(_) => Policy::Bypass,
             // Real network sources: buffer only where rtpbridge isn't transparent.
             Endpoint::Rtp(_) | Endpoint::WebRtc(_) => {
+                // An active VAD/fax tap decodes the stream in arrival order, so it forces
+                // buffering even with no routed destinations.
                 let taps =
                     self.vad_monitors.contains_key(&id) || self.fax_detectors.contains_key(&id);
-                let Some(dests) = self.routing.destinations(&id) else {
-                    return Policy::Bypass; // no consumers
-                };
-                if dests.is_empty() {
-                    return Policy::Bypass;
+                let dests = self.routing.destinations(&id);
+                let has_dests = dests.is_some_and(|d| !d.is_empty());
+                if !has_dests {
+                    return if taps {
+                        Policy::Engaged(PlayoutKind::Tracked) // reorder for the analysis decode
+                    } else {
+                        Policy::Bypass // no consumers at all
+                    };
                 }
+                let dests = dests.expect("has_dests implies Some");
                 let src_codec = endpoint_audio_codec(ep);
                 let mut mixed = false;
                 let mut opaque = false;
@@ -2288,15 +2294,20 @@ impl SessionState {
                 rand::random(),
                 rand::random(),
             )),
-            PlayoutKind::Tracked => {
-                // Deep (mixer-fed) vs shallow (reorder-only) target delay.
-                let mixer_fed = self
-                    .routing
-                    .destinations(&id)
-                    .is_some_and(|dests| dests.iter().any(|d| self.routing.is_multi_source(d)));
-                Some(PlayoutBuffer::tracked(id, clock_rate, mixer_fed))
-            }
+            // Deep paced (mixer-fed) vs shallow reorder-only.
+            PlayoutKind::Tracked => Some(PlayoutBuffer::tracked(
+                id,
+                clock_rate,
+                self.source_is_mixer_fed(id),
+            )),
         }
+    }
+
+    /// Whether a source routes to any multi-source (mixer) destination → deep paced Tracked.
+    fn source_is_mixer_fed(&self, id: EndpointId) -> bool {
+        self.routing
+            .destinations(&id)
+            .is_some_and(|dests| dests.iter().any(|d| self.routing.is_multi_source(d)))
     }
 
     fn emit_stats(&self) {

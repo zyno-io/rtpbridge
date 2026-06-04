@@ -206,6 +206,17 @@ impl DestinationMixer {
         Ok(std::mem::take(&mut self.output_queue))
     }
 
+    /// Flush the frame accumulated during one wall-clock grid tick, queuing it for `drain`.
+    ///
+    /// Called once per 20 ms grid tick (after all of the tick's `feed`s, before `drain`) so
+    /// the mixer is wall-clock-clocked when fed by paced playout buffers. Additive with the
+    /// implicit second-contribution flush in [`feed`](Self::feed), which still handles sources
+    /// that contribute more than once per tick (file/tone catch-up, arrival-fed RTP). The
+    /// inner [`flush_frame`](Self::flush_frame) is guarded so an all-idle tick emits nothing.
+    pub fn flush_tick(&mut self) -> Result<()> {
+        self.flush_frame()
+    }
+
     /// Seed the output timestamp to continue from a previous value.
     /// Call this when transitioning from passthrough to mixing so the
     /// receiver's jitter buffer doesn't see a discontinuity.

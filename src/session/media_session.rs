@@ -19,6 +19,7 @@ use super::endpoint_webrtc::{WebRtcEndpoint, WebRtcEvent};
 use super::endpoint_websocket::{AudioWsStream, WebSocketEndpoint};
 use super::fax_tap;
 use super::file_poll::FileRtpState;
+use super::playout::{PlayoutBuffer, PlayoutKind, Policy};
 use super::routing::RoutingTable;
 use super::session_dtmf::{EndpointDtmf, PendingDtmfInjection};
 use super::vad_tap;
@@ -313,6 +314,14 @@ struct SessionState {
     /// Per-destination audio mixers for multi-party conferences (3+ endpoints).
     /// Active only for destinations receiving from 2+ sources.
     mixers: HashMap<EndpointId, super::mixer::DestinationMixer>,
+    /// Per-source playout / re-pacing buffers. Clockless sources (WS/Bridge) get a
+    /// Synth buffer; non-transparent RTP/WebRTC sources get a Tracked buffer. Transparent
+    /// relay sources have no entry (see [`Policy::Bypass`]).
+    playout_buffers: HashMap<EndpointId, PlayoutBuffer>,
+    /// Engagement decision per source, recomputed on routing/tap changes.
+    playout_policy: HashMap<EndpointId, Policy>,
+    /// Next shared 20 ms playout-grid instant; `None` when no buffer has pending audio.
+    mix_grid: Option<Instant>,
     /// Shared registry of pending WebSocket audio connect tokens. The session
     /// inserts a token per WS endpoint and removes it on endpoint/session teardown.
     ws_audio_registry: Arc<crate::control::ws_audio::WsAudioRegistry>,
@@ -1818,30 +1827,38 @@ impl SessionState {
         silence_interval_ms: u32,
         speech_threshold: f32,
     ) -> anyhow::Result<()> {
-        vad_tap::vad_start(
+        let result = vad_tap::vad_start(
             &self.endpoints,
             &mut self.vad_monitors,
             endpoint_id,
             silence_interval_ms,
             speech_threshold,
-        )
+        );
+        // A tap makes an otherwise-transparent source non-transparent (analysis decodes in
+        // order), so re-evaluate playout engagement.
+        self.recompute_playout_policy();
+        result
     }
 
     fn handle_vad_stop(&mut self, endpoint_id: EndpointId) -> anyhow::Result<()> {
         let result = vad_tap::vad_stop(&mut self.vad_monitors, endpoint_id);
         self.prune_analysis_decoder(endpoint_id);
+        self.recompute_playout_policy();
         result
     }
 
     // ── Fax tone detection ───────────────────────────────────────────
 
     fn handle_fax_detect_start(&mut self, endpoint_id: EndpointId) -> anyhow::Result<()> {
-        fax_tap::fax_start(&self.endpoints, &mut self.fax_detectors, endpoint_id)
+        let result = fax_tap::fax_start(&self.endpoints, &mut self.fax_detectors, endpoint_id);
+        self.recompute_playout_policy();
+        result
     }
 
     fn handle_fax_detect_stop(&mut self, endpoint_id: EndpointId) -> anyhow::Result<()> {
         let result = fax_tap::fax_stop(&mut self.fax_detectors, endpoint_id);
         self.prune_analysis_decoder(endpoint_id);
+        self.recompute_playout_policy();
         result
     }
 
@@ -2097,6 +2114,8 @@ impl SessionState {
         for mixer in self.mixers.values_mut() {
             mixer.remove_source(&endpoint_id);
         }
+        self.playout_buffers.remove(&endpoint_id);
+        self.playout_policy.remove(&endpoint_id);
     }
 
     fn rebuild_routing(&mut self) {
@@ -2115,6 +2134,7 @@ impl SessionState {
             .store(self.endpoints.len(), std::sync::atomic::Ordering::Relaxed);
         self.routing.rebuild(&ep_list);
         self.rebuild_mixers();
+        self.recompute_playout_policy();
         // Track when endpoint count drops to zero for empty session timeout
         if self.endpoints.is_empty() {
             if self.empty_since.is_none() {
@@ -2160,6 +2180,122 @@ impl SessionState {
         for (&dest_id, mixer) in &mut self.mixers {
             let active_sources = self.routing.sources_for(&dest_id);
             mixer.retain_sources(&active_sources);
+        }
+    }
+
+    /// Recompute per-source playout engagement and reconcile the buffer set. Called whenever
+    /// the routing graph or an analysis tap (VAD/fax) changes, since both affect whether a
+    /// source is a transparent relay. A stale policy is the only way a bypassed source could
+    /// reach a non-transparent consumer, so this must run on every such change.
+    fn recompute_playout_policy(&mut self) {
+        // Phase 1: decide policy per endpoint (immutable borrow of endpoints/routing/taps).
+        let decisions: Vec<(EndpointId, Policy)> = self
+            .endpoints
+            .keys()
+            .map(|&id| (id, self.playout_policy_for(id)))
+            .collect();
+
+        for (id, policy) in &decisions {
+            match policy {
+                Policy::Engaged(kind) => {
+                    let matches_existing = self
+                        .playout_buffers
+                        .get(id)
+                        .is_some_and(|b| b.kind() == *kind);
+                    if !matches_existing {
+                        // (Re)create the buffer; an existing one of the right kind is kept so
+                        // its timeline/SSRC stays stable across unrelated routing rebuilds.
+                        if let Some(buf) = self.make_playout_buffer(*id, *kind) {
+                            self.playout_buffers.insert(*id, buf);
+                        }
+                    }
+                }
+                Policy::Bypass => {
+                    self.playout_buffers.remove(id);
+                }
+            }
+            self.playout_policy.insert(*id, *policy);
+        }
+
+        // Drop policy/buffers for endpoints that no longer exist.
+        self.playout_policy
+            .retain(|id, _| self.endpoints.contains_key(id));
+        self.playout_buffers
+            .retain(|id, _| self.endpoints.contains_key(id));
+    }
+
+    /// Decide the playout policy for one source endpoint.
+    fn playout_policy_for(&self, id: EndpointId) -> Policy {
+        let Some(ep) = self.endpoints.get(&id) else {
+            return Policy::Bypass;
+        };
+        match ep {
+            // Clockless sources always need rtpbridge to be the clock master.
+            Endpoint::WebSocket(_) | Endpoint::Bridge(_) => Policy::Engaged(PlayoutKind::Synth),
+            // Generators are already paced; never buffered.
+            Endpoint::File(_) | Endpoint::Tone(_) => Policy::Bypass,
+            // Real network sources: buffer only where rtpbridge isn't transparent.
+            Endpoint::Rtp(_) | Endpoint::WebRtc(_) => {
+                let taps =
+                    self.vad_monitors.contains_key(&id) || self.fax_detectors.contains_key(&id);
+                let Some(dests) = self.routing.destinations(&id) else {
+                    return Policy::Bypass; // no consumers
+                };
+                if dests.is_empty() {
+                    return Policy::Bypass;
+                }
+                let src_codec = endpoint_audio_codec(ep);
+                let mut mixed = false;
+                let mut opaque = false;
+                let mut all_transparent = true;
+                for did in dests {
+                    if self.routing.is_multi_source(did) {
+                        mixed = true;
+                    }
+                    match self.endpoints.get(did) {
+                        Some(dep) => {
+                            let transcodes = endpoint_audio_codec(dep) != src_codec;
+                            let is_plain_rtp = matches!(dep, Endpoint::Rtp(_));
+                            if transcodes || is_plain_rtp {
+                                opaque = true;
+                            }
+                            // Transparent only if every dest is WebRTC with the same codec.
+                            if !matches!(dep, Endpoint::WebRtc(_)) || transcodes {
+                                all_transparent = false;
+                            }
+                        }
+                        None => all_transparent = false,
+                    }
+                }
+                if !taps && !mixed && !opaque && all_transparent {
+                    Policy::Bypass
+                } else {
+                    Policy::Engaged(PlayoutKind::Tracked)
+                }
+            }
+        }
+    }
+
+    /// Construct a playout buffer of the requested kind for a source, deriving codec/rate.
+    fn make_playout_buffer(&self, id: EndpointId, kind: PlayoutKind) -> Option<PlayoutBuffer> {
+        let ep = self.endpoints.get(&id)?;
+        let clock_rate = endpoint_rtp_clock_rate(ep);
+        match kind {
+            PlayoutKind::Synth => Some(PlayoutBuffer::synth(
+                id,
+                clock_rate,
+                rand::random(),
+                rand::random(),
+                rand::random(),
+            )),
+            PlayoutKind::Tracked => {
+                // Deep (mixer-fed) vs shallow (reorder-only) target delay.
+                let mixer_fed = self
+                    .routing
+                    .destinations(&id)
+                    .is_some_and(|dests| dests.iter().any(|d| self.routing.is_multi_source(d)));
+                Some(PlayoutBuffer::tracked(id, clock_rate, mixer_fed))
+            }
         }
     }
 
@@ -2274,6 +2410,9 @@ pub async fn run_media_session(
         last_timeout_check: Instant::now(),
         empty_since: Some(Instant::now()),
         mixers: HashMap::new(),
+        playout_buffers: HashMap::new(),
+        playout_policy: HashMap::new(),
+        mix_grid: None,
         ws_audio_registry,
     };
 
@@ -2319,6 +2458,12 @@ pub async fn run_media_session(
                     raw
                 }
             };
+        // Wake by the next playout-grid instant so engaged buffers drain on a 20 ms cadence
+        // even when no other event (packet/command/timer) is pending.
+        let sleep_duration = match state.mix_grid {
+            Some(grid) => sleep_duration.min(grid.saturating_duration_since(Instant::now())),
+            None => sleep_duration,
+        };
 
         let mut inbound_rtp = Vec::new();
 
@@ -2424,6 +2569,9 @@ pub async fn run_media_session(
             &mut state.transcode_cache,
             transcode_cache_size,
             &mut state.mixers,
+            &mut state.playout_buffers,
+            &state.playout_policy,
+            &mut state.mix_grid,
         )
         .await;
         if needs_routing_rebuild {
@@ -2450,6 +2598,25 @@ pub async fn run_media_session(
                 }
             }
             state.check_ws_connect_timeouts().await;
+            // Roll up per-buffer playout counters into the process metrics.
+            for buf in state.playout_buffers.values_mut() {
+                let c = buf.take_counters();
+                if c.late_drops > 0 {
+                    state.metrics.playout_late_drops.inc_by(c.late_drops);
+                }
+                if c.overflow_drops > 0 {
+                    state
+                        .metrics
+                        .playout_overflow_drops
+                        .inc_by(c.overflow_drops);
+                }
+                if c.underflow_fills > 0 {
+                    state
+                        .metrics
+                        .playout_underflow_fills
+                        .inc_by(c.underflow_fills);
+                }
+            }
             state.last_timeout_check = Instant::now();
         }
         vad_tap::check_vad_timeouts(
@@ -2659,13 +2826,9 @@ fn handle_inbound_packet(
                 );
             }
             Endpoint::WebSocket(wsep) => {
-                // Inbound native-rate L16 frame from the WS IO task. Synthesize a
-                // monotonic RTP timeline (Bridge's ts=0 would freeze downstream).
-                return (
-                    Some(wsep.build_inbound_packet(pkt.data.clone())),
-                    None,
-                    None,
-                );
+                // Inbound native-rate L16 frame from the WS IO task. Wrapped raw; the
+                // source's playout::SynthClock owns the monotonic timeline + pacing.
+                return (Some(wsep.wrap_inbound(pkt.data.clone())), None, None);
             }
         }
     }
@@ -2673,6 +2836,73 @@ fn handle_inbound_packet(
 }
 
 /// Returns (min WebRTC timeout, whether routing table needs rebuild due to state changes).
+#[allow(clippy::too_many_arguments)]
+/// Ingest one audio packet from a source: into its playout buffer if engaged, otherwise
+/// straight to the route set (transparent relay / no policy entry).
+fn ingest_audio(
+    pkt: RoutedRtpPacket,
+    playout_policy: &HashMap<EndpointId, Policy>,
+    playout_buffers: &mut HashMap<EndpointId, PlayoutBuffer>,
+    packets_to_route: &mut Vec<RoutedRtpPacket>,
+    now: Instant,
+) {
+    match playout_policy.get(&pkt.source_endpoint_id) {
+        Some(Policy::Engaged(_)) => match playout_buffers.get_mut(&pkt.source_endpoint_id) {
+            Some(buf) => buf.push(pkt, now),
+            None => packets_to_route.push(pkt), // engaged but no buffer yet — don't drop
+        },
+        _ => packets_to_route.push(pkt),
+    }
+}
+
+/// Advance the shared playout grid. When a 20 ms tick is due, drain one frame from every
+/// engaged buffer into `packets_to_route` and step the grid (with a catch-up clamp so a
+/// stalled loop re-syncs instead of bursting). Parks the grid (`None`) when nothing is
+/// pending. Returns whether a tick fired this pass (gates the mixer `flush_tick`).
+fn drive_grid(
+    mix_grid: &mut Option<Instant>,
+    playout_buffers: &mut HashMap<EndpointId, PlayoutBuffer>,
+    packets_to_route: &mut Vec<RoutedRtpPacket>,
+    now: Instant,
+) -> bool {
+    let fired = match *mix_grid {
+        Some(g) => now >= g,
+        None => {
+            if playout_buffers.values().any(|b| b.has_pending()) {
+                *mix_grid = Some(now);
+                true
+            } else {
+                false
+            }
+        }
+    };
+    if fired {
+        let g = mix_grid.unwrap_or(now);
+        for buf in playout_buffers.values_mut() {
+            // Synth and mixer-fed Tracked release one frame per tick; reorder-only Tracked
+            // drains its whole releasable burst (no pacing — the downstream endpoint plays out).
+            while let Some(pkt) = buf.drain_tick(g) {
+                packets_to_route.push(pkt);
+                if !buf.drains_burst() {
+                    break;
+                }
+            }
+        }
+        let mut next = g + super::playout::FRAME;
+        // Catch-up clamp (mirrors the file/tone pollers): if we fell >3 ticks behind, resync
+        // to avoid emitting a multi-frame burst.
+        if now > next + Duration::from_millis(60) {
+            next = now + super::playout::FRAME;
+        }
+        *mix_grid = Some(next);
+    }
+    // Park the grid when no buffer has pending audio (Synth idle / Tracked empty).
+    if !playout_buffers.values().any(|b| b.has_pending()) {
+        *mix_grid = None;
+    }
+    fired
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn poll_and_route(
     endpoints: &mut HashMap<EndpointId, Endpoint>,
@@ -2692,18 +2922,29 @@ async fn poll_and_route(
     transcode_cache: &mut HashMap<(EndpointId, EndpointId), CachedTranscode>,
     transcode_cache_size: usize,
     mixers: &mut HashMap<EndpointId, super::mixer::DestinationMixer>,
+    playout_buffers: &mut HashMap<EndpointId, PlayoutBuffer>,
+    playout_policy: &HashMap<EndpointId, Policy>,
+    mix_grid: &mut Option<Instant>,
 ) -> (Option<Instant>, bool) {
+    let now = Instant::now();
     let mut packets_to_route: Vec<RoutedRtpPacket> = Vec::new();
     let mut dtmf_packets: Vec<RoutedRtpPacket> = Vec::new();
     let mut state_events: Vec<(EndpointId, EndpointState, EndpointState)> = Vec::new();
     let mut min_webrtc_timeout: Option<Instant> = None;
 
-    // Add inbound RTP packets from plain RTP endpoints
+    // Inbound RTP (plain RTP / WS / Bridge). Telephone-event splits off out-of-band first;
+    // audio is ingested into its playout buffer (engaged) or routed directly (bypass).
     for pkt in inbound_rtp {
         if super::session_dtmf::classify_dtmf(&pkt, dtmf_state) {
             dtmf_packets.push(pkt);
         } else {
-            packets_to_route.push(pkt);
+            ingest_audio(
+                pkt,
+                playout_policy,
+                playout_buffers,
+                &mut packets_to_route,
+                now,
+            );
         }
     }
 
@@ -2744,7 +2985,13 @@ async fn poll_and_route(
                                 if super::session_dtmf::classify_dtmf(&pkt, dtmf_state) {
                                     dtmf_packets.push(pkt);
                                 } else {
-                                    packets_to_route.push(pkt);
+                                    ingest_audio(
+                                        pkt,
+                                        playout_policy,
+                                        playout_buffers,
+                                        &mut packets_to_route,
+                                        now,
+                                    );
                                 }
                             }
                             WebRtcEvent::StateChanged { old, new } => {
@@ -2759,6 +3006,10 @@ async fn poll_and_route(
             }
         }
     }
+
+    // Shared 20 ms grid: drain each engaged buffer's due frame into the route set. All buffers
+    // are evaluated against the same instant so a mixer's sources stay frame-aligned.
+    let grid_fired = drive_grid(mix_grid, playout_buffers, &mut packets_to_route, now);
 
     // Emit state change events (critical priority)
     let mut needs_routing_rebuild = false;
@@ -2992,7 +3243,19 @@ async fn poll_and_route(
         }
     }
 
-    // Deliver mixed frames queued by feed() (flushed on frame boundaries)
+    // On a grid tick, flush each mixer's accumulated frame so the mixer is wall-clock-clocked
+    // when fed by paced playout buffers. Additive with feed()'s implicit second-contribution
+    // flush (which still handles file/tone catch-up and arrival-fed RTP bursts); the inner
+    // flush is guarded so an all-idle tick emits nothing.
+    if grid_fired {
+        for mixer in mixers.values_mut() {
+            if let Err(e) = mixer.flush_tick() {
+                warn!(error = %e, "mixer flush_tick error");
+            }
+        }
+    }
+
+    // Deliver mixed frames queued by feed() (flushed on frame boundaries) + grid flush_tick
     for (&dest_id, mixer) in mixers.iter_mut() {
         for routed in mixer.drain() {
             if let Some(dest_ep) = endpoints.get_mut(&dest_id) {
@@ -3262,6 +3525,9 @@ mod tests {
             ),
             empty_since: None,
             mixers: HashMap::new(),
+            playout_buffers: HashMap::new(),
+            playout_policy: HashMap::new(),
+            mix_grid: None,
             ws_audio_registry: Arc::new(crate::control::ws_audio::WsAudioRegistry::new()),
         }
     }

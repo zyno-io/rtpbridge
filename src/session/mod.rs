@@ -11,6 +11,7 @@ pub mod fax_tap;
 pub mod file_poll;
 pub mod media_session;
 pub mod mixer;
+pub mod playout;
 pub mod routing;
 pub mod session_dtmf;
 pub mod stats;

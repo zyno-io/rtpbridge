@@ -54,11 +54,6 @@ pub struct WebSocketEndpoint {
     /// Baseline direction used in `auto` mode.
     auto_direction: EndpointDirection,
 
-    /// Synthesized inbound RTP-generation state (one frame = one 20 ms L16 packet).
-    in_seq: u16,
-    in_ts: u32,
-    in_ssrc: u32,
-
     /// Session -> IO task: native-rate L16 frames awaiting WS transmission.
     outbound_tx: mpsc::Sender<Vec<u8>>,
     /// Taken by `attach_io` when the audio socket connects.
@@ -88,9 +83,6 @@ impl WebSocketEndpoint {
             flush_frames: (flush_ms / 20) as usize,
             connect_token: Uuid::new_v4(),
             auto_direction: direction,
-            in_seq: rand::random(),
-            in_ts: rand::random(),
-            in_ssrc: rand::random(),
             outbound_tx,
             outbound_rx: Some(outbound_rx),
             cancel: CancellationToken::new(),
@@ -133,24 +125,21 @@ impl WebSocketEndpoint {
         Ok(None)
     }
 
-    /// Build the next inbound `RoutedRtpPacket` from one native-rate L16 frame,
-    /// advancing the synthesized monotonic timeline (`ts += sample_rate/50`,
-    /// `seq += 1`). The timestamp step matches the endpoint's RTP clock rate
-    /// (= `sample_rate`), so downstream timestamp scaling stays consistent.
-    pub fn build_inbound_packet(&mut self, payload: Vec<u8>) -> RoutedRtpPacket {
+    /// Wrap one native-rate L16 frame as a raw inbound packet. The synthesized monotonic
+    /// timeline (seq/ts/ssrc, silence-fill, talkspurt marker) is owned by this source's
+    /// `playout::SynthClock`, which paces the frames onto the shared grid — so the
+    /// seq/ts/ssrc here are placeholders the buffer overwrites. Records inbound stats.
+    pub fn wrap_inbound(&mut self, payload: Vec<u8>) -> RoutedRtpPacket {
         self.stats.record_inbound(payload.len());
-        let pkt = RoutedRtpPacket {
+        RoutedRtpPacket {
             source_endpoint_id: self.id,
             payload_type: L16_PT,
-            sequence_number: self.in_seq,
-            timestamp: self.in_ts,
-            ssrc: self.in_ssrc,
+            sequence_number: 0,
+            timestamp: 0,
+            ssrc: 0,
             marker: false,
             payload,
-        };
-        self.in_seq = self.in_seq.wrapping_add(1);
-        self.in_ts = self.in_ts.wrapping_add(self.sample_rate / 50);
-        pkt
+        }
     }
 
     /// Bind a freshly-upgraded audio WebSocket to this endpoint, spawning the IO task.
@@ -411,15 +400,14 @@ mod tests {
     }
 
     #[test]
-    fn build_inbound_packet_advances_timeline() {
+    fn wrap_inbound_records_stats_and_uses_placeholder_timeline() {
         let mut e = ep(8000, 0);
-        let p0 = e.build_inbound_packet(vec![0u8; 320]);
-        let p1 = e.build_inbound_packet(vec![0u8; 320]);
+        let p0 = e.wrap_inbound(vec![0u8; 320]);
+        let p1 = e.wrap_inbound(vec![0u8; 320]);
         assert_eq!(p0.payload_type, 127);
-        assert_eq!(p1.sequence_number, p0.sequence_number.wrapping_add(1));
-        // 8 kHz wire rate → 160 ticks per 20 ms frame (sample_rate / 50).
-        assert_eq!(p1.timestamp, p0.timestamp.wrapping_add(160));
-        assert_eq!(p1.ssrc, p0.ssrc, "ssrc is stable across frames");
+        assert_eq!(p0.source_endpoint_id, e.id);
+        // The SynthClock owns the real timeline; these are placeholders (0/0/0).
+        assert_eq!((p1.sequence_number, p1.timestamp, p1.ssrc), (0, 0, 0));
         assert_eq!(e.stats.inbound_packets, 2);
     }
 

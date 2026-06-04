@@ -31,6 +31,12 @@ pub struct Metrics {
     pub dtmf_events: Counter,
     /// Transcode errors (decode or encode failures).
     pub transcode_errors: Counter,
+    /// Playout buffer: packets dropped because they arrived after their play slot.
+    pub playout_late_drops: Counter,
+    /// Playout buffer: frames dropped to bound latency when a producer ran ahead.
+    pub playout_overflow_drops: Counter,
+    /// Playout buffer: silence frames synthesized to ride out a clockless-source underflow.
+    pub playout_underflow_fills: Counter,
     /// Events dropped due to channel backpressure (client too slow).
     pub events_dropped: Counter,
     /// Inbound packets that a WebRTC endpoint's `handle_receive` rejected
@@ -106,6 +112,9 @@ impl Metrics {
         let srtp_errors = Counter::default();
         let dtmf_events = Counter::default();
         let transcode_errors = Counter::default();
+        let playout_late_drops = Counter::default();
+        let playout_overflow_drops = Counter::default();
+        let playout_underflow_fills = Counter::default();
         let events_dropped = Counter::default();
         let webrtc_packet_errors = Counter::default();
         let webrtc_connecting_stuck = Counter::default();
@@ -169,6 +178,21 @@ impl Metrics {
             transcode_errors.clone(),
         );
         registry.register(
+            "rtpbridge_playout_late_drops",
+            "Playout packets dropped for arriving after their play slot",
+            playout_late_drops.clone(),
+        );
+        registry.register(
+            "rtpbridge_playout_overflow_drops",
+            "Playout frames dropped to bound latency when a producer ran ahead",
+            playout_overflow_drops.clone(),
+        );
+        registry.register(
+            "rtpbridge_playout_underflow_fills",
+            "Playout silence frames synthesized to ride out clockless-source underflow",
+            playout_underflow_fills.clone(),
+        );
+        registry.register(
             "rtpbridge_events_dropped",
             "Events dropped due to channel backpressure",
             events_dropped.clone(),
@@ -224,6 +248,9 @@ impl Metrics {
             srtp_errors,
             dtmf_events,
             transcode_errors,
+            playout_late_drops,
+            playout_overflow_drops,
+            playout_underflow_fills,
             events_dropped,
             webrtc_packet_errors,
             webrtc_connecting_stuck,

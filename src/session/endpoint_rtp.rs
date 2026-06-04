@@ -622,6 +622,17 @@ impl RtpEndpoint {
 
         self.state = EndpointState::Connected;
 
+        // Re-anchor the symmetric-RTP learning window to answer time. As the
+        // offerer we don't know the peer's address (or get any media) until the
+        // answer arrives, which for a ringing phone can be many seconds after
+        // this endpoint was created — long enough that a window anchored at
+        // creation would already be closed, locking us to the (often private,
+        // NAT'd) SDP address and never latching the real source. `update_remote_sdp`
+        // resets the window for the same reason on re-INVITE; this also lets a
+        // post-rekey answer (which overwrites `remote_rtp_addr` from SDP above)
+        // re-latch the live source.
+        self.reset_addr_lock();
+
         Ok(())
     }
 
@@ -788,6 +799,18 @@ impl RtpEndpoint {
         self.srtp_rx.is_some() || self.srtp_rx_new.is_some()
     }
 
+    /// Point outbound RTP/RTCP at `source` (symmetric RTP). The RTCP address
+    /// follows the mux mode: the same address under `rtcp-mux`, otherwise the
+    /// RTP port + 1.
+    fn latch_remote_addr(&mut self, source: SocketAddr) {
+        self.remote_rtp_addr = Some(source);
+        self.remote_rtcp_addr = if self.rtcp_mux {
+            Some(source)
+        } else {
+            rtcp_addr_from_rtp(source)
+        };
+    }
+
     /// Process an inbound RTP packet (SRTP decrypt if enabled)
     pub fn handle_rtp(&mut self, data: &[u8], source: SocketAddr) -> Option<RoutedRtpPacket> {
         // Check rekey switchover deadline
@@ -847,35 +870,50 @@ impl RtpEndpoint {
         let header = RtpHeader::parse(data)?;
         let payload = header.payload(data);
 
-        // Learn remote SSRC from first packet
+        // Learn remote SSRC from the first packet. That same first (already
+        // authenticated, for SRTP) packet also latches the real source address
+        // unconditionally — even if the symmetric-RTP learning window has already
+        // elapsed. This covers an offerer leg whose callee rings longer than the
+        // window before answering, so media only starts well after the endpoint
+        // was created: the negotiated SDP address is just a placeholder (often an
+        // unroutable private NAT address) until we actually hear from the peer.
+        // SRTP packets are authenticated/decrypted above and plain RTP already
+        // trusts the first packet for the SSRC, so this does not widen the
+        // spoofing surface. Later NAT rebinds are handled by the windowed path.
         if self.remote_ssrc.is_none() {
             self.remote_ssrc = Some(header.ssrc);
             debug!(endpoint_id = %self.id, ssrc = header.ssrc, "learned remote SSRC");
+
+            if self.remote_rtp_addr != Some(source) {
+                if let Some(old) = self.remote_rtp_addr {
+                    tracing::info!(
+                        endpoint_id = %self.id,
+                        sdp_addr = %old,
+                        actual_addr = %source,
+                        "symmetric RTP: latched remote address from first packet (SDP mismatch, likely NAT)"
+                    );
+                } else {
+                    debug!(endpoint_id = %self.id, addr = %source, "learned remote address from first packet");
+                }
+                self.latch_remote_addr(source);
+            }
         }
 
-        // Symmetric RTP: learn/update remote address from inbound media
+        // Symmetric RTP: keep tracking address changes within the learning
+        // window (a NAT rebind during call setup), then lock once it elapses.
         if !self.addr_locked {
             if self.created_at.elapsed() > Duration::from_secs(self.addr_learn_window_secs) {
                 // Learning window expired — lock the address
                 self.addr_locked = true;
                 debug!(endpoint_id = %self.id, addr = ?self.remote_rtp_addr, "address locked after learning window");
             } else if self.remote_rtp_addr != Some(source) {
-                if let Some(old) = self.remote_rtp_addr {
-                    tracing::info!(
-                        endpoint_id = %self.id,
-                        sdp_addr = %old,
-                        actual_addr = %source,
-                        "symmetric RTP: updating remote address (SDP mismatch, likely NAT)"
-                    );
-                } else {
-                    debug!(endpoint_id = %self.id, addr = %source, "learned remote address from first packet");
-                }
-                self.remote_rtp_addr = Some(source);
-                if self.rtcp_mux {
-                    self.remote_rtcp_addr = Some(source);
-                } else {
-                    self.remote_rtcp_addr = rtcp_addr_from_rtp(source);
-                }
+                tracing::info!(
+                    endpoint_id = %self.id,
+                    sdp_addr = ?self.remote_rtp_addr,
+                    actual_addr = %source,
+                    "symmetric RTP: updating remote address (SDP mismatch, likely NAT)"
+                );
+                self.latch_remote_addr(source);
             }
         }
 
@@ -1760,6 +1798,143 @@ mod tests {
         assert!(
             !ep.addr_locked,
             "update_remote_sdp should reset addr lock so new NAT bindings can be learned"
+        );
+    }
+
+    // Build a minimal valid PCMU RTP packet for symmetric-RTP latch tests.
+    fn make_rtp_packet(ssrc: u32) -> Vec<u8> {
+        crate::media::rtp::RtpHeader::build(0, 1, 160, ssrc, false, &[0u8; 160])
+    }
+
+    /// Fix #1 (unit): as the offerer we may ring longer than the learning window
+    /// before the answer arrives. `accept_answer` must re-anchor the window to
+    /// answer time, not endpoint creation — otherwise it is already closed when
+    /// media starts and we lock to the (private, NAT'd) SDP address forever.
+    #[tokio::test]
+    async fn test_accept_answer_reanchors_stale_learning_window() {
+        let pool =
+            crate::net::socket_pool::SocketPool::new("127.0.0.1".parse().unwrap(), 51710, 51810)
+                .unwrap();
+        let pair = pool.allocate_pair().await.unwrap();
+        let mut ep = RtpEndpoint::new(EndpointId::new_v4(), EndpointDirection::SendRecv, pair);
+
+        // Simulate a long ring: created well before the answer, past the window.
+        ep.created_at = Instant::now() - Duration::from_secs(ep.addr_learn_window_secs + 10);
+        assert!(ep.created_at.elapsed() > Duration::from_secs(ep.addr_learn_window_secs));
+
+        ep.accept_answer(&make_sdp_with_mux(30000, true)).unwrap();
+
+        assert!(
+            !ep.addr_locked,
+            "accept_answer must leave the address unlocked"
+        );
+        assert!(
+            ep.created_at.elapsed() < Duration::from_secs(ep.addr_learn_window_secs),
+            "accept_answer must re-anchor the learning window to answer time"
+        );
+    }
+
+    /// Fix #1 (end-to-end): offerer rings past the window, the answer advertises
+    /// a private address, then media arrives from the public post-NAT source
+    /// within the re-anchored window. We must latch the public source.
+    #[tokio::test]
+    async fn test_offerer_latches_public_source_after_long_ring() {
+        let pool =
+            crate::net::socket_pool::SocketPool::new("127.0.0.1".parse().unwrap(), 51810, 51910)
+                .unwrap();
+        let pair = pool.allocate_pair().await.unwrap();
+        let mut ep = RtpEndpoint::new(EndpointId::new_v4(), EndpointDirection::SendRecv, pair);
+
+        // Long ring before the answer.
+        ep.created_at = Instant::now() - Duration::from_secs(ep.addr_learn_window_secs + 10);
+
+        // Answer advertises a private (NAT'd) address: 10.0.0.1:30000.
+        ep.accept_answer(&make_sdp_with_mux(30000, true)).unwrap();
+        assert_eq!(ep.remote_rtp_addr.unwrap().ip().to_string(), "10.0.0.1");
+
+        // First media actually arrives from the public post-NAT source.
+        let public_src: SocketAddr = "203.0.113.7:50000".parse().unwrap();
+        let _ = ep.handle_rtp(&make_rtp_packet(0x1234_5678), public_src);
+
+        assert_eq!(
+            ep.remote_rtp_addr,
+            Some(public_src),
+            "must latch the public source the media came from, not the SDP address"
+        );
+        assert_eq!(
+            ep.remote_rtcp_addr,
+            Some(public_src),
+            "rtcp-mux: RTCP address follows the latched RTP source"
+        );
+    }
+
+    /// Fix #2: even if media only starts *after* the (re-anchored) window has
+    /// elapsed — e.g. answered, then a long pause before cut-through — the first
+    /// authenticated packet must still latch its source. Without it the
+    /// window-expiry branch locks the stale SDP address. Uses a non-mux answer to
+    /// also exercise the RTCP port+1 path.
+    #[tokio::test]
+    async fn test_first_packet_latches_even_after_window_elapsed() {
+        let pool =
+            crate::net::socket_pool::SocketPool::new("127.0.0.1".parse().unwrap(), 51910, 52010)
+                .unwrap();
+        let pair = pool.allocate_pair().await.unwrap();
+        let mut ep = RtpEndpoint::new(EndpointId::new_v4(), EndpointDirection::SendRecv, pair);
+
+        ep.accept_answer(&make_sdp_with_mux(30000, false)).unwrap();
+
+        // Window already elapsed by the time the first packet arrives.
+        ep.created_at = Instant::now() - Duration::from_secs(ep.addr_learn_window_secs + 10);
+        assert!(!ep.addr_locked);
+
+        let public_src: SocketAddr = "203.0.113.9:40000".parse().unwrap();
+        let _ = ep.handle_rtp(&make_rtp_packet(0x1234_5678), public_src);
+
+        assert_eq!(
+            ep.remote_rtp_addr,
+            Some(public_src),
+            "first packet must latch even though the learning window had elapsed"
+        );
+        assert_eq!(
+            ep.remote_rtcp_addr.unwrap(),
+            SocketAddr::new(public_src.ip(), public_src.port() + 1),
+            "non-mux: RTCP address is the latched RTP source port + 1"
+        );
+    }
+
+    /// Fix #1 (rekey/re-answer interaction — Codex finding #2): on an established
+    /// leg `remote_ssrc` is already set, so fix #2's first-packet latch can't
+    /// help. A re-answer (e.g. SRTP rekey) overwrites `remote_rtp_addr` from SDP
+    /// (back to the private address). `accept_answer` reopening the window is what
+    /// lets the next packet re-latch the live public source.
+    #[tokio::test]
+    async fn test_reanswer_reopens_window_to_relatch_established_leg() {
+        let pool =
+            crate::net::socket_pool::SocketPool::new("127.0.0.1".parse().unwrap(), 52010, 52110)
+                .unwrap();
+        let pair = pool.allocate_pair().await.unwrap();
+        let mut ep = RtpEndpoint::new(EndpointId::new_v4(), EndpointDirection::SendRecv, pair);
+
+        // Established leg, already latched to the public source.
+        ep.accept_answer(&make_sdp_with_mux(30000, true)).unwrap();
+        let public_src: SocketAddr = "203.0.113.7:50000".parse().unwrap();
+        let _ = ep.handle_rtp(&make_rtp_packet(0x1234_5678), public_src);
+        assert_eq!(ep.remote_rtp_addr, Some(public_src));
+        assert!(ep.remote_ssrc.is_some(), "leg is established");
+
+        // Time passes on the call (well past the window).
+        ep.created_at = Instant::now() - Duration::from_secs(ep.addr_learn_window_secs + 10);
+
+        // Re-answer overwrites the address back to the private SDP value.
+        ep.accept_answer(&make_sdp_with_mux(30000, true)).unwrap();
+        assert_eq!(ep.remote_rtp_addr.unwrap().ip().to_string(), "10.0.0.1");
+
+        // Continued media from the same public source must re-latch.
+        let _ = ep.handle_rtp(&make_rtp_packet(0x1234_5678), public_src);
+        assert_eq!(
+            ep.remote_rtp_addr,
+            Some(public_src),
+            "re-answer must reopen the window so the established leg re-latches its source"
         );
     }
 

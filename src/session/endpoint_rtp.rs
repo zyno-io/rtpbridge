@@ -372,21 +372,35 @@ impl RtpEndpoint {
             }
         }
 
-        // Use the codecs from the offer (intersect with what we support)
-        endpoint.codecs = parsed.codecs.clone();
         endpoint.telephone_event_pt = parsed.telephone_event_pt;
 
-        // Pick first codec as our send codec, and learn the receive clock rate
-        endpoint.send_codec = parsed
-            .codecs
-            .iter()
-            .find(|c| c.name != "telephone-event")
-            .cloned();
+        // Pick the highest-quality offered codec as our send codec (rather than
+        // the offerer's first-listed preference), and learn the receive clock rate.
+        endpoint.send_codec = crate::media::sdp::select_answer_codec(&parsed.codecs).cloned();
         endpoint.recv_clock_rate = endpoint
             .send_codec
             .as_ref()
             .map(|c| c.clock_rate)
             .unwrap_or(8000);
+
+        // Commit to a single media codec: keep only the selected codec plus the
+        // offered telephone-event. This endpoint decodes ALL inbound media as
+        // send_codec (see endpoint_audio_codec) — advertising other audio codecs
+        // the peer could then send would cause them to be misdecoded. Trimming the
+        // set here makes every answer we generate (initial and re-INVITE) advertise
+        // exactly the selected codec.
+        endpoint.codecs = endpoint
+            .send_codec
+            .iter()
+            .cloned()
+            .chain(
+                parsed
+                    .codecs
+                    .iter()
+                    .filter(|c| c.name == "telephone-event")
+                    .cloned(),
+            )
+            .collect();
 
         // Set up SRTP/SRTCP if crypto was offered.
         // RX uses the offerer's key; TX uses an independently generated key
@@ -428,8 +442,20 @@ impl RtpEndpoint {
             None
         };
 
-        // Generate SDP answer
-        let answer_codecs: Vec<&SdpCodec> = endpoint.codecs.iter().collect();
+        // Generate SDP answer from the trimmed codec set (selected codec +
+        // telephone-event), send_codec first so the offerer transmits the codec
+        // we selected (RFC 3264 — the answerer's first listed PT is what the
+        // offerer's device sends), matching our send_codec and recv_clock_rate.
+        let mut answer_codecs: Vec<&SdpCodec> = Vec::new();
+        if let Some(ref send) = endpoint.send_codec {
+            answer_codecs.push(send);
+        }
+        for c in endpoint.codecs.iter() {
+            if matches!(endpoint.send_codec, Some(ref send) if send.pt == c.pt) {
+                continue;
+            }
+            answer_codecs.push(c);
+        }
         let answer = sdp::generate_sdp_answer(
             SocketAddr::new(bind_ip, endpoint.local_rtp_addr.port()),
             endpoint.local_rtp_addr.port(),
@@ -1561,6 +1587,83 @@ mod tests {
             ep.remote_rtcp_addr.unwrap().port(),
             20001,
             "without rtcp-mux, RTCP port should be RTP port + 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_from_offer_answer_advertises_selected_codec_first() {
+        // Offer lists PCMU first, then G722, then Opus. We select Opus as the
+        // highest-quality codec AND must advertise it first in the answer, so the
+        // offerer transmits Opus — matching our send_codec and recv_clock_rate.
+        // If the answer kept the offer order (PCMU first), the peer would send
+        // PCMU while we encode Opus / clock at 48 kHz, breaking audio.
+        let pool =
+            crate::net::socket_pool::SocketPool::new("127.0.0.1".parse().unwrap(), 53000, 53100)
+                .unwrap();
+        let pair = pool.allocate_pair().await.unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+
+        let sdp = "v=0\r\n\
+            o=- 1 1 IN IP4 127.0.0.1\r\n\
+            s=-\r\n\
+            c=IN IP4 127.0.0.1\r\n\
+            t=0 0\r\n\
+            m=audio 20000 RTP/AVP 0 9 111 101\r\n\
+            a=rtpmap:0 PCMU/8000\r\n\
+            a=rtpmap:9 G722/8000\r\n\
+            a=rtpmap:111 opus/48000/2\r\n\
+            a=rtpmap:101 telephone-event/8000\r\n\
+            a=sendrecv\r\n";
+
+        let (ep, answer) = RtpEndpoint::from_offer(
+            EndpointId::new_v4(),
+            EndpointDirection::SendRecv,
+            sdp,
+            pair,
+            "127.0.0.1".parse().unwrap(),
+            tx,
+        )
+        .unwrap();
+
+        assert_eq!(
+            ep.send_codec.as_ref().map(|c| c.name),
+            Some("opus"),
+            "should select the highest-quality offered codec (Opus)"
+        );
+        assert_eq!(
+            ep.recv_clock_rate, 48000,
+            "recv_clock_rate must track the selected codec (Opus)"
+        );
+
+        let m_line = answer
+            .lines()
+            .find(|l| l.starts_with("m=audio"))
+            .expect("answer must contain an m=audio line");
+        let pts: Vec<&str> = m_line.split_whitespace().skip(3).collect();
+        assert_eq!(
+            pts.first().copied(),
+            Some("111"),
+            "answer must advertise Opus (PT 111) first, not the offerer's first-listed PCMU; got: {m_line}"
+        );
+
+        // We decode all inbound media as send_codec, so the answer must NOT
+        // advertise the other offered audio PTs (0/PCMU, 9/G722) — only the
+        // selected codec plus telephone-event.
+        assert_eq!(
+            pts,
+            vec!["111", "101"],
+            "answer must advertise only the selected codec + telephone-event; got: {m_line}"
+        );
+
+        // telephone-event must keep the offered 8 kHz clock, not be rewritten to
+        // 48 kHz just because Opus was selected (RFC 3264 — don't redefine the PT).
+        assert!(
+            answer.contains("a=rtpmap:101 telephone-event/8000"),
+            "telephone-event must keep its offered 8000 clock rate; answer:\n{answer}"
+        );
+        assert!(
+            !answer.contains("telephone-event/48000"),
+            "telephone-event must not be rewritten to 48000; answer:\n{answer}"
         );
     }
 

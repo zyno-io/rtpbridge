@@ -1,3 +1,4 @@
+use crate::media::codec::AudioCodec;
 use std::net::SocketAddr;
 
 /// Codec info for SDP generation
@@ -42,6 +43,38 @@ pub const CODEC_TELEPHONE_EVENT: SdpCodec = SdpCodec {
     channels: None,
     fmtp: Some("0-16"),
 };
+
+/// Audio-quality ranking used when answering an offer. Higher = better
+/// fidelity. Ranked by real audio bandwidth, NOT the SDP clock rate — G.722
+/// advertises an 8 kHz clock but carries 16 kHz wideband audio.
+/// Unknown names, `telephone-event`, and L16 rank lowest.
+fn codec_quality(c: &SdpCodec) -> u8 {
+    match AudioCodec::from_name(c.name) {
+        Some(AudioCodec::Opus) => 3, // 48 kHz fullband
+        Some(AudioCodec::G722) => 2, // 16 kHz wideband
+        Some(AudioCodec::Pcmu) => 1, // 8 kHz narrowband
+        _ => 0,
+    }
+}
+
+/// Select the media codec to use when answering an offer.
+///
+/// Rather than honoring the offerer's first-listed preference (the bare
+/// RFC 3264 default), we pick the highest-quality codec the offerer supports,
+/// so a bridged leg stays as wideband as the far end allows. `telephone-event`
+/// is never chosen as the media codec; ties keep the first-listed codec.
+pub fn select_answer_codec(codecs: &[SdpCodec]) -> Option<&SdpCodec> {
+    codecs
+        .iter()
+        .filter(|c| c.name != "telephone-event")
+        .reduce(|best, c| {
+            if codec_quality(c) > codec_quality(best) {
+                c
+            } else {
+                best
+            }
+        })
+}
 
 /// Parsed SDP info relevant to plain RTP
 #[derive(Debug, Clone)]
@@ -296,7 +329,7 @@ fn generate_sdp(
     codecs: &[&SdpCodec],
     crypto: Option<&SdpCrypto>,
     session_id: u64,
-    _is_offer: bool,
+    is_offer: bool,
 ) -> String {
     let ip = local_addr.ip();
     let ip_ver = if ip.is_ipv4() { "IP4" } else { "IP6" };
@@ -336,9 +369,16 @@ fn generate_sdp(
 
     // rtpmap for each codec
     for codec in &all_codecs {
-        // Match telephone-event clock rate to the primary audio codec (RFC 4733)
+        // For offers, match the telephone-event clock to our chosen audio codec
+        // (RFC 4733). For answers, echo the offered telephone-event rate as-is —
+        // redefining the offered PT's clock (e.g. to 48000 when Opus is selected)
+        // can make peers reject or ignore DTMF (RFC 3264).
         let rate = if codec.name == "telephone-event" {
-            audio_clock_rate
+            if is_offer {
+                audio_clock_rate
+            } else {
+                codec.clock_rate
+            }
         } else {
             codec.clock_rate
         };
@@ -393,6 +433,27 @@ mod tests {
         assert!(!parsed.is_webrtc);
         assert!(parsed.telephone_event_pt.is_some());
         assert_eq!(parsed.remote_addr.unwrap().port(), 30000);
+    }
+
+    #[test]
+    fn test_select_answer_codec_prefers_highest_quality() {
+        // Offer lists narrowband first; we should still pick Opus.
+        let codecs = vec![CODEC_PCMU, CODEC_G722, CODEC_OPUS];
+        assert_eq!(select_answer_codec(&codecs).unwrap().name, "opus");
+
+        // Without Opus, G722 wins over PCMU regardless of order.
+        let codecs = vec![CODEC_PCMU, CODEC_G722];
+        assert_eq!(select_answer_codec(&codecs).unwrap().name, "G722");
+        let codecs = vec![CODEC_G722, CODEC_PCMU];
+        assert_eq!(select_answer_codec(&codecs).unwrap().name, "G722");
+
+        // telephone-event is never selected as the media codec.
+        let codecs = vec![CODEC_TELEPHONE_EVENT, CODEC_PCMU];
+        assert_eq!(select_answer_codec(&codecs).unwrap().name, "PCMU");
+
+        // Only telephone-event (or empty) yields no media codec.
+        assert!(select_answer_codec(&[CODEC_TELEPHONE_EVENT]).is_none());
+        assert!(select_answer_codec(&[]).is_none());
     }
 
     #[test]

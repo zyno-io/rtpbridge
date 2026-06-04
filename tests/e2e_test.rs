@@ -69,7 +69,17 @@ async fn test_e2e_session_lifecycle_with_endpoints() {
     assert!(!result["endpoint_id"].as_str().unwrap().is_empty());
     let answer = result["sdp_answer"].as_str().unwrap();
     assert!(answer.contains("RTP/AVP"), "answer should match plain RTP");
-    assert!(answer.contains("PCMU"), "answer should include PCMU");
+    // We select the highest-quality offered codec (G722 > PCMU) and narrow the
+    // answer to just that codec plus telephone-event — so PCMU is no longer
+    // advertised.
+    assert!(
+        answer.contains("G722"),
+        "answer should select highest-quality offered codec (G722): {answer}"
+    );
+    assert!(
+        !answer.contains("PCMU"),
+        "answer should not advertise the unselected PCMU codec: {answer}"
+    );
 
     // Create endpoint from an OSRTP offer (RTP/AVP with a=crypto)
     let osrtp_offer = "v=0\r\n\

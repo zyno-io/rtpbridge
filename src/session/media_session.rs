@@ -3543,6 +3543,130 @@ mod tests {
         }
     }
 
+    /// Repro harness for the WS→PSTN stutter (call2.pcapng): drive the REAL `drive_grid` with
+    /// the captured inbound-WS arrival timeline, modeling the media loop's select/sleep wake
+    /// behavior — wake at `min(grid_instant, next_packet)`, batch-drain everything that has
+    /// arrived, then one `drive_grid` pass. A correctly grid-paced egress is ~20 ms between
+    /// frames with no sub-ms bursts, regardless of how bursty the inbound arrivals are.
+    #[test]
+    fn synth_grid_repaces_bursty_ws_inbound_from_pcap() {
+        // Inter-arrival deltas (ms) of inbound 20 ms WS frames; index ~196 is a 4678.6 ms gap.
+        let deltas_ms: &[f64] = &[
+            0.4, 40.1, 21.1, 40.7, 40.2, 1.2, 1.2, 41.0, 1.1, 56.8, 27.9, 0.0, 30.4, 42.7, 0.1,
+            7.8, 20.1, 29.2, 42.1, 0.0, 12.5, 19.5, 26.4, 42.1, 14.4, 0.1, 20.9, 22.4, 41.2, 19.3,
+            39.4, 21.7, 0.0, 40.8, 37.4, 40.4, 1.6, 0.1, 5.2, 23.0, 29.6, 43.8, 0.1, 4.3, 21.6,
+            31.1, 41.2, 0.1, 10.8, 21.2, 26.5, 41.1, 15.4, 0.1, 21.0, 22.0, 40.5, 21.5, 5.2, 19.6,
+            21.4, 41.4, 29.8, 0.0, 18.7, 20.4, 41.5, 0.0, 20.4, 21.2, 40.9, 22.3, 35.4, 40.3, 1.4,
+            0.0, 7.5, 21.2, 29.4, 42.7, 0.0, 10.4, 21.1, 25.8, 36.9, 0.0, 40.7, 0.1, 22.2, 40.4,
+            20.2, 0.0, 20.8, 19.5, 40.5, 23.4, 0.0, 18.3, 19.4, 41.9, 40.4, 0.0, 1.5, 20.0, 41.0,
+            21.3, 31.4, 40.3, 1.3, 0.0, 11.2, 21.1, 25.8, 36.6, 0.0, 41.7, 0.0, 20.2, 61.4, 0.0,
+            0.6, 20.6, 19.6, 40.9, 41.1, 0.1, 5.0, 20.8, 42.2, 0.1, 20.5, 21.0, 20.4, 44.0, 39.0,
+            0.1, 44.8, 40.9, 21.3, 40.7, 18.1, 0.0, 19.2, 20.3, 40.6, 0.8, 41.3, 0.2, 20.0, 40.8,
+            2.9, 17.5, 34.8, 41.5, 8.3, 0.1, 22.2, 28.1, 40.4, 15.3, 21.8, 0.0, 21.0, 41.0, 40.7,
+            0.0, 20.6, 40.7, 41.0, 17.8, 41.2, 0.4, 0.1, 3.1, 21.4, 61.4, 19.9, 0.0, 30.2, 40.5,
+            41.0, 4678.6, 22.2, 40.2, 15.4, 41.0, 0.0, 11.5, 40.0, 17.2, 34.7, 41.5, 0.0, 7.3,
+            21.7, 29.5, 51.3, 0.0, 1.3, 21.3, 25.6, 41.8, 0.0, 15.5, 21.1, 20.2, 40.8, 21.2, 0.1,
+            21.6, 20.4, 40.7, 56.7, 0.0, 40.3, 5.3, 42.1, 0.1, 1.3, 20.2, 41.0, 21.5, 28.5, 41.1,
+            0.5, 0.0, 13.1, 21.3, 24.0, 40.1, 38.1, 2.1, 19.5, 60.7, 0.0, 29.4, 21.4, 40.9, 35.3,
+            0.0, 12.1, 41.6, 0.0, 54.0, 0.1, 0.6, 20.9, 41.3, 45.0, 40.7, 5.3, 0.0, 40.7, 51.2,
+            23.8, 0.0, 32.6, 40.4, 29.6, 0.0, 21.3, 20.5,
+        ];
+
+        let base = Instant::now();
+        let mut arrivals = vec![base];
+        let mut acc = 0.0f64;
+        for &d in deltas_ms {
+            acc += d;
+            arrivals.push(base + Duration::from_micros((acc * 1000.0) as u64));
+        }
+
+        let src = EndpointId::new_v4();
+        let mut buffers: HashMap<EndpointId, PlayoutBuffer> = HashMap::new();
+        // 16 kHz wire rate (640-byte / 20 ms frames in the capture).
+        buffers.insert(src, PlayoutBuffer::synth(src, 16_000, 1, 0, 0));
+        let mut mix_grid: Option<Instant> = None;
+        let frame = vec![0u8; 640];
+
+        let mut out: Vec<Instant> = Vec::new();
+        let mut now = base;
+        let mut idx = 0usize;
+        let deadline = *arrivals.last().unwrap() + Duration::from_secs(2);
+        let mut guard = 0u64;
+        loop {
+            guard += 1;
+            assert!(guard < 5_000_000, "loop runaway");
+            let next_in = arrivals.get(idx).copied();
+            let wake = match (mix_grid, next_in) {
+                (Some(g), Some(ti)) => g.min(ti),
+                (Some(g), None) => g,
+                (None, Some(ti)) => ti,
+                (None, None) => break,
+            };
+            if wake > now {
+                now = wake;
+            }
+            // Batch-drain every packet that has arrived by `now` (select + try_recv loop).
+            while matches!(arrivals.get(idx), Some(&ta) if ta <= now) {
+                if let Some(buf) = buffers.get_mut(&src) {
+                    buf.push(
+                        RoutedRtpPacket {
+                            source_endpoint_id: src,
+                            payload_type: 127,
+                            sequence_number: 0,
+                            timestamp: 0,
+                            ssrc: 0,
+                            marker: false,
+                            payload: frame.clone(),
+                        },
+                        now,
+                    );
+                }
+                idx += 1;
+            }
+            let mut routed = Vec::new();
+            drive_grid(&mut mix_grid, &mut buffers, &mut routed, now);
+            for _ in &routed {
+                out.push(now);
+            }
+            if idx >= arrivals.len() && mix_grid.is_none() {
+                break;
+            }
+            assert!(now <= deadline, "did not converge");
+        }
+
+        // Analyze egress pacing. A 4.7 s input gap is legitimately DTX-collapsed (one long
+        // output gap), so classify gaps > 200 ms separately and require the rest be ~20 ms.
+        let n = out.len();
+        assert!(n > 100, "expected a full egress stream, got {n}");
+        let (mut zero_pairs, mut within, mut small, mut big) = (0usize, 0usize, 0usize, 0usize);
+        for w in out.windows(2) {
+            let d = w[1].duration_since(w[0]).as_secs_f64() * 1000.0;
+            if d > 200.0 {
+                big += 1;
+                continue;
+            }
+            small += 1;
+            if d < 1.0 {
+                zero_pairs += 1;
+            }
+            if (15.0..=25.0).contains(&d) {
+                within += 1;
+            }
+        }
+        eprintln!(
+            "egress frames={n} smooth(15-25ms)={within}/{small} bursts(<1ms)={zero_pairs} dtx_gaps={big}"
+        );
+        assert!(
+            within as f64 / small as f64 > 0.9,
+            "egress should be ~20 ms grid-paced, not arrival-clocked: only {within}/{small} \
+             inter-frame gaps fell in 15-25 ms ({zero_pairs} sub-ms bursts)"
+        );
+        assert!(
+            zero_pairs < small / 50,
+            "egress is emitting catch-up bursts ({zero_pairs} sub-ms gaps) instead of pacing"
+        );
+    }
+
     #[test]
     fn test_emit_event_none_channel_is_noop() {
         let tx: Option<mpsc::Sender<Event>> = None;

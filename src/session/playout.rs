@@ -29,12 +29,18 @@ const L16_PT: u8 = 127;
 pub const FRAME: Duration = Duration::from_millis(20);
 
 // ── Tunables (frames unless noted) ──────────────────────────────────────────
-/// Synth prebuffer / nominal cushion (~60 ms).
+/// Synth prebuffer / nominal cushion floor (~60 ms). The cushion is adaptive (see
+/// [`SYNTH_MAX_TARGET_FRAMES`]); this is the starting depth and the relaxed floor.
 const SYNTH_TARGET_FRAMES: usize = 3;
+/// Adaptive prebuffer ceiling (~140 ms). The Synth cushion grows one frame toward this each
+/// talkspurt that underruns mid-spurt (a too-shallow buffer for that producer's burstiness) and
+/// relaxes one frame per clean talkspurt. Mirrors `TrackedClock`'s adaptive `target_delay`.
+const SYNTH_MAX_TARGET_FRAMES: usize = 7;
 /// Consecutive silence-fill ticks before a Synth source goes idle/DTX (~200 ms).
 const SYNTH_IDLE_TICKS: u32 = 10;
-/// Synth overflow cap (~240 ms); drop-oldest beyond this.
-const SYNTH_MAX_FRAMES: usize = 12;
+/// Synth overflow cap (~280 ms); drop-oldest beyond this. Kept clear of
+/// [`SYNTH_MAX_TARGET_FRAMES`] so a grown cushion isn't immediately trimmed by a normal burst.
+const SYNTH_MAX_FRAMES: usize = 14;
 /// Tracked reorder-only target delay (~40 ms) for transcode / RTP-egress / analysis paths.
 const TRACKED_SHALLOW_MS: u64 = 40;
 /// Tracked mixer-fed target delay (~60 ms).
@@ -104,6 +110,8 @@ impl PlayoutBuffer {
             pending_marker: false,
             prebuffer_ticks: 0,
             underflow_ticks: 0,
+            target_frames: SYNTH_TARGET_FRAMES,
+            underran_this_spurt: false,
             counters: PlayoutCounters::default(),
         })
     }
@@ -227,6 +235,16 @@ pub struct SynthClock {
     pending_marker: bool,
     prebuffer_ticks: u32,
     underflow_ticks: u32,
+    /// Adaptive prebuffer/cushion depth (frames). Floor [`SYNTH_TARGET_FRAMES`], grows toward
+    /// [`SYNTH_MAX_TARGET_FRAMES`] when a producer underruns mid-talkspurt, relaxes on clean
+    /// talkspurts. The average producer rate is assumed correct (clockless source), so a deeper
+    /// cushion absorbs burst jitter without a standing deficit.
+    target_frames: usize,
+    /// Whether the current talkspurt underran mid-spurt (recovered from a silence-fill). Drives
+    /// both "grow `target_frames` at most once per spurt" and "don't relax a spurt that needed the
+    /// depth" — set even when already at the ceiling, so a still-underrunning spurt isn't misread
+    /// as clean and relaxed back down.
+    underran_this_spurt: bool,
     counters: PlayoutCounters,
 }
 
@@ -236,6 +254,7 @@ impl SynthClock {
             self.state = SynthState::Prebuffering;
             self.prebuffer_ticks = 0;
             self.pending_marker = true;
+            self.underran_this_spurt = false;
         }
         self.queue.push_back(payload);
         // Overflow: bound latency by dropping the oldest queued audio.
@@ -243,7 +262,7 @@ impl SynthClock {
             self.queue.pop_front();
             self.counters.overflow_drops += 1;
         }
-        if self.state == SynthState::Prebuffering && self.queue.len() >= SYNTH_TARGET_FRAMES {
+        if self.state == SynthState::Prebuffering && self.queue.len() >= self.target_frames {
             self.state = SynthState::Active;
         }
     }
@@ -255,8 +274,8 @@ impl SynthClock {
                 // Leave prebuffer once the cushion is built or we've waited long enough
                 // (a short utterance must not stall forever).
                 self.prebuffer_ticks += 1;
-                if self.queue.len() >= SYNTH_TARGET_FRAMES
-                    || self.prebuffer_ticks >= SYNTH_TARGET_FRAMES as u32
+                if self.queue.len() >= self.target_frames
+                    || self.prebuffer_ticks >= self.target_frames as u32
                 {
                     self.state = SynthState::Active;
                     self.emit_active()
@@ -270,12 +289,29 @@ impl SynthClock {
 
     fn emit_active(&mut self) -> Option<RoutedRtpPacket> {
         if let Some(payload) = self.queue.pop_front() {
+            // Real audio resumed while `underflow_ticks > 0` ⇒ we just rode out a *mid-talkspurt*
+            // gap with silence — the cushion was too shallow for this producer's burstiness. Mark
+            // the spurt non-clean (so it won't relax — even at the ceiling, where it can't grow)
+            // and grow the prebuffer target once per spurt, capped; the deeper target takes effect
+            // when the next talkspurt re-prebuffers. (End-of-talkspurt silence never reaches here —
+            // the queue stays empty through to idle — so this only fires on recover-from-gap.)
+            if self.underflow_ticks > 0 {
+                if !self.underran_this_spurt && self.target_frames < SYNTH_MAX_TARGET_FRAMES {
+                    self.target_frames += 1;
+                }
+                self.underran_this_spurt = true;
+            }
             self.underflow_ticks = 0;
             Some(self.emit(payload, false))
         } else {
             // Underflow: silence-fill to ride out producer jitter, then DTX-idle.
             self.underflow_ticks += 1;
             if self.underflow_ticks > SYNTH_IDLE_TICKS {
+                // Talkspurt ended cleanly (never underran mid-spurt) → relax one step toward the
+                // floor so a well-paced producer doesn't carry a deep cushion forever.
+                if !self.underran_this_spurt && self.target_frames > SYNTH_TARGET_FRAMES {
+                    self.target_frames -= 1;
+                }
                 self.state = SynthState::Idle;
                 self.underflow_ticks = 0;
                 return None;
@@ -656,6 +692,93 @@ mod tests {
         }
         let c = b.take_counters();
         assert_eq!(c.overflow_drops, 5);
+    }
+
+    #[test]
+    fn synth_prebuffer_grows_on_midspurt_underrun_then_relaxes() {
+        let target = |b: &PlayoutBuffer| match b {
+            PlayoutBuffer::Synth(s) => s.target_frames,
+            _ => unreachable!(),
+        };
+        let now = Instant::now();
+        let mut b = PlayoutBuffer::synth(Uuid::new_v4(), 8000, 1, 0, 0);
+        assert_eq!(target(&b), SYNTH_TARGET_FRAMES);
+
+        // Build the cushion, go Active, drain it empty.
+        for _ in 0..SYNTH_TARGET_FRAMES {
+            b.push(raw(vec![1u8; 320]), now);
+        }
+        for _ in 0..SYNTH_TARGET_FRAMES {
+            assert!(b.drain_tick(now).is_some());
+        }
+        // Mid-spurt gap: one silence-fill, then real audio resumes → cushion grows by one.
+        assert!(!b.drain_tick(now).expect("silence fill").marker);
+        b.push(raw(vec![2u8; 320]), now);
+        assert!(b.drain_tick(now).is_some());
+        assert_eq!(
+            target(&b),
+            SYNTH_TARGET_FRAMES + 1,
+            "a mid-talkspurt underrun deepens the cushion"
+        );
+
+        // This spurt grew, so ending it must NOT relax.
+        while b.drain_tick(now).is_some() {}
+        assert!(!b.has_pending());
+        assert_eq!(target(&b), SYNTH_TARGET_FRAMES + 1);
+
+        // A fully clean talkspurt (no mid-spurt underrun) relaxes one step toward the floor.
+        let deeper = SYNTH_TARGET_FRAMES + 1;
+        for _ in 0..deeper {
+            b.push(raw(vec![3u8; 320]), now);
+        }
+        while b.drain_tick(now).is_some() {} // drain reals, silence-fill to idle (clean → relax)
+        assert_eq!(
+            target(&b),
+            SYNTH_TARGET_FRAMES,
+            "a clean talkspurt relaxes the cushion back toward the floor"
+        );
+    }
+
+    #[test]
+    fn synth_prebuffer_pins_at_ceiling_under_sustained_underrun() {
+        let target = |b: &PlayoutBuffer| match b {
+            PlayoutBuffer::Synth(s) => s.target_frames,
+            _ => unreachable!(),
+        };
+        let now = Instant::now();
+        let mut b = PlayoutBuffer::synth(Uuid::new_v4(), 8000, 1, 0, 0);
+
+        // One talkspurt that underruns mid-spurt (silence-fill), recovers, then idles.
+        let bursty_spurt = |b: &mut PlayoutBuffer| {
+            let t = target(b);
+            for _ in 0..t {
+                b.push(raw(vec![1u8; 320]), now);
+            }
+            for _ in 0..t {
+                assert!(b.drain_tick(now).is_some());
+            }
+            assert!(b.drain_tick(now).is_some()); // mid-spurt underrun → silence
+            b.push(raw(vec![2u8; 320]), now);
+            assert!(b.drain_tick(now).is_some()); // recovery
+            while b.drain_tick(now).is_some() {} // drain to idle
+        };
+
+        // Sustained burstiness drives the cushion to the ceiling (3 → 7 over four spurts).
+        for _ in 0..4 {
+            bursty_spurt(&mut b);
+        }
+        assert_eq!(target(&b), SYNTH_MAX_TARGET_FRAMES);
+
+        // Further spurts that still underrun *at the ceiling* must stay pinned — not be
+        // misclassified as clean and relaxed (the cap-state regression).
+        for _ in 0..4 {
+            bursty_spurt(&mut b);
+            assert_eq!(
+                target(&b),
+                SYNTH_MAX_TARGET_FRAMES,
+                "an underrun at the ceiling must not relax the cushion"
+            );
+        }
     }
 
     // ── Tracked: reorder mode (shallow, non-mixer) ──────────────────────────

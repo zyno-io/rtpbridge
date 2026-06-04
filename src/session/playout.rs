@@ -390,10 +390,13 @@ impl TrackedClock {
             None => self.ssrc = Some(pkt.ssrc),
         }
 
-        // Talkspurt gap: a long arrival silence means the stream paused; drop the stale paced
-        // anchor so the resumed stream re-anchors to now (and re-marks). Harmless in reorder
-        // mode (no anchor), where it just re-marks the resume.
-        if let Some(last) = self.last_arrival
+        // Talkspurt gap: a long arrival silence *while the buffer is drained* means the stream
+        // paused; drop the stale paced anchor so the resumed stream re-anchors to now (and
+        // re-marks). Gated on an empty queue so a mid-burst inter-arrival gap (the buffer is
+        // still draining) doesn't strand queued frames behind a cleared anchor. Harmless in
+        // reorder mode (no anchor), where it just re-marks the resume.
+        if self.queue.is_empty()
+            && let Some(last) = self.last_arrival
             && arrival.saturating_duration_since(last) > TRACKED_GAP_RESET
         {
             self.anchor = None;
@@ -786,6 +789,32 @@ mod tests {
             b.take_counters().late_drops,
             0,
             "no frames dropped on resume"
+        );
+    }
+
+    #[test]
+    fn paced_gap_during_draining_burst_does_not_strand_queue() {
+        let mut b = PlayoutBuffer::tracked(Uuid::new_v4(), 8000, true);
+        let t0 = Instant::now();
+        for seq in 0u16..8 {
+            b.push(rtp(seq, seq as u32 * 160, 42), t0);
+        }
+        // A late arrival (>gap threshold) while the queue is still non-empty must NOT clear the
+        // anchor — otherwise drain_paced returns None forever while has_pending stays true (a
+        // grid busy-loop). The buffer must still drain to empty (by emit and/or stale-drop).
+        let late = t0 + Duration::from_secs(1);
+        b.push(rtp(8, 8 * 160, 42), late);
+        let mut grid = late;
+        for _ in 0..100 {
+            grid += FRAME;
+            b.drain_tick(grid);
+            if !b.has_pending() {
+                break;
+            }
+        }
+        assert!(
+            !b.has_pending(),
+            "buffer must drain to empty after a mid-burst gap, not busy-loop on a cleared anchor"
         );
     }
 

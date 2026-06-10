@@ -14,6 +14,8 @@ Requires a bound session (`session.create` or `session.attach`). Statistics and 
 |-------|------|---------|-------------|
 | `interval_ms` | u32 | `5000` | Emission interval in milliseconds (min: 500, max: 3600000) |
 
+Calling `stats.subscribe` again while already subscribed changes the interval without resetting the emit timeline. The next `stats` event fires at `interval - time_since_last_emit`: if the new (shorter) interval has already elapsed since the last emit, one is published immediately; otherwise the next emit lands at the diff. This means re-subscribing in a tight loop will not starve emission.
+
 ## stats.unsubscribe
 
 Unsubscribe from periodic statistics for the currently bound session.

@@ -621,8 +621,17 @@ impl SessionState {
                 let _ = reply.send(self.handle_update_remote_sdp(endpoint_id, &sdp));
             }
             SessionCommand::StatsSubscribe { reply, interval_ms } => {
+                // First subscribe anchors the emit timeline to now, so the first
+                // `stats` event lands one full interval out. A re-subscribe
+                // (changing the interval) keeps the existing anchor: the new
+                // interval is measured from the last actual emit, so the next
+                // fire is `interval - last_stats_emit.elapsed()` away. If that's
+                // already in the past, the emit gate in the run loop fires it
+                // immediately on the next iteration.
+                if self.stats_interval.is_none() {
+                    self.last_stats_emit = Instant::now();
+                }
                 self.stats_interval = Some(Duration::from_millis(interval_ms as u64));
-                self.last_stats_emit = Instant::now();
                 let _ = reply.send(Ok(()));
             }
             SessionCommand::StatsUnsubscribe { reply } => {
@@ -4070,6 +4079,49 @@ mod tests {
             .await;
         assert!(reply_rx.await.unwrap().is_ok());
         assert!(state.stats_interval.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_stats_resubscribe_preserves_emit_anchor() {
+        let mut state = test_session_state();
+        let (packet_tx, _packet_rx) = mpsc::channel(16);
+
+        // First subscribe anchors the emit timeline to ~now.
+        let (reply_tx, reply_rx) = oneshot::channel();
+        state
+            .handle_command(
+                SessionCommand::StatsSubscribe {
+                    reply: reply_tx,
+                    interval_ms: 5000,
+                },
+                &packet_tx,
+            )
+            .await;
+        assert!(reply_rx.await.unwrap().is_ok());
+
+        // Pretend a stats event fired 2s ago.
+        let anchor = Instant::now() - Duration::from_secs(2);
+        state.last_stats_emit = anchor;
+
+        // Re-subscribe with a new interval: the anchor must be preserved so the
+        // next fire is `interval - elapsed` from now, not reset to a fresh
+        // full interval.
+        let (reply_tx, reply_rx) = oneshot::channel();
+        state
+            .handle_command(
+                SessionCommand::StatsSubscribe {
+                    reply: reply_tx,
+                    interval_ms: 10000,
+                },
+                &packet_tx,
+            )
+            .await;
+        assert!(reply_rx.await.unwrap().is_ok());
+        assert_eq!(state.stats_interval, Some(Duration::from_millis(10000)));
+        assert_eq!(
+            state.last_stats_emit, anchor,
+            "re-subscribe must not re-anchor the emit timeline"
+        );
     }
 
     #[test]

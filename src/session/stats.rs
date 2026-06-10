@@ -1,4 +1,42 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
+
+/// Wire-level inbound datagram counters for endpoints backed by a UDP socket
+/// (WebRTC, plain RTP). Counts EVERY datagram the socket delivers — STUN/ICE
+/// bindings, DTLS, RTCP, RTP, and malformed junk — BEFORE any demux or parse.
+///
+/// Contrast with [`EndpointStats`] `inbound_*`, which count only validated RTP
+/// media (post-demux for WebRTC, post-parse/decrypt for RTP). The gap between
+/// the two is the signal for "remote path is alive but sending no media" (raw
+/// climbing, media flat); both flat is a dead path — the remote-network-failure
+/// signal. STUN consent keepalives (RFC 7675) and RTCP keep arriving even
+/// during media silence, so this counter moves whenever the peer's network path
+/// is up, independent of whether it is producing media.
+///
+/// Incremented from the per-endpoint recv task and read from the session task,
+/// so the fields are atomic and the struct is shared via `Arc`.
+#[derive(Debug, Default)]
+pub struct RawRecvCounters {
+    packets: AtomicU64,
+    bytes: AtomicU64,
+}
+
+impl RawRecvCounters {
+    /// Record one received datagram of `bytes` length (called once per
+    /// successful `recv_from`, before any demux/parse).
+    pub fn record(&self, bytes: usize) {
+        self.packets.fetch_add(1, Ordering::Relaxed);
+        self.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    pub fn packets(&self) -> u64 {
+        self.packets.load(Ordering::Relaxed)
+    }
+
+    pub fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+}
 
 /// Per-endpoint statistics
 #[derive(Debug, Clone)]
@@ -264,5 +302,59 @@ mod tests {
         // Clone should have both
         assert_eq!(cloned.inbound_packets, 2);
         assert_eq!(cloned.inbound_bytes, 30);
+    }
+
+    // --- RawRecvCounters tests ---
+
+    #[test]
+    fn raw_recv_counters_default_is_zero() {
+        let raw = RawRecvCounters::default();
+        assert_eq!(raw.packets(), 0);
+        assert_eq!(raw.bytes(), 0);
+    }
+
+    #[test]
+    fn raw_recv_record_accumulates_packets_and_bytes() {
+        let raw = RawRecvCounters::default();
+        raw.record(20); // e.g. a STUN binding
+        raw.record(160); // an RTP datagram
+        raw.record(0); // a zero-length datagram still counts as one packet
+        assert_eq!(raw.packets(), 3);
+        assert_eq!(raw.bytes(), 180);
+    }
+
+    #[test]
+    fn raw_recv_counters_shared_across_arc_clones() {
+        use std::sync::Arc;
+        // The recv task holds one Arc clone and the session task another; both
+        // must observe the same underlying counter.
+        let a = Arc::new(RawRecvCounters::default());
+        let b = Arc::clone(&a);
+        a.record(100);
+        b.record(50);
+        assert_eq!(a.packets(), 2);
+        assert_eq!(a.bytes(), 150);
+        assert_eq!(b.packets(), 2);
+        assert_eq!(b.bytes(), 150);
+    }
+
+    #[test]
+    fn raw_recv_counters_accumulate_under_concurrency() {
+        use std::sync::Arc;
+        let raw = Arc::new(RawRecvCounters::default());
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let r = Arc::clone(&raw);
+            handles.push(thread::spawn(move || {
+                for _ in 0..1000 {
+                    r.record(10);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(raw.packets(), 8000);
+        assert_eq!(raw.bytes(), 80_000);
     }
 }

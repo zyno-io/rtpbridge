@@ -149,6 +149,46 @@ impl Endpoint {
         }
     }
 
+    /// Wire-level inbound datagram count: ALL UDP datagrams received on the
+    /// endpoint's socket(s) before any demux/parse — STUN/ICE bindings, DTLS,
+    /// RTCP, RTP, and malformed junk. `None` for endpoint types with no UDP
+    /// socket (file/tone/bridge/websocket).
+    ///
+    /// This diverging from `stats().inbound_packets` (validated media only)
+    /// while it keeps climbing means the remote path is alive but sending no
+    /// media; both flat means the path is dead — the remote-network-failure
+    /// signal that media-only counters cannot distinguish from peer silence.
+    pub fn raw_recv_packets(&self) -> Option<u64> {
+        match self {
+            Endpoint::WebRtc(ep) => Some(ep.raw_recv.packets()),
+            Endpoint::Rtp(ep) => Some(ep.raw_recv.packets()),
+            _ => None,
+        }
+    }
+
+    /// Wire-level inbound byte count, paired with [`Self::raw_recv_packets`].
+    pub fn raw_recv_bytes(&self) -> Option<u64> {
+        match self {
+            Endpoint::WebRtc(ep) => Some(ep.raw_recv.bytes()),
+            Endpoint::Rtp(ep) => Some(ep.raw_recv.bytes()),
+            _ => None,
+        }
+    }
+
+    /// str0m ICE connection state (WebRTC only), lowercased: `"new"`,
+    /// `"checking"`, `"connected"`, `"completed"`, `"disconnected"`. `None` for
+    /// non-WebRTC endpoints or before the first ICE transition. `"disconnected"`
+    /// is str0m's RFC 7675 consent-freshness verdict — the canonical
+    /// remote-path-lost signal.
+    pub fn ice_state(&self) -> Option<&'static str> {
+        match self {
+            Endpoint::WebRtc(ep) => ep
+                .ice_connection_state
+                .map(super::endpoint_webrtc::ice_state_str),
+            _ => None,
+        }
+    }
+
     /// Whether this endpoint is a bridge
     pub fn is_bridge(&self) -> bool {
         matches!(self, Endpoint::Bridge(_))
@@ -352,6 +392,26 @@ mod tests {
         let id = EndpointId::new_v4();
         let ep = Endpoint::File(Box::new(FileEndpoint::new_buffering(id, 0.0)));
         assert_eq!(ep.state(), EndpointState::Buffering);
+    }
+
+    // ── raw_recv / ice_state accessor tests ─────────────────────────────
+
+    #[tokio::test]
+    async fn test_raw_recv_present_for_rtp_absent_for_file() {
+        // RTP has a UDP socket: wire-level counters exist and start at zero.
+        let (rtp_ep, _) = make_rtp_endpoint(EndpointDirection::SendRecv).await;
+        assert_eq!(rtp_ep.raw_recv_packets(), Some(0));
+        assert_eq!(rtp_ep.raw_recv_bytes(), Some(0));
+        // Plain RTP has no ICE.
+        assert_eq!(rtp_ep.ice_state(), None);
+
+        // File has no UDP socket: no wire-level counter, no ICE.
+        let path = "/tmp/rtpbridge-test-enum-rawrecv-file.wav";
+        let (file_ep, _) = make_file_endpoint(path);
+        assert_eq!(file_ep.raw_recv_packets(), None);
+        assert_eq!(file_ep.raw_recv_bytes(), None);
+        assert_eq!(file_ep.ice_state(), None);
+        std::fs::remove_file(path).ok();
     }
 
     // ── accept_answer() tests ───────────────────────────────────────────

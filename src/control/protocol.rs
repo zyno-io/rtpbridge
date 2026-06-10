@@ -493,6 +493,12 @@ pub struct EndpointStats {
     pub rtt_ms: Option<f64>,
     pub codec: String,
     pub state: String,
+    /// str0m ICE connection state for WebRTC endpoints (`"new"`, `"checking"`,
+    /// `"connected"`, `"completed"`, `"disconnected"`); omitted for non-WebRTC
+    /// endpoints or before the first ICE transition. `"disconnected"` is ICE
+    /// consent loss — a remote network-path failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ice_state: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -502,6 +508,16 @@ pub struct InboundStats {
     pub packets_lost: u64,
     pub jitter_ms: f64,
     pub last_received_ms_ago: u64,
+    /// Wire-level inbound datagrams on the endpoint's UDP socket(s): ALL packets
+    /// received before any demux/parse — STUN/ICE bindings, DTLS, RTCP, RTP, and
+    /// malformed junk. Omitted for endpoints with no UDP socket (file/tone/
+    /// bridge/websocket). Compare against `packets`/`bytes` (validated media
+    /// only): raw climbing while media is flat = remote alive but silent; both
+    /// flat = remote path dead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_packets: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_bytes: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -629,6 +645,16 @@ pub struct EndpointStateChangedData {
     pub endpoint_id: EndpointId,
     pub old_state: EndpointState,
     pub new_state: EndpointState,
+}
+
+/// `endpoint.ice_state_changed` — emitted when a WebRTC endpoint's str0m ICE
+/// connection state transitions. Finer-grained than `endpoint.state_changed`;
+/// `ice_state: "disconnected"` is ICE consent loss (RFC 7675), the canonical
+/// signal that the remote network path has failed.
+#[derive(Debug, Serialize)]
+pub struct IceStateChangedData {
+    pub endpoint_id: EndpointId,
+    pub ice_state: String,
 }
 
 #[derive(Debug, Serialize)]

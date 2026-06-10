@@ -18,6 +18,14 @@ Endpoint state transition. States: `new`, `buffering`, `connecting`, `connected`
 {"event":"endpoint.state_changed","data":{"endpoint_id":"...","old_state":"connecting","new_state":"connected"}}
 ```
 
+## endpoint.ice_state_changed
+
+WebRTC-only. The endpoint's str0m ICE connection state transitioned. States: `new`, `checking`, `connected`, `completed`, `disconnected`. Finer-grained than `endpoint.state_changed` (which collapses ICE states into the endpoint state): `disconnected` here is ICE consent loss (RFC 7675) — the canonical signal that the **remote network path has failed**, distinct from the peer merely going silent. Emitted on each genuine transition and delivered on the critical-priority channel. The latest value is also reflected in the [`stats`](./stats.md) event's `ice_state` field.
+
+```json
+{"event":"endpoint.ice_state_changed","data":{"endpoint_id":"...","ice_state":"disconnected"}}
+```
+
 ## endpoint.file.finished
 
 File playback completed or errored.

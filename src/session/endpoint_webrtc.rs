@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, trace, warn};
 
 use super::endpoint::{EndpointConfig, InboundPacket, RoutedRtpPacket};
-use super::stats::EndpointStats;
+use super::stats::{EndpointStats, RawRecvCounters};
 use crate::control::protocol::{
     EndpointDirection, EndpointDirectionUpdate, EndpointId, EndpointState,
 };
@@ -40,6 +40,17 @@ pub struct WebRtcEndpoint {
     pub config: EndpointConfig,
     pub state: EndpointState,
     pub stats: EndpointStats,
+    /// Wire-level inbound datagram counters: ALL datagrams the UDP socket
+    /// delivers (STUN/ICE, DTLS, RTCP, RTP, junk) before str0m demuxes them.
+    /// Shared with the recv task, which increments it; the session task reads
+    /// it for stats. Diverging from `stats.inbound_*` (validated media only)
+    /// while this climbs means the peer's path is alive but producing no media.
+    pub raw_recv: Arc<RawRecvCounters>,
+    /// Last ICE connection state str0m reported (None before the first
+    /// transition). `Disconnected` is str0m's RFC 7675 consent-freshness
+    /// verdict — the canonical "remote path lost" signal. Surfaced in stats
+    /// and via `endpoint.ice_state_changed`.
+    pub ice_connection_state: Option<IceConnectionState>,
     /// RFC 3550 §A.3/A.8 inbound stats (jitter, loss, sequence tracking).
     /// str0m computes these internally but does not expose them on
     /// MediaIngressStats, so we run our own pass over Event::RtpPacket.
@@ -133,6 +144,8 @@ impl WebRtcEndpoint {
             config: config.clone(),
             state: EndpointState::New,
             stats: EndpointStats::new(),
+            raw_recv: Arc::new(RawRecvCounters::default()),
+            ice_connection_state: None,
             rtcp_stats: RtcpStats::new(),
             rtc,
             socket,
@@ -223,6 +236,7 @@ impl WebRtcEndpoint {
         let local_addr = self.local_addr;
         let token = self.cancel_token.clone();
         let metrics = Arc::clone(&self.metrics);
+        let raw_recv = Arc::clone(&self.raw_recv);
         let recv_started = Arc::clone(&self.recv_started);
         // Fresh attempt: clear the liveness flag (a prior task on transfer
         // restart set it true), arm the start-grace deadline, and let the sweep
@@ -246,6 +260,11 @@ impl WebRtcEndpoint {
                         result = socket.recv_from(&mut buf) => {
                             match result {
                                 Ok((n, source)) => {
+                                    // Wire-level count: every datagram, BEFORE
+                                    // str0m demuxes ICE/DTLS/RTCP from media. A
+                                    // dropped (overflow) packet still arrived on
+                                    // the path, so count before the try_send.
+                                    raw_recv.record(n);
                                     let packet = InboundPacket {
                                         endpoint_id,
                                         source,
@@ -577,6 +596,18 @@ impl WebRtcEndpoint {
                     }
                     Event::IceConnectionStateChange(ice_state) => {
                         debug!(endpoint_id = %self.id, ?ice_state, "ICE state change");
+                        // Surface the raw ICE state independently of the
+                        // collapsed endpoint state. str0m only emits this on a
+                        // genuine transition, but guard against a no-op repeat
+                        // so consumers never see a spurious duplicate. This is
+                        // the finer-grained signal: `Disconnected` here is ICE
+                        // consent loss (remote path failure), which the
+                        // endpoint state also reports, but `Checking` vs
+                        // `Connected` etc. are only visible at this level.
+                        if self.ice_connection_state != Some(ice_state) {
+                            self.ice_connection_state = Some(ice_state);
+                            events.push(WebRtcEvent::IceStateChanged { state: ice_state });
+                        }
                         match ice_state {
                             IceConnectionState::Checking => {
                                 // str0m enters Checking whenever a new ICE
@@ -737,7 +768,24 @@ pub enum WebRtcEvent {
         old: EndpointState,
         new: EndpointState,
     },
+    /// str0m ICE connection state transitioned. Finer-grained than
+    /// `StateChanged`; `Disconnected` is the remote-path-lost signal.
+    IceStateChanged {
+        state: IceConnectionState,
+    },
     RtpPacket(RoutedRtpPacket),
+}
+
+/// Lowercase wire name for an ICE connection state, used in stats and the
+/// `endpoint.ice_state_changed` event.
+pub fn ice_state_str(state: IceConnectionState) -> &'static str {
+    match state {
+        IceConnectionState::New => "new",
+        IceConnectionState::Checking => "checking",
+        IceConnectionState::Connected => "connected",
+        IceConnectionState::Completed => "completed",
+        IceConnectionState::Disconnected => "disconnected",
+    }
 }
 
 #[cfg(test)]
@@ -1345,5 +1393,49 @@ mod tests {
         ep.pending_offer = None;
         let (_o2, g2) = ep.ice_restart().expect("second ice_restart");
         assert_eq!(g2, 2, "generation is monotonic across restarts");
+    }
+
+    #[test]
+    fn ice_state_str_maps_all_variants() {
+        assert_eq!(ice_state_str(IceConnectionState::New), "new");
+        assert_eq!(ice_state_str(IceConnectionState::Checking), "checking");
+        assert_eq!(ice_state_str(IceConnectionState::Connected), "connected");
+        assert_eq!(ice_state_str(IceConnectionState::Completed), "completed");
+        assert_eq!(
+            ice_state_str(IceConnectionState::Disconnected),
+            "disconnected"
+        );
+    }
+
+    /// A fresh endpoint has no ICE state and a zeroed wire-level counter; once a
+    /// state is stored, the `Endpoint` accessors surface it (lowercased) for
+    /// the WebRTC variant.
+    #[tokio::test]
+    async fn ice_state_and_raw_recv_surface_through_endpoint_enum() {
+        use crate::session::endpoint_enum::Endpoint;
+
+        let id = uuid::Uuid::new_v4();
+        let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let (tx, _rx) = mpsc::channel(16);
+        let metrics = Arc::new(Metrics::new());
+
+        let mut ep =
+            WebRtcEndpoint::create_offer(id, EndpointDirection::SendRecv, bind_addr, tx, metrics)
+                .await
+                .expect("create_offer should succeed")
+                .0;
+
+        assert!(
+            ep.ice_connection_state.is_none(),
+            "no ICE transition has happened yet"
+        );
+        // Simulate str0m reporting ICE consent loss.
+        ep.ice_connection_state = Some(IceConnectionState::Disconnected);
+
+        let wrapped = Endpoint::WebRtc(Box::new(ep));
+        assert_eq!(wrapped.ice_state(), Some("disconnected"));
+        // The wire-level counters exist for WebRTC and start at zero.
+        assert_eq!(wrapped.raw_recv_packets(), Some(0));
+        assert_eq!(wrapped.raw_recv_bytes(), Some(0));
     }
 }

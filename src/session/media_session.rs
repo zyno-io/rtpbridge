@@ -15,7 +15,7 @@ use super::endpoint_enum::{
 };
 use super::endpoint_file::FileEndpoint;
 use super::endpoint_rtp::RtpEndpoint;
-use super::endpoint_webrtc::{WebRtcEndpoint, WebRtcEvent};
+use super::endpoint_webrtc::{WebRtcEndpoint, WebRtcEvent, ice_state_str};
 use super::endpoint_websocket::{AudioWsStream, WebSocketEndpoint};
 use super::fax_tap;
 use super::file_poll::FileRtpState;
@@ -334,6 +334,7 @@ const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Event names that should be routed to the critical channel first.
 const CRITICAL_EVENTS: &[&str] = &[
     "endpoint.state_changed",
+    "endpoint.ice_state_changed",
     "recording.stopped",
     "endpoint.file.finished",
     "session.idle_timeout",
@@ -2324,6 +2325,8 @@ impl SessionState {
                         packets_lost: ep.packets_lost(),
                         jitter_ms: ep.jitter_ms(),
                         last_received_ms_ago: stats.ms_since_last_received().unwrap_or(0),
+                        raw_packets: ep.raw_recv_packets(),
+                        raw_bytes: ep.raw_recv_bytes(),
                     },
                     outbound: OutboundStats {
                         packets: stats.outbound_packets,
@@ -2332,6 +2335,7 @@ impl SessionState {
                     rtt_ms: ep.rtt_ms(),
                     codec: ep.codec_name(),
                     state: format!("{:?}", ep.state()),
+                    ice_state: ep.ice_state().map(str::to_string),
                 }
             })
             .collect();
@@ -2941,6 +2945,7 @@ async fn poll_and_route(
     let mut packets_to_route: Vec<RoutedRtpPacket> = Vec::new();
     let mut dtmf_packets: Vec<RoutedRtpPacket> = Vec::new();
     let mut state_events: Vec<(EndpointId, EndpointState, EndpointState)> = Vec::new();
+    let mut ice_state_events: Vec<(EndpointId, &'static str)> = Vec::new();
     let mut min_webrtc_timeout: Option<Instant> = None;
 
     // Inbound RTP (plain RTP / WS / Bridge). Telephone-event splits off out-of-band first;
@@ -3008,6 +3013,9 @@ async fn poll_and_route(
                             WebRtcEvent::StateChanged { old, new } => {
                                 state_events.push((wep.id, old, new));
                             }
+                            WebRtcEvent::IceStateChanged { state } => {
+                                ice_state_events.push((wep.id, ice_state_str(state)));
+                            }
                         }
                     }
                 }
@@ -3036,6 +3044,23 @@ async fn poll_and_route(
                 endpoint_id: eid,
                 old_state: old,
                 new_state: new,
+            },
+            dropped_events,
+            metrics,
+        );
+    }
+
+    // Emit ICE connection-state transitions (critical priority): the
+    // finer-grained signal for remote-path failure, where `disconnected` is
+    // str0m's ICE consent loss.
+    for (eid, ice_state) in ice_state_events {
+        emit_event_with_priority(
+            event_tx,
+            critical_event_tx,
+            "endpoint.ice_state_changed",
+            IceStateChangedData {
+                endpoint_id: eid,
+                ice_state: ice_state.to_string(),
             },
             dropped_events,
             metrics,

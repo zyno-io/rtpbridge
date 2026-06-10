@@ -17,7 +17,7 @@ fn rtcp_addr_from_rtp(rtp_addr: SocketAddr) -> Option<SocketAddr> {
 }
 
 use super::endpoint::{EndpointConfig, InboundPacket, RoutedRtpPacket};
-use super::stats::EndpointStats;
+use super::stats::{EndpointStats, RawRecvCounters};
 use crate::control::protocol::{
     EndpointDirection, EndpointDirectionUpdate, EndpointId, EndpointState,
 };
@@ -33,6 +33,12 @@ pub struct RtpEndpoint {
     pub config: EndpointConfig,
     pub state: EndpointState,
     pub stats: EndpointStats,
+    /// Wire-level inbound datagram counters: ALL datagrams the RTP and RTCP
+    /// sockets deliver, before parse/decrypt. Shared with the recv tasks, which
+    /// increment it. Diverging from `stats.inbound_*` (validated RTP media
+    /// only) while this climbs means the peer's path is alive but producing no
+    /// media — for plain RTP, RTCP keepalives keep this moving during silence.
+    pub raw_recv: Arc<RawRecvCounters>,
 
     pub rtp_socket: Arc<UdpSocket>,
     pub rtcp_socket: Arc<UdpSocket>,
@@ -143,6 +149,7 @@ impl RtpEndpoint {
             config: EndpointConfig { direction },
             state: EndpointState::New,
             stats: EndpointStats::new(),
+            raw_recv: Arc::new(RawRecvCounters::default()),
             rtp_socket: Arc::new(socket_pair.rtp_socket),
             rtcp_socket: Arc::new(socket_pair.rtcp_socket),
             local_rtp_addr: socket_pair.rtp_addr,
@@ -257,6 +264,7 @@ impl RtpEndpoint {
         let endpoint_id = self.id;
         let tx = packet_tx.clone();
         let token = self.cancel_token.clone();
+        let raw_recv = Arc::clone(&self.raw_recv);
         self.recv_tasks.push(tokio::spawn(async move {
             let mut buf = vec![0u8; 4096];
             let exit_reason;
@@ -265,6 +273,10 @@ impl RtpEndpoint {
                     result = rtp_socket.recv_from(&mut buf) => {
                         match result {
                             Ok((n, source)) => {
+                                // Wire-level count: every datagram on the RTP
+                                // socket, before parse/decrypt drops invalid or
+                                // non-RTP traffic.
+                                raw_recv.record(n);
                                 let packet = InboundPacket {
                                     endpoint_id,
                                     source,
@@ -299,6 +311,7 @@ impl RtpEndpoint {
         let rtcp_socket = Arc::clone(&self.rtcp_socket);
         let endpoint_id = self.id;
         let token = self.cancel_token.clone();
+        let raw_recv = Arc::clone(&self.raw_recv);
         self.recv_tasks.push(tokio::spawn(async move {
             let mut buf = vec![0u8; 4096];
             let exit_reason;
@@ -307,6 +320,10 @@ impl RtpEndpoint {
                     result = rtcp_socket.recv_from(&mut buf) => {
                         match result {
                             Ok((n, source)) => {
+                                // Count RTCP datagrams into the same wire-level
+                                // tally: for plain RTP these are the peer's
+                                // liveness keepalives during media silence.
+                                raw_recv.record(n);
                                 let packet = InboundPacket {
                                     endpoint_id,
                                     source,
@@ -2657,5 +2674,68 @@ mod tests {
         assert!(EndpointDirection::RecvOnly.is_sending());
         assert!(!EndpointDirection::SendOnly.is_sending());
         assert!(!EndpointDirection::Inactive.is_sending());
+    }
+
+    /// The wire-level counter counts EVERY datagram the RTP and RTCP sockets
+    /// receive — including non-RTP junk — independently of the media-plane
+    /// counter, which only counts validated RTP. This is the core property the
+    /// remote-network-failure signal relies on.
+    #[tokio::test]
+    async fn raw_recv_counts_datagrams_on_both_sockets() {
+        let pool =
+            crate::net::socket_pool::SocketPool::new("127.0.0.1".parse().unwrap(), 53400, 53500)
+                .unwrap();
+        let pair = pool.allocate_pair().await.unwrap();
+        let mut ep = RtpEndpoint::new(EndpointId::new_v4(), EndpointDirection::SendRecv, pair);
+        let rtp_addr = ep.local_rtp_addr;
+        let rtcp_addr = ep.rtcp_socket.local_addr().unwrap();
+        let raw = Arc::clone(&ep.raw_recv);
+
+        // Keep the receiver alive so the recv tasks' blocking sends complete.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        ep.start_recv_tasks(tx);
+
+        // Two non-RTP datagrams: one to the RTP socket, one to the RTCP socket.
+        // Neither parses as RTP media, but both arrived on the wire.
+        let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let junk = [0xFFu8; 8];
+        sender.send_to(&junk, rtp_addr).await.unwrap();
+        sender.send_to(&junk, rtcp_addr).await.unwrap();
+
+        // record() runs before the recv task forwards each datagram, so once we
+        // have drained both from the channel we know both were counted.
+        for _ in 0..2 {
+            tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("recv task should forward the datagram")
+                .expect("session channel stays open");
+        }
+
+        assert_eq!(raw.packets(), 2, "both datagrams counted at the wire");
+        assert_eq!(raw.bytes(), 16);
+        // The media-plane counter is untouched: nothing was parsed as RTP.
+        assert_eq!(ep.stats.inbound_packets, 0);
+    }
+
+    /// Junk fed through the media path returns no packet and never bumps the
+    /// media counter — confirming `stats.inbound_*` is media-only, the
+    /// complement of the wire-level `raw_recv` counter.
+    #[tokio::test]
+    async fn handle_rtp_rejects_junk_without_counting_media() {
+        let pool =
+            crate::net::socket_pool::SocketPool::new("127.0.0.1".parse().unwrap(), 53500, 53600)
+                .unwrap();
+        let pair = pool.allocate_pair().await.unwrap();
+        let mut ep = RtpEndpoint::new(EndpointId::new_v4(), EndpointDirection::SendRecv, pair);
+        let source = ep.local_rtp_addr;
+
+        let before = ep.stats.inbound_packets;
+        // First byte 0xFF => RTP version 3 (invalid); header parse fails.
+        let result = ep.handle_rtp(&[0xFFu8; 16], source);
+        assert!(result.is_none(), "junk must not parse as RTP");
+        assert_eq!(
+            ep.stats.inbound_packets, before,
+            "media counter only counts validated RTP"
+        );
     }
 }

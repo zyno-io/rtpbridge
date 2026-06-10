@@ -202,6 +202,106 @@ async fn test_stats_event_content() {
     client.request_ok("session.destroy", json!({})).await;
 }
 
+/// Test: the stats event carries the wire-level `inbound.raw_packets` /
+/// `inbound.raw_bytes` counters for a socket-backed (RTP) endpoint, and they
+/// are consistent with the media-plane counters. `raw_packets` counts ALL
+/// datagrams the socket received (RTP media here, plus any RTCP), so it must be
+/// at least the validated-media `packets` count. This is the counter that lets
+/// a consumer tell "remote alive but silent" (raw climbing, media flat) from
+/// "remote path dead" (both flat).
+#[tokio::test]
+async fn test_stats_includes_wire_level_raw_counters() {
+    let server = TestServer::start().await;
+    let mut client = TestControlClient::connect(&server.addr).await;
+
+    client.request_ok("session.create", json!({})).await;
+
+    // A single RTP endpoint fed by a test peer is enough: the raw counter lives
+    // on the recv task and increments independently of routing.
+    let mut peer_a = TestRtpPeer::new().await;
+    let offer_a = peer_a.make_sdp_offer();
+    let result = client
+        .request_ok(
+            "endpoint.create_from_offer",
+            json!({"sdp": offer_a, "direction": "sendrecv"}),
+        )
+        .await;
+    let ep_a_id = result["endpoint_id"].as_str().unwrap().to_string();
+    let answer_a = result["sdp_answer"].as_str().unwrap();
+    peer_a.set_remote(parse_rtp_addr_from_sdp(answer_a).expect("parse server addr A"));
+
+    peer_a.activate().await;
+    tokio::time::sleep(timing::scaled_ms(50)).await;
+
+    client
+        .request_ok("stats.subscribe", json!({"interval_ms": 500}))
+        .await;
+
+    // Drive real RTP media at the server's socket.
+    peer_a.send_tone_for(Duration::from_millis(500)).await;
+    tokio::time::sleep(timing::scaled_ms(300)).await;
+
+    let mut verified = false;
+    for _ in 0..15 {
+        let Some(event) = client.recv_event(timing::scaled_ms(2000)).await else {
+            continue;
+        };
+        if event["event"].as_str().unwrap_or("") != "stats" {
+            continue;
+        }
+        let endpoints = event["data"]["endpoints"].as_array().unwrap();
+        let ep_a = endpoints
+            .iter()
+            .find(|ep| ep["endpoint_id"].as_str().unwrap_or("") == ep_a_id)
+            .expect("endpoint A stats should exist");
+
+        let inbound = &ep_a["inbound"];
+        let media_packets = inbound["packets"].as_u64().unwrap_or(0);
+        if media_packets == 0 {
+            // Media hasn't been accounted yet; wait for a later interval.
+            continue;
+        }
+
+        // The wire-level counters must be present (RTP is socket-backed) ...
+        let raw_packets = inbound["raw_packets"]
+            .as_u64()
+            .expect("RTP endpoint stats must include inbound.raw_packets");
+        let raw_bytes = inbound["raw_bytes"]
+            .as_u64()
+            .expect("RTP endpoint stats must include inbound.raw_bytes");
+
+        // ... and consistent: every validated media packet was also a datagram
+        // counted at the wire, so raw >= media (raw additionally includes RTCP
+        // and anything that failed to parse).
+        assert!(
+            raw_packets >= media_packets,
+            "raw_packets ({raw_packets}) must be >= media packets ({media_packets}): {ep_a}"
+        );
+        assert!(
+            raw_bytes >= inbound["bytes"].as_u64().unwrap_or(0),
+            "raw_bytes must be >= media bytes: {ep_a}"
+        );
+        assert!(raw_packets > 0, "raw_packets should be non-zero: {ep_a}");
+
+        // Plain RTP has no ICE, so the WebRTC-only field is omitted.
+        assert!(
+            ep_a.get("ice_state").is_none(),
+            "non-WebRTC endpoint must not carry an ice_state field: {ep_a}"
+        );
+
+        verified = true;
+        break;
+    }
+
+    assert!(
+        verified,
+        "should have observed a stats event with wire-level raw counters"
+    );
+
+    client.request_ok("stats.unsubscribe", json!({})).await;
+    client.request_ok("session.destroy", json!({})).await;
+}
+
 /// Send a known number of RTP packets, subscribe to stats, and verify the
 /// reported inbound/outbound packet counts match what was actually sent
 /// and what the receiving peer observed.

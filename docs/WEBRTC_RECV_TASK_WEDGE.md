@@ -8,6 +8,9 @@ stay perfectly healthy. A pod restart fixes it; it recurs.
 
 This is the failure the commit *"Add telemetry for WebRTC accept_answer wedge
 investigation"* (`11e41e8`) was chasing. First fully diagnosed 2026-06-02.
+Root-cause theories re-ranked 2026-06-09 from retained logs/metrics — see §3;
+the datapath branch is now the front-runner, and the §4 supervision counters
+are expected to stay silent during a recurrence (§4 expectation note).
 
 ---
 
@@ -100,17 +103,19 @@ while a probe sent STUN to the endpoint's socket):** the socket is
 same worker concurrently and healthily services the control WS, `/health`,
 `/metrics`. So the process never services that endpoint socket, while the rest
 of the process runs fine. By itself, that trace does not distinguish "task never
-registered/polled the socket" from "socket readiness/packet delivery never
-arrived"; §5 has the captures that separate those cases.
+polled the socket" from "socket readiness/packet delivery never arrived" (note
+the fd is registered at bind time regardless — see §5 step 4); §5 has the
+captures that separate those cases.
 
 Because creation only `tokio::spawn`s the task and returns the SDP **without
 confirming the task ever started**, this was completely silent — the endpoint
 looked created, but its media leg was dead on arrival.
 
 ### What is *not* the cause (ruled out)
-- Not coturn (live STUN + Allocate both succeed on the same pod/IP).
-- Not the node/network (coturn on the same public IP is reachable; node UDP
-  error counters clean).
+- Not coturn (live STUN + Allocate both succeed on the same pod/IP). NOTE this
+  only vouches for coturn's *own* ports — coturn shares the pod's netns, so it
+  proves UDP reaches the pod on its well-known port, nothing about the arbitrary
+  high ports rtpbridge endpoints bind. It does NOT clear the node datapath.
 - Not a deadlock or spin (the worker sits idle in `epoll_wait`; `/proc` thread
   state identical to a healthy pod).
 - Not a panic (none logged in the pod's entire life; the recv task also
@@ -119,25 +124,66 @@ looked created, but its media leg was dead on arrival.
   reject; here the socket is never read). The unrelated `pending_offer` /
   ICE-restart-generation work is a *different*, per-call bug — see the
   `ice_restart` guard + `offer_generation` — not this process-wide wedge.
+- Not a tokio 1.52 regression: the investigation telemetry (`11e41e8`,
+  2026-05-13) predates the 1.50.0 → 1.52.3 bump (2026-05-15), so the wedge
+  existed on both versions.
 
-### Still open: the exact trigger
-We proved the *symptom* (socket never read) and the *defect* (unsupervised
-fire-and-forget recv loop), but not the precise event that makes *every* new
-endpoint's media socket fail process-wide. Each endpoint gets a fresh
-`CancellationToken`, so "cancelled before first poll" doesn't obviously explain
-all of them. The surviving theories:
+### Still open: the exact trigger — re-ranked 2026-06-09
+We proved the *symptom* (socket never read by the process) and the *defect*
+(unsupervised fire-and-forget recv loop), but not the trigger. A 2026-06-09
+re-analysis of the June 2 incident from retained Loki/Mimir data (plus an
+adversarial second review) re-ranked the theories. Key evidence:
 
-1. **Recv task never scheduled / never registers the fd** — a tokio
-   scheduling/runtime wedge on the effectively single-worker runtime
-   (`#[tokio::main]`, container CPU-limited to ~1 core). Restart-fixes-it
-   strongly favors this (in-process state).
-2. **Recv task starts, but readiness/waker delivery is broken** — the fd is
-   registered with epoll, but Tokio never observes socket readiness and therefore
-   never issues `recvfrom`.
-3. **Packets never reach the socket** (per-socket kernel/datapath) — far less likely;
-   a same-node restart fixes it and coturn on the same IP works.
+- **Idle onset.** The wedged pod (up since Jun 1 ~17:00Z) routed media normally
+  until Jun 2 ~00:40Z, then sat idle. Synthetic prober cycles completed cleanly
+  at 01:15, 02:24, 02:25 (7–13 s each); the 06:21 cycle took 30 s (prober
+  timeout?); the 10:13:13 probe got its SDP but its session was never destroyed.
+  Onset is bounded to **02:25–10:13Z (likely ≤06:21)** with ZERO log lines at
+  the transition and zero traffic — overload/backpressure triggers are out.
+- **The runtime kept scheduling new tasks and serving new TCP fds during the
+  wedge.** At 10:13 and ~12:24, brand-new control-WS TCP connections (and the
+  freshly spawned session tasks behind them) worked end to end. So the
+  scheduler and reactor were not globally dead. Caveat (from the adversarial
+  review): TCP and UDP share the driver but not identical wait states (per-fd
+  `ScheduledIo`, edge-triggered readiness), so a UDP-side per-fd divergence is
+  not fully excluded by this.
+- **Registration is NOT the recv task's job.** Verified against tokio 1.52.3 /
+  mio 1.2.0 sources: `UdpSocket::bind` → `PollEvented::new` registers the fd
+  (`EPOLL_CTL_ADD`) at construction, on the *session* task, inside
+  `create_offer`/`from_offer` — before the recv task is spawned. Theory 1's
+  "never registers the fd" framing conflated two things.
+- **Port spread.** Failed-endpoint ports (40833, 33081, 51836, RTP 23032)
+  interleave with healthy-period ports (34108, 35726, 57228): if it's datapath,
+  it is a *generalized* UDP delivery failure to the pod, not a static
+  port-range DNAT steal.
+- **"Restart fixes it" does not isolate it in-process**: the Jun 2 mitigation
+  was a pod *delete*; pod churn is exactly what makes svclb/kube-proxy
+  reprogram node NAT/conntrack state. There was also node-level churn inside
+  the onset window (kube-state-metrics moved instances ~08:00Z), and the
+  May 15 burst hit two pods simultaneously (caveat: contaminated by the
+  watchdog false-positives fixed in `fd76dbd` the same day).
+- The first Jun 2 casualty was a **plain RTP** endpoint, so the wedge is
+  probably not WebRTC-specific — weak corroboration only, since RTP recv tasks
+  still use blocking `send().await` and could park on a full channel instead.
 
-The measurements that would settle it need the pod **still wedged** (see §5).
+Theories, re-ranked (was 1 > 2 > 3):
+
+1. **Packets never reach the socket** (node/datapath: NAT, conntrack, svclb /
+   kube-proxy reprogramming, kernel drop) — now MOST probable. Fits the strace
+   exactly (idle `epoll_wait`, zero `recvfrom` = nothing to deliver), survives
+   the coturn and restart counter-arguments per above.
+2. **Recv task polls, but readiness/waker delivery is broken** for UDP fds —
+   still viable; no known tokio/mio bug of this shape in 1.50–1.52, but the
+   new-TCP evidence doesn't fully exclude a per-fd UDP divergence.
+3. **Recv task never polled** (scheduler loses the spawn) — least likely:
+   during the wedge every other freshly spawned task ran, and the idle worker
+   cuts against starvation. Not formally dead (the June 2 incident predates the
+   `recv_started` telemetry, so "the task was polled" is inference, not data).
+
+The supervision metrics now discriminate 3 from 1/2 automatically on the next
+recurrence: theory 3 ⇒ `start_timeout` fires; theories 1/2 ⇒ counters stay
+silent while calls fail (see §4 note). The 1-vs-2 split needs §5's captures on
+a still-wedged pod.
 
 ---
 
@@ -189,6 +235,14 @@ before the call's `endpoint media timeout` (5s). It makes those failures visible
 and attributable; it does **not** prove or auto-recover a readiness/datapath
 failure where the recv task started and stayed alive. See §5/§6.
 
+**Expectation (2026-06-09 re-analysis):** under §3's now-leading theories the
+recv task starts fine and parks forever in `recv_from`, so on the next wedge
+`start_timeout`/`dead` likely stay at ZERO while `recv_task_started` keeps
+climbing and calls fail. Counters at zero since the Jun 3 deploy means "no
+recurrence yet" (`connecting_stuck` is also zero), NOT "fixed". Don't let the
+silent supervision counters talk you out of the diagnosis — confirm with the
+§2 probe.
+
 ---
 
 ## 5. Diagnosing a recurrence — capture BEFORE you restart
@@ -197,18 +251,29 @@ The pod restart is the mitigation, but it erases the evidence. If you can spare
 the wedged pod for ~5 min, grab these (they are what's still missing to close
 §3's open trigger). All read-only.
 
-1. **Pin the pod & a live endpoint.** Run the probe (§2) against the bad pod;
-   note the `rtpbridge media candidate = <ip>:<port>` it prints.
-2. **Recv-Q on that endpoint socket** — first split: are packets reaching the
-   kernel socket?
+1. **Pin the pod & a live endpoint, and note the NODE.** Run the probe (§2)
+   against the bad pod; note the `rtpbridge media candidate = <ip>:<port>` it
+   prints, and record `kubectl get pod -o wide` (node identity matters if the
+   datapath theory is right — check whether wedges correlate with a node or
+   with svclb/kube-proxy/pod churn on it in the onset window).
+2. **THE decisive first split — Recv-Q + drops on that endpoint socket, while
+   the probe sends continuously:**
    ```bash
-   # In the rtpbridge container (or a debug sidecar sharing its netns):
-   #   nonzero Recv-Q  => kernel has packets, app isn't reading  => task/readiness branch
-   #   zero    Recv-Q  => packets aren't arriving                 => datapath branch
-   grep <hex(port)> /proc/<pid>/net/udp   # rx_queue column
+   # In the rtpbridge container (or a debug sidecar sharing its netns),
+   # sample a few times while the probe is actively sending STUN:
+   #   rx_queue grows         => kernel has packets, app isn't reading => task/readiness branch (stop chasing datapath)
+   #   rx_queue 0, drops 0    => packets never arrive                  => datapath branch
+   #   rx_queue 0, drops grow => kernel is dropping at the socket      => buffer/filter branch
+   grep <hex(port)> /proc/<pid>/net/udp   # rx_queue and drops columns
    ```
-3. **strace the worker** (needs `CAP_SYS_PTRACE`; the container has none, so use
-   an ephemeral debug container):
+3. **Datapath branch:** packet-capture at each hop until the packets vanish —
+   host NIC → (pod veth, if not hostNetwork) → inside the pod netns
+   (`tcpdump -ni any udp port <port>` from the debug container) — plus
+   `conntrack -L | grep <port>`, `iptables-save`/`nft list ruleset` diffed
+   against a healthy node. Rules inspection alone can miss the drop point;
+   the capture shows it.
+4. **Task/readiness branch: strace the worker** (needs `CAP_SYS_PTRACE`; the
+   container has none, so use an ephemeral debug container):
    ```bash
    kubectl -n zynotalk-cluster debug <pod> --image=nicolaka/netshoot \
      --target=rtpbridge --profile=sysadmin -c dbg --attach=false -- sleep 3600
@@ -216,14 +281,22 @@ the wedged pod for ~5 min, grab these (they are what's still missing to close
    kubectl -n zynotalk-cluster exec <pod> -c dbg -- \
      timeout 15 strace -f -p 1 -e trace=%network,epoll_ctl,epoll_wait,recvfrom,sendto -yy -tt
    ```
-   Add `epoll_ctl` (vs the original capture): if the endpoint UDP fd is never
-   `EPOLL_CTL_ADD`-ed, the socket was never registered ⇒ the task never ran. If
-   it *is* registered but never `recvfrom`'d, the readiness/waker path is the
-   problem.
-4. **Thread state** (`/proc/1/task/*/{stat,wchan,syscall,schedstat}`) — confirm
+   Interpretation (corrected 2026-06-09): the fd is `EPOLL_CTL_ADD`-ed at
+   `UdpSocket::bind` time on the *session* task, BEFORE the recv task spawns —
+   verified against tokio 1.52.3/mio 1.2.0 sources. So the ADD being present
+   says nothing about whether the recv task ran (the old "no ADD ⇒ task never
+   ran" inference was wrong; an absent ADD would instead mean bind-time
+   registration failed, which `create_offer` would have surfaced). What this
+   capture CAN show: `epoll_wait` returning events for the endpoint fd
+   (`-yy` decodes fds) with no subsequent `recvfrom` ⇒ readiness arrives but
+   the waker/poll path is broken (§3 theory 2); no events for that fd at all
+   while Recv-Q grows would be kernel-internal and warrants a tokio/mio bug
+   report. Combine with the supervision counters: `start_timeout` fired ⇒
+   never-polled variant (§3 theory 3).
+5. **Thread state** (`/proc/1/task/*/{stat,wchan,syscall,schedstat}`) — confirm
    the worker is idle in `ep_poll` and not spinning/futex-blocked (rules
    deadlock/spin in or out vs a healthy pod).
-5. After capture, **restart** (§6).
+6. After capture, **restart** (§6).
 
 When this trigger is finally pinned, update §3 and link the fix.
 
@@ -231,17 +304,35 @@ When this trigger is finally pinned, update §3 and link the fix.
 
 ## 6. Mitigation
 
-- **Restart the wedged pod:** `kubectl -n zynotalk-cluster delete pod <pod>`. It's
-  in-process state — same-node restart is fine (coturn on the same node/IP works,
-  so it's not the node). Confirm recovery with the probe on the fresh pod.
-- With the supervision fix deployed, the two recv-task failure variants are
-  **observable**: alert on `rtpbridge_webrtc_recv_task_start_timeout_total > 0`
-  or `rtpbridge_webrtc_recv_task_dead_total > 0` and auto-drain/restart the pod
-  (or have the bridge stop routing to it).
+- **Restart the wedged pod:** `kubectl -n zynotalk-cluster delete pod <pod>`.
+  Confirm recovery with the probe on the fresh pod. (2026-06-09 caveat: "it's
+  in-process, same node is fine" is no longer safe to assume — pod delete also
+  reprograms svclb/kube-proxy/conntrack node state, which under §3's leading
+  theory may be the actual fix. If the replacement lands on the same node and
+  the probe still fails, that's itself decisive data: capture §5 step 3 there.)
+- The supervision alerts (`rtpbridge_webrtc_recv_task_start_timeout_total > 0`,
+  `rtpbridge_webrtc_recv_task_dead_total > 0`) catch the never-polled and
+  died-young variants — but per §4's expectation note they likely stay SILENT
+  for this wedge. Also alert on the symptom directly, e.g. endpoints created
+  but zero `Connected` transitions / `rtpbridge_packets_routed_total` flat over
+  10m while `rtpbridge_sessions_active > 0` on a pod.
 - **Recommended follow-ups** (not yet implemented):
   - Drive the readiness probe unhealthy when `webrtc_recv_task_start_timeout` or
     `webrtc_recv_task_dead` fires so k8s drains/restarts the pod automatically
     (the real auto-recovery).
+  - **In-process UDP self-probe** in the 1 Hz sweep: a scratch socket sends a
+    datagram to a live endpoint's local port and the sweep verifies the recv
+    task saw it (count before str0m/routing). Limits: loopback bypasses the
+    external datapath, so self-probe OK + external probe failing ⇒ datapath;
+    self-probe failing ⇒ genuinely in-process. Either way it converts the next
+    recurrence into an instant branch verdict and gives the readiness probe a
+    real signal.
+  - **Give the bridge-side prober a timeout** — on Jun 2 it hung forever on the
+    10:13 probe (session never destroyed, WS never closed), so the wedge showed
+    up as silence instead of probe failures.
+  - **Extend `try_send` + supervision to RTP/RTCP recv tasks**
+    (`endpoint_rtp.rs` still uses blocking `send().await` — the original
+    parking hazard the WebRTC path was cured of).
   - Attempt a bounded recv-task restart in the liveness sweep before giving up.
   - Class-aware backpressure: demux inbound by RFC 5764 packet class (STUN /
     DTLS / SRTP) so STUN/DTLS are not dropped under RTP overload, while keeping

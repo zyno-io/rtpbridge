@@ -2,6 +2,8 @@
 //!
 //! Supports SDES key exchange (a=crypto lines in SDP).
 
+use std::collections::HashMap;
+
 use aes::cipher::{KeyIvInit, StreamCipher};
 use base64::Engine;
 use hmac::{Hmac, KeyInit, Mac};
@@ -16,180 +18,28 @@ const SRTP_AUTH_TAG_LEN: usize = 10; // 80 bits
 const SRTP_MASTER_KEY_LEN: usize = 16; // 128 bits
 const SRTP_MASTER_SALT_LEN: usize = 14; // 112 bits
 
-/// SRTP session context for encrypt/decrypt
-pub struct SrtpContext {
-    /// Derived session encryption key (128 bits)
-    pub(crate) cipher_key: [u8; 16],
-    /// Derived session salt (112 bits)
-    pub(crate) cipher_salt: [u8; 14],
-    /// Derived session authentication key (160 bits)
-    pub(crate) auth_key: [u8; 20],
+/// Maximum distinct inbound SSRCs tracked per SRTP/SRTCP receive context. Bounds
+/// memory against an authenticated peer spraying SSRCs; new SSRCs beyond this are
+/// rejected — we never evict live replay state (RFC 3711 §3.3.2).
+const MAX_RECV_SSRCS: usize = 64;
+
+/// Per-SSRC SRTP rollover counter + replay window. RFC 3711 §3.2.1/§3.3 keeps
+/// this state per SSRC; sharing it across SSRCs corrupts both when a peer
+/// rotates SSRC mid-session (the new low sequence is rejected as "too old" or
+/// authenticated against the wrong ROC).
+#[derive(Default)]
+struct SrtpStreamState {
     /// Rollover counter for extended sequence number
     roc: u32,
     /// Highest sequence number seen
     highest_seq: u16,
     seq_initialized: bool,
     /// Sliding replay window bitmap (64 packets behind highest_seq).
-    /// Bit i is set if packet (highest_seq - i) has been seen.
-    /// Bit 0 = highest_seq itself.
+    /// Bit i is set if packet (highest_seq - i) has been seen; bit 0 = highest_seq.
     replay_window: u64,
 }
 
-impl SrtpContext {
-    /// Create an SRTP context from a base64-encoded SDES key.
-    /// The key material is: master_key (16 bytes) || master_salt (14 bytes) = 30 bytes.
-    pub fn from_sdes_key(key_b64: &str) -> anyhow::Result<Self> {
-        let mut key_material = base64_decode(key_b64)?;
-        if key_material.len() < SRTP_MASTER_KEY_LEN + SRTP_MASTER_SALT_LEN {
-            anyhow::bail!(
-                "SRTP key material too short: {} bytes (need {})",
-                key_material.len(),
-                SRTP_MASTER_KEY_LEN + SRTP_MASTER_SALT_LEN
-            );
-        }
-
-        let mut master_key: [u8; 16] = key_material[..16]
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("SRTP master key slice conversion failed"))?;
-        let mut master_salt: [u8; 14] = key_material[16..30]
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("SRTP master salt slice conversion failed"))?;
-        key_material.zeroize();
-
-        // Derive session keys using SRTP KDF (RFC 3711 §4.3.1)
-        let mut cipher_key = srtp_kdf(&master_key, &master_salt, 0x00, 16);
-        let mut auth_key = srtp_kdf(&master_key, &master_salt, 0x01, 20);
-        let mut cipher_salt_vec = srtp_kdf(&master_key, &master_salt, 0x02, 14);
-
-        let mut ck = [0u8; 16];
-        ck.copy_from_slice(&cipher_key);
-        let mut cs = [0u8; 14];
-        cs.copy_from_slice(&cipher_salt_vec);
-        let mut ak = [0u8; 20];
-        ak.copy_from_slice(&auth_key);
-
-        // Zeroize intermediate key material
-        cipher_key.zeroize();
-        auth_key.zeroize();
-        cipher_salt_vec.zeroize();
-        master_key.zeroize();
-        master_salt.zeroize();
-
-        Ok(Self {
-            cipher_key: ck,
-            cipher_salt: cs,
-            auth_key: ak,
-            roc: 0,
-            highest_seq: 0,
-            seq_initialized: false,
-            replay_window: 0,
-        })
-    }
-
-    /// Encrypt an RTP packet in-place, appending the auth tag.
-    /// Returns the encrypted packet (header unchanged, payload encrypted, auth tag appended).
-    pub fn protect(&mut self, rtp_packet: &[u8]) -> anyhow::Result<Vec<u8>> {
-        if rtp_packet.len() < 12 {
-            anyhow::bail!("RTP packet too short");
-        }
-
-        let ssrc =
-            u32::from_be_bytes([rtp_packet[8], rtp_packet[9], rtp_packet[10], rtp_packet[11]]);
-        let seq = u16::from_be_bytes([rtp_packet[2], rtp_packet[3]]);
-
-        self.update_roc(seq);
-        let index = ((self.roc as u64) << 16) | seq as u64;
-
-        // Find payload offset (skip fixed header + CSRC + header extension)
-        let header_len = rtp_header_len(rtp_packet)
-            .ok_or_else(|| anyhow::anyhow!("RTP packet too short for header"))?;
-
-        let mut output = rtp_packet.to_vec();
-
-        // Encrypt payload using AES-CM
-        let iv = compute_iv(&self.cipher_salt, ssrc, index);
-        let mut cipher = Aes128Ctr::new((&self.cipher_key).into(), (&iv).into());
-        cipher.apply_keystream(&mut output[header_len..]);
-
-        // Compute and append HMAC-SHA1 auth tag
-        // Auth covers: RTP header + encrypted payload + ROC
-        let mut mac = HmacSha1::new_from_slice(&self.auth_key)
-            .map_err(|e| anyhow::anyhow!("HMAC init error: {e}"))?;
-        mac.update(&output);
-        mac.update(&self.roc.to_be_bytes());
-        let tag = mac.finalize().into_bytes();
-        output.extend_from_slice(&tag[..SRTP_AUTH_TAG_LEN]);
-
-        Ok(output)
-    }
-
-    /// Reset the sequence/ROC/replay state, preserving the derived session keys.
-    ///
-    /// Use this when the remote peer restarts its RTP stream mid-session — e.g.,
-    /// after a SIP hold where the phone sends RTCP BYE and resumes with a new
-    /// SSRC + reset sequence number. Without this, the old `replay_window` /
-    /// `highest_seq` would reject the peer's fresh low-seq packets as "too old"
-    /// and decrypt would silently drop every packet until the sequence climbed
-    /// back into range.
-    pub fn reset_sequence_state(&mut self) {
-        self.roc = 0;
-        self.highest_seq = 0;
-        self.seq_initialized = false;
-        self.replay_window = 0;
-    }
-
-    /// Decrypt an SRTP packet, verifying the auth tag, checking for replay,
-    /// and decrypting the payload.
-    /// Returns the decrypted RTP packet (without auth tag).
-    pub fn unprotect(&mut self, srtp_packet: &[u8]) -> anyhow::Result<Vec<u8>> {
-        if srtp_packet.len() < 12 + SRTP_AUTH_TAG_LEN {
-            anyhow::bail!("SRTP packet too short");
-        }
-
-        let auth_portion = &srtp_packet[..srtp_packet.len() - SRTP_AUTH_TAG_LEN];
-        let received_tag = &srtp_packet[srtp_packet.len() - SRTP_AUTH_TAG_LEN..];
-
-        let seq = u16::from_be_bytes([srtp_packet[2], srtp_packet[3]]);
-        let ssrc = u32::from_be_bytes([
-            srtp_packet[8],
-            srtp_packet[9],
-            srtp_packet[10],
-            srtp_packet[11],
-        ]);
-
-        // Estimate ROC for auth check (don't commit state yet)
-        let (estimated_roc, _) = self.estimate_roc(seq);
-
-        // Verify HMAC-SHA1 auth tag (using estimated ROC)
-        let mut mac = HmacSha1::new_from_slice(&self.auth_key)
-            .map_err(|e| anyhow::anyhow!("HMAC init error: {e}"))?;
-        mac.update(auth_portion);
-        mac.update(&estimated_roc.to_be_bytes());
-        let computed_tag = mac.finalize().into_bytes();
-
-        if computed_tag[..SRTP_AUTH_TAG_LEN]
-            .ct_eq(received_tag)
-            .unwrap_u8()
-            == 0
-        {
-            anyhow::bail!("SRTP auth tag mismatch (ssrc={ssrc:#x}, seq={seq})");
-        }
-
-        // Auth passed — now check replay window (commits ROC/seq state)
-        let (_roc, index) = self.check_replay(seq)?;
-
-        // Decrypt payload
-        let header_len = rtp_header_len(auth_portion)
-            .ok_or_else(|| anyhow::anyhow!("SRTP packet too short for header"))?;
-
-        let mut output = auth_portion.to_vec();
-        let iv = compute_iv(&self.cipher_salt, ssrc, index);
-        let mut cipher = Aes128Ctr::new((&self.cipher_key).into(), (&iv).into());
-        cipher.apply_keystream(&mut output[header_len..]);
-
-        Ok(output)
-    }
-
+impl SrtpStreamState {
     /// Update ROC for outbound (protect) — no replay check needed.
     fn update_roc(&mut self, seq: u16) {
         if !self.seq_initialized {
@@ -273,11 +123,242 @@ impl SrtpContext {
     }
 }
 
+/// SRTP session context for encrypt/decrypt
+pub struct SrtpContext {
+    /// Derived session encryption key (128 bits)
+    pub(crate) cipher_key: [u8; 16],
+    /// Derived session salt (112 bits)
+    pub(crate) cipher_salt: [u8; 14],
+    /// Derived session authentication key (160 bits)
+    pub(crate) auth_key: [u8; 20],
+    /// Per-SSRC rollover counter + replay window, keyed by RTP SSRC. A peer that
+    /// rotates SSRC mid-session (hold/re-INVITE, failover, gateway) gets an
+    /// independent context per RFC 3711 §3.2.1 instead of corrupting a single
+    /// shared one. A receive context inserts an entry only after a packet
+    /// authenticates (bounded by `MAX_RECV_SSRCS`); a transmit context holds one
+    /// entry per local SSRC we send.
+    streams: HashMap<u32, SrtpStreamState>,
+}
+
+impl SrtpContext {
+    /// Create an SRTP context from a base64-encoded SDES key.
+    /// The key material is: master_key (16 bytes) || master_salt (14 bytes) = 30 bytes.
+    pub fn from_sdes_key(key_b64: &str) -> anyhow::Result<Self> {
+        let mut key_material = base64_decode(key_b64)?;
+        if key_material.len() < SRTP_MASTER_KEY_LEN + SRTP_MASTER_SALT_LEN {
+            anyhow::bail!(
+                "SRTP key material too short: {} bytes (need {})",
+                key_material.len(),
+                SRTP_MASTER_KEY_LEN + SRTP_MASTER_SALT_LEN
+            );
+        }
+
+        let mut master_key: [u8; 16] = key_material[..16]
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("SRTP master key slice conversion failed"))?;
+        let mut master_salt: [u8; 14] = key_material[16..30]
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("SRTP master salt slice conversion failed"))?;
+        key_material.zeroize();
+
+        // Derive session keys using SRTP KDF (RFC 3711 §4.3.1)
+        let mut cipher_key = srtp_kdf(&master_key, &master_salt, 0x00, 16);
+        let mut auth_key = srtp_kdf(&master_key, &master_salt, 0x01, 20);
+        let mut cipher_salt_vec = srtp_kdf(&master_key, &master_salt, 0x02, 14);
+
+        let mut ck = [0u8; 16];
+        ck.copy_from_slice(&cipher_key);
+        let mut cs = [0u8; 14];
+        cs.copy_from_slice(&cipher_salt_vec);
+        let mut ak = [0u8; 20];
+        ak.copy_from_slice(&auth_key);
+
+        // Zeroize intermediate key material
+        cipher_key.zeroize();
+        auth_key.zeroize();
+        cipher_salt_vec.zeroize();
+        master_key.zeroize();
+        master_salt.zeroize();
+
+        Ok(Self {
+            cipher_key: ck,
+            cipher_salt: cs,
+            auth_key: ak,
+            streams: HashMap::new(),
+        })
+    }
+
+    /// Encrypt an RTP packet in-place, appending the auth tag.
+    /// Returns the encrypted packet (header unchanged, payload encrypted, auth tag appended).
+    pub fn protect(&mut self, rtp_packet: &[u8]) -> anyhow::Result<Vec<u8>> {
+        if rtp_packet.len() < 12 {
+            anyhow::bail!("RTP packet too short");
+        }
+
+        let ssrc =
+            u32::from_be_bytes([rtp_packet[8], rtp_packet[9], rtp_packet[10], rtp_packet[11]]);
+        let seq = u16::from_be_bytes([rtp_packet[2], rtp_packet[3]]);
+
+        let st = self.streams.entry(ssrc).or_default();
+        st.update_roc(seq);
+        let roc = st.roc;
+        let index = ((roc as u64) << 16) | seq as u64;
+
+        // Find payload offset (skip fixed header + CSRC + header extension)
+        let header_len = rtp_header_len(rtp_packet)
+            .ok_or_else(|| anyhow::anyhow!("RTP packet too short for header"))?;
+
+        let mut output = rtp_packet.to_vec();
+
+        // Encrypt payload using AES-CM
+        let iv = compute_iv(&self.cipher_salt, ssrc, index);
+        let mut cipher = Aes128Ctr::new((&self.cipher_key).into(), (&iv).into());
+        cipher.apply_keystream(&mut output[header_len..]);
+
+        // Compute and append HMAC-SHA1 auth tag
+        // Auth covers: RTP header + encrypted payload + ROC
+        let mut mac = HmacSha1::new_from_slice(&self.auth_key)
+            .map_err(|e| anyhow::anyhow!("HMAC init error: {e}"))?;
+        mac.update(&output);
+        mac.update(&roc.to_be_bytes());
+        let tag = mac.finalize().into_bytes();
+        output.extend_from_slice(&tag[..SRTP_AUTH_TAG_LEN]);
+
+        Ok(output)
+    }
+
+    /// Reset the sequence/ROC/replay state, preserving the derived session keys.
+    ///
+    /// Use this when the remote peer restarts its RTP stream mid-session — e.g.,
+    /// after a SIP hold where the phone sends RTCP BYE and resumes with a new
+    /// SSRC + reset sequence number. Without this, the old `replay_window` /
+    /// `highest_seq` would reject the peer's fresh low-seq packets as "too old"
+    /// and decrypt would silently drop every packet until the sequence climbed
+    /// back into range.
+    pub fn reset_sequence_state(&mut self) {
+        // Drop all per-SSRC state so any SSRC — the same one restarting with a
+        // low sequence after a hold, or a fresh one — re-baselines on its next
+        // packet. Called at a trusted SDP-renegotiation boundary; the derived
+        // session keys are preserved.
+        self.streams.clear();
+    }
+
+    /// Decrypt an SRTP packet, verifying the auth tag, checking for replay,
+    /// and decrypting the payload.
+    /// Returns the decrypted RTP packet (without auth tag).
+    pub fn unprotect(&mut self, srtp_packet: &[u8]) -> anyhow::Result<Vec<u8>> {
+        if srtp_packet.len() < 12 + SRTP_AUTH_TAG_LEN {
+            anyhow::bail!("SRTP packet too short");
+        }
+
+        let auth_portion = &srtp_packet[..srtp_packet.len() - SRTP_AUTH_TAG_LEN];
+        let received_tag = &srtp_packet[srtp_packet.len() - SRTP_AUTH_TAG_LEN..];
+
+        let seq = u16::from_be_bytes([srtp_packet[2], srtp_packet[3]]);
+        let ssrc = u32::from_be_bytes([
+            srtp_packet[8],
+            srtp_packet[9],
+            srtp_packet[10],
+            srtp_packet[11],
+        ]);
+
+        // Estimate ROC for the auth check from THIS SSRC's state (a new SSRC
+        // starts at ROC 0). Computed without mutating or inserting state, so a
+        // packet that fails auth can never spray the SSRC table.
+        let estimated_roc = match self.streams.get(&ssrc) {
+            Some(st) => st.estimate_roc(seq).0,
+            None => 0,
+        };
+
+        // Verify HMAC-SHA1 auth tag (using estimated ROC)
+        let mut mac = HmacSha1::new_from_slice(&self.auth_key)
+            .map_err(|e| anyhow::anyhow!("HMAC init error: {e}"))?;
+        mac.update(auth_portion);
+        mac.update(&estimated_roc.to_be_bytes());
+        let computed_tag = mac.finalize().into_bytes();
+
+        if computed_tag[..SRTP_AUTH_TAG_LEN]
+            .ct_eq(received_tag)
+            .unwrap_u8()
+            == 0
+        {
+            anyhow::bail!("SRTP auth tag mismatch (ssrc={ssrc:#x}, seq={seq})");
+        }
+
+        // Auth passed — commit replay state for this SSRC, creating the entry on
+        // first sight. Bounded: reject a brand-new SSRC over the cap rather than
+        // evicting a live stream's replay window.
+        if !self.streams.contains_key(&ssrc) && self.streams.len() >= MAX_RECV_SSRCS {
+            anyhow::bail!(
+                "SRTP: too many distinct SSRCs ({}), rejecting {ssrc:#x}",
+                self.streams.len()
+            );
+        }
+        let (_roc, index) = self.streams.entry(ssrc).or_default().check_replay(seq)?;
+
+        // Decrypt payload
+        let header_len = rtp_header_len(auth_portion)
+            .ok_or_else(|| anyhow::anyhow!("SRTP packet too short for header"))?;
+
+        let mut output = auth_portion.to_vec();
+        let iv = compute_iv(&self.cipher_salt, ssrc, index);
+        let mut cipher = Aes128Ctr::new((&self.cipher_key).into(), (&iv).into());
+        cipher.apply_keystream(&mut output[header_len..]);
+
+        Ok(output)
+    }
+}
+
 impl Drop for SrtpContext {
     fn drop(&mut self) {
         self.cipher_key.zeroize();
         self.cipher_salt.zeroize();
         self.auth_key.zeroize();
+    }
+}
+
+/// Per-SSRC inbound SRTCP replay state, keyed by RTCP sender SSRC.
+#[derive(Default)]
+struct SrtcpRecvState {
+    /// Highest SRTCP index seen (inbound replay protection)
+    highest_recv_index: u32,
+    recv_index_initialized: bool,
+    /// Sliding replay window bitmap (64 indices behind highest_recv_index)
+    replay_window: u64,
+}
+
+impl SrtcpRecvState {
+    /// Check + update the replay window for an incoming SRTCP packet.
+    /// Returns Err if the packet is a replay. On success, updates window state.
+    fn check_replay(&mut self, index: u32) -> anyhow::Result<()> {
+        if !self.recv_index_initialized {
+            self.highest_recv_index = index;
+            self.recv_index_initialized = true;
+            self.replay_window = 1;
+            return Ok(());
+        }
+
+        if index > self.highest_recv_index {
+            let delta = index - self.highest_recv_index;
+            if delta < 64 {
+                self.replay_window = (self.replay_window << delta) | 1;
+            } else {
+                self.replay_window = 1;
+            }
+            self.highest_recv_index = index;
+        } else {
+            let delta = self.highest_recv_index - index;
+            if delta >= 64 {
+                anyhow::bail!("SRTCP replay: packet too old (index={index}, delta={delta})");
+            }
+            let bit = 1u64 << delta;
+            if self.replay_window & bit != 0 {
+                anyhow::bail!("SRTCP replay: duplicate packet (index={index})");
+            }
+            self.replay_window |= bit;
+        }
+
+        Ok(())
     }
 }
 
@@ -288,13 +369,14 @@ pub struct SrtcpContext {
     pub(crate) cipher_key: [u8; 16],
     pub(crate) cipher_salt: [u8; 14],
     pub(crate) auth_key: [u8; 20],
-    /// 31-bit SRTCP index counter (outbound)
+    /// 31-bit SRTCP index counter (outbound). A single monotonic counter across
+    /// any local SSRC rotation — intentionally not per-SSRC (see `protect_rtcp`
+    /// and `rotate_outbound_ssrc`) so peers with a global SRTCP replay window
+    /// aren't tripped by a reused low index.
     srtcp_index: u32,
-    /// Highest SRTCP index seen (inbound replay protection)
-    highest_recv_index: u32,
-    recv_index_initialized: bool,
-    /// Sliding replay window bitmap (64 indices behind highest_recv_index)
-    replay_window: u64,
+    /// Per-SSRC inbound SRTCP replay state, keyed by RTCP sender SSRC. Inserted
+    /// only after a packet authenticates (bounded by `MAX_RECV_SSRCS`).
+    recv_streams: HashMap<u32, SrtcpRecvState>,
 }
 
 impl SrtcpContext {
@@ -337,9 +419,7 @@ impl SrtcpContext {
             cipher_salt: cs,
             auth_key: ak,
             srtcp_index: 0,
-            highest_recv_index: 0,
-            recv_index_initialized: false,
-            replay_window: 0,
+            recv_streams: HashMap::new(),
         })
     }
 
@@ -395,9 +475,9 @@ impl SrtcpContext {
     /// SRTCP index of 0. Without this, the old `replay_window` / `highest_recv_index`
     /// would reject the peer's restarted low-index packets as "too old".
     pub fn reset_recv_state(&mut self) {
-        self.highest_recv_index = 0;
-        self.recv_index_initialized = false;
-        self.replay_window = 0;
+        // Drop all per-SSRC inbound replay state so a restarted (same or new)
+        // SRTCP source re-baselines; preserves keys and the outbound index.
+        self.recv_streams.clear();
     }
 
     /// Decrypt an SRTCP packet, verifying auth and decrypting if E=1.
@@ -436,14 +516,32 @@ impl SrtcpContext {
         let encrypted = (e_and_index & 0x80000000) != 0;
         let recv_index = e_and_index & 0x7FFFFFFF;
 
-        // Check SRTCP replay window
-        self.check_srtcp_replay(recv_index)?;
+        // SRTCP replay state is keyed by the RTCP sender SSRC (bytes 4-7, always
+        // in the clear) so a peer rotating SSRC isn't rejected against another
+        // source's window. Auth has already passed above, so inserting here can't
+        // be sprayed by unauthenticated traffic; still bounded to reject (not
+        // evict) brand-new SSRCs over the cap.
+        let ssrc = u32::from_be_bytes([
+            srtcp_packet[4],
+            srtcp_packet[5],
+            srtcp_packet[6],
+            srtcp_packet[7],
+        ]);
+        if !self.recv_streams.contains_key(&ssrc) && self.recv_streams.len() >= MAX_RECV_SSRCS {
+            anyhow::bail!(
+                "SRTCP: too many distinct SSRCs ({}), rejecting {ssrc:#x}",
+                self.recv_streams.len()
+            );
+        }
+        self.recv_streams
+            .entry(ssrc)
+            .or_default()
+            .check_replay(recv_index)?;
 
         // Strip E+index and auth tag to get the RTCP compound packet
         let mut output = srtcp_packet[..index_start].to_vec();
 
         if encrypted && output.len() > 8 {
-            let ssrc = u32::from_be_bytes([output[4], output[5], output[6], output[7]]);
             let index = e_and_index & 0x7FFFFFFF;
             let iv = compute_srtcp_iv(&self.cipher_salt, ssrc, index);
             let mut cipher = Aes128Ctr::new((&self.cipher_key).into(), (&iv).into());
@@ -451,39 +549,6 @@ impl SrtcpContext {
         }
 
         Ok(output)
-    }
-
-    /// Check + update the replay window for an incoming SRTCP packet.
-    /// Returns Err if the packet is a replay. On success, updates window state.
-    fn check_srtcp_replay(&mut self, index: u32) -> anyhow::Result<()> {
-        if !self.recv_index_initialized {
-            self.highest_recv_index = index;
-            self.recv_index_initialized = true;
-            self.replay_window = 1;
-            return Ok(());
-        }
-
-        if index > self.highest_recv_index {
-            let delta = index - self.highest_recv_index;
-            if delta < 64 {
-                self.replay_window = (self.replay_window << delta) | 1;
-            } else {
-                self.replay_window = 1;
-            }
-            self.highest_recv_index = index;
-        } else {
-            let delta = self.highest_recv_index - index;
-            if delta >= 64 {
-                anyhow::bail!("SRTCP replay: packet too old (index={index}, delta={delta})");
-            }
-            let bit = 1u64 << delta;
-            if self.replay_window & bit != 0 {
-                anyhow::bail!("SRTCP replay: duplicate packet (index={index})");
-            }
-            self.replay_window |= bit;
-        }
-
-        Ok(())
     }
 }
 
@@ -763,17 +828,19 @@ mod tests {
             unprotect_ctx.unprotect(&srtp).unwrap();
         }
 
-        // Phone unholds, restarts its protect context (fresh seq from 1)
+        // Phone unholds, restarts its protect context with the SAME SSRC but a
+        // fresh low sequence (a new SSRC would be auto-accepted per-stream; the
+        // case that still needs a reset is a same-SSRC sequence restart).
         let mut restarted_protect = SrtpContext::from_sdes_key(&key).unwrap();
         let restart_rtp =
-            crate::media::rtp::RtpHeader::build(0, 1, 160, 0xBEEF, false, &[0xAA; 80]);
+            crate::media::rtp::RtpHeader::build(0, 1, 160, 0xABCD, false, &[0xAA; 80]);
         let restart_srtp = restarted_protect.protect(&restart_rtp).unwrap();
 
-        // Without reset, the low-seq packet must be rejected — this is the bug
+        // Without reset, the low-seq packet on the SAME SSRC must be rejected.
         let pre_reset = unprotect_ctx.unprotect(&restart_srtp);
         assert!(
             pre_reset.is_err(),
-            "sanity: low-seq packet on a stale context should be rejected before reset"
+            "sanity: same-SSRC low-seq packet on a stale context should be rejected before reset"
         );
 
         // After reset_sequence_state, the same packet must decrypt successfully
@@ -815,10 +882,10 @@ mod tests {
             "cipher_salt must be preserved"
         );
         assert_eq!(ctx.auth_key, auth_before, "auth_key must be preserved");
-        assert_eq!(ctx.roc, 0);
-        assert_eq!(ctx.highest_seq, 0);
-        assert!(!ctx.seq_initialized);
-        assert_eq!(ctx.replay_window, 0);
+        assert!(
+            ctx.streams.is_empty(),
+            "reset must drop all per-SSRC sequence/replay state"
+        );
     }
 
     #[test]
@@ -1483,6 +1550,180 @@ mod tests {
         assert_eq!(
             decrypted, original,
             "SRTCP roundtrip with hand-built SR should recover original packet"
+        );
+    }
+
+    #[test]
+    fn test_srtp_new_ssrc_accepted_without_reset() {
+        // Per-SSRC state: after one source runs to a high sequence, a DIFFERENT
+        // SSRC starting at a low sequence is accepted with no reset call — the
+        // bug this fixes (the shared window previously rejected it as "too old").
+        let key = make_test_key();
+        let mut tx = SrtpContext::from_sdes_key(&key).unwrap();
+        let mut rx = SrtpContext::from_sdes_key(&key).unwrap();
+
+        for seq in 1..=300u16 {
+            let rtp = crate::media::rtp::RtpHeader::build(
+                0,
+                seq,
+                seq as u32 * 160,
+                0xAAAA_0001,
+                false,
+                &[seq as u8; 80],
+            );
+            let srtp = tx.protect(&rtp).unwrap();
+            rx.unprotect(&srtp).unwrap();
+        }
+
+        let rtp = crate::media::rtp::RtpHeader::build(0, 1, 160, 0xBBBB_0002, false, &[0x99; 80]);
+        let srtp = tx.protect(&rtp).unwrap();
+        let decrypted = rx
+            .unprotect(&srtp)
+            .expect("new SSRC at a low sequence must be accepted without a reset");
+        assert_eq!(decrypted, rtp);
+    }
+
+    #[test]
+    fn test_srtp_same_seq_distinct_ssrc_independent_replay() {
+        // The same sequence number on two SSRCs is not a cross-SSRC replay; each
+        // SSRC has an independent window. Replaying within one SSRC still fails.
+        let key = make_test_key();
+        let mut tx = SrtpContext::from_sdes_key(&key).unwrap();
+        let mut rx = SrtpContext::from_sdes_key(&key).unwrap();
+
+        let a = crate::media::rtp::RtpHeader::build(0, 7, 1120, 0xA000_0000, false, &[1u8; 80]);
+        let b = crate::media::rtp::RtpHeader::build(0, 7, 1120, 0xB000_0000, false, &[2u8; 80]);
+        let sa = tx.protect(&a).unwrap();
+        let sb = tx.protect(&b).unwrap();
+
+        assert_eq!(rx.unprotect(&sa).unwrap(), a);
+        assert_eq!(
+            rx.unprotect(&sb).unwrap(),
+            b,
+            "same seq, other SSRC is not a replay"
+        );
+        assert!(
+            rx.unprotect(&sa)
+                .unwrap_err()
+                .to_string()
+                .contains("replay"),
+            "duplicate on the same SSRC must still be a replay"
+        );
+    }
+
+    #[test]
+    fn test_srtp_independent_roc_per_ssrc() {
+        // Two SSRCs cross the 16-bit sequence wrap independently; their ROCs must
+        // advance separately. Interleaved so neither corrupts the other's ROC.
+        let key = make_test_key();
+        let mut tx = SrtpContext::from_sdes_key(&key).unwrap();
+        let mut rx = SrtpContext::from_sdes_key(&key).unwrap();
+
+        let ssrc_a = 0xA0A0_A0A0; // starts near the top → wraps mid-loop
+        let ssrc_b = 0xB0B0_B0B0; // starts low → no wrap
+        for i in 0..100u32 {
+            let seq_a = 65500u16.wrapping_add(i as u16);
+            let seq_b = 1000u16.wrapping_add(i as u16);
+            let ra = crate::media::rtp::RtpHeader::build(
+                0,
+                seq_a,
+                i.wrapping_mul(160),
+                ssrc_a,
+                false,
+                &[i as u8; 80],
+            );
+            let rb = crate::media::rtp::RtpHeader::build(
+                0,
+                seq_b,
+                i.wrapping_mul(160),
+                ssrc_b,
+                false,
+                &[(i as u8) ^ 0xFF; 80],
+            );
+            let pa = tx.protect(&ra).unwrap();
+            let pb = tx.protect(&rb).unwrap();
+            assert_eq!(rx.unprotect(&pa).unwrap(), ra, "A failed at i={i}");
+            assert_eq!(rx.unprotect(&pb).unwrap(), rb, "B failed at i={i}");
+        }
+    }
+
+    #[test]
+    fn test_srtp_recv_ssrc_cap_rejects_excess() {
+        // The receive context bounds distinct SSRCs to MAX_RECV_SSRCS; one more
+        // authenticated SSRC is rejected rather than evicting a live stream.
+        let key = make_test_key();
+        let mut tx = SrtpContext::from_sdes_key(&key).unwrap();
+        let mut rx = SrtpContext::from_sdes_key(&key).unwrap();
+
+        for i in 0..MAX_RECV_SSRCS as u32 {
+            let rtp = crate::media::rtp::RtpHeader::build(
+                0,
+                0,
+                0,
+                0x1000_0000 + i,
+                false,
+                &[i as u8; 80],
+            );
+            let srtp = tx.protect(&rtp).unwrap();
+            rx.unprotect(&srtp).unwrap();
+        }
+
+        let rtp = crate::media::rtp::RtpHeader::build(0, 0, 0, 0x2000_0000, false, &[0u8; 80]);
+        let srtp = tx.protect(&rtp).unwrap();
+        let err = rx.unprotect(&srtp).unwrap_err().to_string();
+        assert!(err.contains("too many"), "expected cap error, got: {err}");
+
+        // An already-tracked SSRC keeps working (not locked out by the cap).
+        let rtp = crate::media::rtp::RtpHeader::build(0, 1, 160, 0x1000_0000, false, &[7u8; 80]);
+        let srtp = tx.protect(&rtp).unwrap();
+        rx.unprotect(&srtp)
+            .expect("an already-tracked SSRC must keep working at the cap");
+    }
+
+    #[test]
+    fn test_srtcp_new_ssrc_accepted_without_reset() {
+        // SRTCP analogue: after one source runs its index past the window, a
+        // different source at index 0 is accepted without a reset.
+        let key = make_test_key();
+        let mut rx = SrtcpContext::from_sdes_key(&key).unwrap();
+        let mut stats = crate::media::rtcp::RtcpStats::new();
+
+        let mut px = SrtcpContext::from_sdes_key(&key).unwrap();
+        let rtcp_x = crate::media::rtcp::build_sr_rr(0x1111_1111, 0x2222_2222, &mut stats, 0, 8000);
+        for _ in 0..200 {
+            let s = px.protect_rtcp(&rtcp_x).unwrap();
+            rx.unprotect_rtcp(&s).unwrap();
+        }
+
+        let mut py = SrtcpContext::from_sdes_key(&key).unwrap();
+        let rtcp_y = crate::media::rtcp::build_sr_rr(0x3333_3333, 0x4444_4444, &mut stats, 0, 8000);
+        let sy = py.protect_rtcp(&rtcp_y).unwrap();
+        rx.unprotect_rtcp(&sy)
+            .expect("new SRTCP SSRC at index 0 must be accepted without a reset");
+    }
+
+    #[test]
+    fn test_srtcp_distinct_ssrc_independent_replay() {
+        // Same SRTCP index on two SSRCs is independent; replay within one fails.
+        let key = make_test_key();
+        let mut rx = SrtcpContext::from_sdes_key(&key).unwrap();
+        let mut pa = SrtcpContext::from_sdes_key(&key).unwrap();
+        let mut pb = SrtcpContext::from_sdes_key(&key).unwrap();
+        let mut stats = crate::media::rtcp::RtcpStats::new();
+        let rtcp_a = crate::media::rtcp::build_sr_rr(0xAAAA_0000, 0x1, &mut stats, 0, 8000);
+        let rtcp_b = crate::media::rtcp::build_sr_rr(0xBBBB_0000, 0x1, &mut stats, 0, 8000);
+        let sa = pa.protect_rtcp(&rtcp_a).unwrap();
+        let sb = pb.protect_rtcp(&rtcp_b).unwrap();
+
+        rx.unprotect_rtcp(&sa).unwrap();
+        rx.unprotect_rtcp(&sb)
+            .expect("same index on a different SSRC is independent, not a replay");
+        assert!(
+            rx.unprotect_rtcp(&sa)
+                .unwrap_err()
+                .to_string()
+                .contains("replay"),
+            "SRTCP duplicate on the same SSRC must still be rejected"
         );
     }
 }

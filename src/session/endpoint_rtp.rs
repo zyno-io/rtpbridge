@@ -228,18 +228,19 @@ impl RtpEndpoint {
 
         // A new SSRC starts a fresh SRTP cryptographic context on the wire: the
         // peer (re-)initialises its per-SSRC rollover counter (ROC) at 0 when it
-        // first sees the new SSRC. Reset our TX sequence/ROC state to match.
+        // first sees the new SSRC. With per-SSRC TX state (RFC 3711 §3.2.1) our
+        // new SSRC already starts at ROC 0 on its own; we still clear the TX map
+        // here so the retired SSRC's now-unused state doesn't accumulate across
+        // repeated rotations. Mirrors the RX-side `reset_sequence_state()` done
+        // in `update_remote_sdp`.
         //
-        // Without this the prior stream's `roc`/`highest_seq` carry over, and
-        // because `update_roc` keys ROC globally (not per-SSRC) it can even
-        // spuriously increment ROC on the first packet when the new random seq
-        // is < 0x8000 while the stale `highest_seq` is > 0x8000. The auth tag
-        // covers the ROC, so any ROC disagreement makes EVERY outbound SRTP
-        // packet fail the peer's auth check — the peer silently drops them and
-        // hears nothing while still being heard. This is the one-way-audio seen
+        // (Historically this was load-bearing: when ROC was keyed globally, the
+        // stale `highest_seq` could spuriously bump ROC on the new SSRC's first
+        // packet so the auth tag — which covers the ROC — failed at the peer,
+        // making EVERY outbound SRTP packet drop. That was the one-way-audio seen
         // after a hold long enough to drive the direction back through
-        // recvonly→sendrecv (which is what triggers this SSRC rotation). Mirrors
-        // the RX-side `reset_sequence_state()` already done in `update_remote_sdp`.
+        // recvonly→sendrecv. Per-SSRC state removes that failure mode; this reset
+        // is now hygiene, not correctness.)
         //
         // SRTCP TX index is intentionally NOT reset: the index travels on the
         // wire and the IV is keyed by (ssrc, wire-index), so a new SSRC stays

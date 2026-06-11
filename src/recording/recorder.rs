@@ -6,8 +6,20 @@ use std::time::{Instant, SystemTime};
 use tokio::sync::mpsc;
 use tracing::{debug, error, warn};
 
+use super::meta::StreamDescriptor;
 use super::pcap_writer::{self, RecordPacket};
 use crate::control::protocol::{EndpointId, RecordingId};
+
+/// Cached per-endpoint descriptor: the latest `StreamDescriptor`, its encoded
+/// bytes, a monotonically-bumped version, and the frame `(src,dst)` it was last
+/// noted with (so a recording started mid-call can replay it without a live packet).
+struct DescriptorState {
+    desc: StreamDescriptor,
+    payload: Vec<u8>,
+    version: u64,
+    src: SocketAddr,
+    dst: SocketAddr,
+}
 
 /// Info about a recording that was stopped implicitly (not via recording.stop).
 pub struct StoppedRecordingInfo {
@@ -35,6 +47,9 @@ pub struct RecordingManager {
     flush_timeout_secs: u64,
     /// Channel buffer size for packets between session task and writer task
     channel_size: usize,
+    /// Latest codec descriptor per endpoint (for prepending ahead of media and
+    /// replaying into newly-started recordings).
+    latest_descriptors: HashMap<EndpointId, DescriptorState>,
 }
 
 struct Recording {
@@ -46,9 +61,9 @@ struct Recording {
     pub dropped_packet_count: u64,
     pub tx: mpsc::Sender<RecordPacket>,
     pub task: tokio::task::JoinHandle<()>,
-    /// When true, this recording also receives the unencrypted outbound RTP/RTCP
-    /// packets that rtpbridge writes toward each captured endpoint. Default false.
-    pub record_outbound: bool,
+    /// Highest descriptor version already written into this recording, per
+    /// endpoint. Guarantees descriptor-before-media ordering on the channel.
+    pub last_written_version: HashMap<EndpointId, u64>,
 }
 
 impl Default for RecordingManager {
@@ -84,31 +99,18 @@ impl RecordingManager {
             max_recordings,
             flush_timeout_secs,
             channel_size,
+            latest_descriptors: HashMap::new(),
         }
     }
 
-    /// Start a new inbound-only recording. Equivalent to
-    /// [`start_with_options`] with `record_outbound = false`.
+    /// Start a new recording. Returns the recording ID. Validates the path and
+    /// that the PCAP file can be created before returning success. Recording is
+    /// one-directional: it captures what each source *produces* (inbound RTP/RTCP
+    /// from real peers, and the RTP that internal generators emit).
     pub async fn start(
         &mut self,
         endpoint_id: Option<EndpointId>,
         file_path: String,
-    ) -> anyhow::Result<RecordingId> {
-        self.start_with_options(endpoint_id, file_path, false).await
-    }
-
-    /// Start a new recording. Returns the recording ID.
-    /// Validates the path and that the PCAP file can be created before returning success.
-    ///
-    /// `record_outbound`: when true, this recording also receives outbound packets
-    /// (rtpbridge → endpoint), captured pre-encryption. Default for callers without
-    /// the flag should be false because outbound capture roughly doubles bandwidth
-    /// and adds a small allocation on the hot path per outbound RTP packet.
-    pub async fn start_with_options(
-        &mut self,
-        endpoint_id: Option<EndpointId>,
-        file_path: String,
-        record_outbound: bool,
     ) -> anyhow::Result<RecordingId> {
         if self.recordings.len() >= self.max_recordings {
             let max = self.max_recordings;
@@ -155,7 +157,7 @@ impl RecordingManager {
             dropped_packet_count: 0,
             tx,
             task,
-            record_outbound,
+            last_written_version: HashMap::new(),
         };
 
         self.recordings.insert(id, recording);
@@ -163,6 +165,29 @@ impl RecordingManager {
         // Track endpoint → recording mapping
         if let Some(eid) = endpoint_id {
             self.endpoint_recordings.entry(eid).or_default().push(id);
+        }
+
+        // Replay cached descriptors so a recording started mid-call is
+        // self-describing from byte 0 (and the first media packet won't re-prepend).
+        let to_replay: Vec<(EndpointId, u64, Vec<u8>, SocketAddr, SocketAddr)> = self
+            .latest_descriptors
+            .iter()
+            .filter(|(eid, _)| endpoint_id.is_none_or(|e| e == **eid))
+            .map(|(eid, d)| (*eid, d.version, d.payload.clone(), d.src, d.dst))
+            .collect();
+        if let Some(rec) = self.recordings.get_mut(&id) {
+            for (eid, version, payload, src, dst) in to_replay {
+                let pkt = RecordPacket {
+                    src_addr: src,
+                    dst_addr: dst,
+                    payload,
+                    timestamp: SystemTime::now(),
+                };
+                if rec.tx.try_send(pkt).is_ok() {
+                    rec.packet_count += 1;
+                    rec.last_written_version.insert(eid, version);
+                }
+            }
         }
 
         Ok(id)
@@ -240,96 +265,194 @@ impl RecordingManager {
         &mut self,
         endpoint_id: &EndpointId,
         payload: &[u8],
-        is_outbound: bool,
     ) -> Vec<StoppedRecordingInfo> {
-        self.record_packet_addr(endpoint_id, payload, is_outbound, None, None)
+        self.record_packet_addr(endpoint_id, payload, None, None)
     }
 
-    /// Record a packet for the given endpoint, framing it with the real local and
-    /// remote socket addresses when known. Inbound packets are framed as
-    /// `remote -> local`, outbound as `local -> remote`. When either address is
-    /// unknown (endpoints with no real socket, or a remote not yet learned) it
-    /// falls back to synthetic per-endpoint `10.x` markers. Returns info about
-    /// any recordings that died due to write errors.
+    /// Frame an endpoint's packet as `source -> us`: `(src = remote, dst = local)`
+    /// with the real socket addresses when both are known, else synthetic
+    /// per-endpoint `10.x` markers (`src = endpoint marker`, `dst = bridge marker`).
+    /// Descriptor packets and media MUST share this helper so they carry identical
+    /// `(src,dst)` and the decoder binds them to one channel.
+    fn frame(
+        &mut self,
+        endpoint_id: &EndpointId,
+        local: Option<SocketAddr>,
+        remote: Option<SocketAddr>,
+    ) -> (SocketAddr, SocketAddr) {
+        match (local, remote) {
+            (Some(local), Some(remote)) => (remote, local),
+            _ => {
+                let ep = pcap_writer::synthetic_addr(self.get_endpoint_index(endpoint_id));
+                let bridge = pcap_writer::synthetic_addr(0xFFFF);
+                (ep, bridge)
+            }
+        }
+    }
+
+    /// Cache/update the codec descriptor for an endpoint. The descriptor is framed
+    /// with the same `frame()` helper as media, so it carries identical `(src,dst)`.
+    /// Bumps the version only when the descriptor content actually changes (codec or
+    /// address) — a no-op otherwise, so callers may over-call cheaply.
+    pub fn note_descriptor(
+        &mut self,
+        endpoint_id: &EndpointId,
+        desc: &StreamDescriptor,
+        local: Option<SocketAddr>,
+        remote: Option<SocketAddr>,
+    ) {
+        if let Some(existing) = self.latest_descriptors.get(endpoint_id)
+            && &existing.desc == desc
+        {
+            return; // unchanged
+        }
+        let (src, dst) = self.frame(endpoint_id, local, remote);
+        let version = self
+            .latest_descriptors
+            .get(endpoint_id)
+            .map(|d| d.version + 1)
+            .unwrap_or(1);
+        let payload = desc.encode();
+        self.latest_descriptors.insert(
+            *endpoint_id,
+            DescriptorState {
+                desc: desc.clone(),
+                payload,
+                version,
+                src,
+                dst,
+            },
+        );
+    }
+
+    /// Forget an endpoint's cached descriptor (on endpoint teardown) so a later
+    /// recording doesn't replay a dead endpoint.
+    pub fn forget_endpoint(&mut self, endpoint_id: &EndpointId) {
+        self.latest_descriptors.remove(endpoint_id);
+    }
+
+    /// Record an audio RTP packet for the endpoint. Prepends the endpoint's current
+    /// codec descriptor into any recording that hasn't seen this version yet, so the
+    /// decoder always sees the descriptor before the media it describes.
     pub fn record_packet_addr(
         &mut self,
         endpoint_id: &EndpointId,
         payload: &[u8],
-        is_outbound: bool,
         local: Option<SocketAddr>,
         remote: Option<SocketAddr>,
+    ) -> Vec<StoppedRecordingInfo> {
+        let (src, dst) = self.frame(endpoint_id, local, remote);
+        self.deliver(endpoint_id, src, dst, payload, true)
+    }
+
+    /// Record an auxiliary packet (e.g. RTCP) for the endpoint WITHOUT a descriptor.
+    /// RTCP is framed on its own port (a different `(src,dst)` than the media), and
+    /// the decoder skips it, so it must not carry/advance the media descriptor.
+    pub fn record_rtcp(
+        &mut self,
+        endpoint_id: &EndpointId,
+        payload: &[u8],
+        local: Option<SocketAddr>,
+        remote: Option<SocketAddr>,
+    ) -> Vec<StoppedRecordingInfo> {
+        let (src, dst) = self.frame(endpoint_id, local, remote);
+        self.deliver(endpoint_id, src, dst, payload, false)
+    }
+
+    /// Deliver one packet (framed `src -> dst`) to every recording covering the
+    /// endpoint (endpoint-specific + session-wide). When `with_descriptor` and the
+    /// cached descriptor version is ahead of what a recording has seen, the
+    /// descriptor is enqueued FIRST; if that enqueue is dropped (channel full), the
+    /// media is dropped too and the version is not advanced — so the decoder never
+    /// sees media before its descriptor.
+    fn deliver(
+        &mut self,
+        endpoint_id: &EndpointId,
+        src: SocketAddr,
+        dst: SocketAddr,
+        payload: &[u8],
+        with_descriptor: bool,
     ) -> Vec<StoppedRecordingInfo> {
         if self.recordings.is_empty() {
             return Vec::new();
         }
 
-        let (src, dst) = match (local, remote) {
-            (Some(local), Some(remote)) => {
-                if is_outbound {
-                    (local, remote)
-                } else {
-                    (remote, local)
-                }
-            }
-            _ => {
-                // No real socket pair — fall back to synthetic markers so distinct
-                // endpoints remain distinguishable in Wireshark.
-                let ep = pcap_writer::synthetic_addr(self.get_endpoint_index(endpoint_id));
-                let bridge = pcap_writer::synthetic_addr(0xFFFF);
-                if is_outbound {
-                    (bridge, ep)
-                } else {
-                    (ep, bridge)
-                }
-            }
+        let desc = if with_descriptor {
+            self.latest_descriptors
+                .get(endpoint_id)
+                .map(|d| (d.version, d.payload.clone()))
+        } else {
+            None
         };
-
-        let pkt = RecordPacket {
+        let now = SystemTime::now();
+        let media = RecordPacket {
             src_addr: src,
             dst_addr: dst,
             payload: payload.to_vec(),
-            timestamp: SystemTime::now(),
+            timestamp: now,
         };
 
-        let mut dead_recordings = Vec::new();
+        // Target recordings: endpoint-specific + session-wide. A session-wide
+        // recording has `endpoint_id = None` so it is never in `endpoint_recordings`,
+        // hence no duplicates.
+        let mut targets: Vec<RecordingId> = Vec::new();
+        if let Some(ids) = self.endpoint_recordings.get(endpoint_id) {
+            targets.extend(ids.iter().copied());
+        }
+        for (id, rec) in self.recordings.iter() {
+            if rec.endpoint_id.is_none() {
+                targets.push(*id);
+            }
+        }
 
-        // Send to endpoint-specific recordings
-        if let Some(rec_ids) = self.endpoint_recordings.get(endpoint_id) {
-            for rec_id in rec_ids {
-                if let Some(rec) = self.recordings.get_mut(rec_id) {
-                    // Outbound packets only go to recordings that explicitly opted in.
-                    if is_outbound && !rec.record_outbound {
-                        continue;
-                    }
-                    match rec.tx.try_send(pkt.clone_packet()) {
-                        Ok(()) => rec.packet_count += 1,
+        let mut dead_recordings = Vec::new();
+        for rec_id in targets {
+            let Some(rec) = self.recordings.get_mut(&rec_id) else {
+                continue;
+            };
+
+            // Prepend the descriptor if this recording is behind the cached version.
+            if let Some((version, ref dpayload)) = desc {
+                let seen = rec
+                    .last_written_version
+                    .get(endpoint_id)
+                    .copied()
+                    .unwrap_or(0);
+                if version > seen {
+                    let dpkt = RecordPacket {
+                        src_addr: src,
+                        dst_addr: dst,
+                        payload: dpayload.clone(),
+                        timestamp: now,
+                    };
+                    match rec.tx.try_send(dpkt) {
+                        Ok(()) => {
+                            rec.packet_count += 1;
+                            rec.last_written_version.insert(*endpoint_id, version);
+                        }
                         Err(mpsc::error::TrySendError::Closed(_)) => {
-                            dead_recordings.push(*rec_id);
+                            dead_recordings.push(rec_id);
+                            continue;
                         }
                         Err(mpsc::error::TrySendError::Full(_)) => {
+                            // Drop the media too so it never precedes its descriptor;
+                            // both are retried on the next packet.
                             rec.dropped_packet_count += 1;
-                            warn!(recording_id = %rec_id, "recording channel full, dropping packet");
+                            warn!(recording_id = %rec_id, "recording channel full, dropping descriptor+media");
+                            continue;
                         }
                     }
                 }
             }
-        }
 
-        // Send to session-wide recordings (endpoint_id = None)
-        for rec in self.recordings.values_mut() {
-            if rec.endpoint_id.is_none() {
-                if is_outbound && !rec.record_outbound {
-                    continue;
+            match rec.tx.try_send(media.clone_packet()) {
+                Ok(()) => rec.packet_count += 1,
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    dead_recordings.push(rec_id);
                 }
-                match rec.tx.try_send(pkt.clone_packet()) {
-                    Ok(()) => rec.packet_count += 1,
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                        dead_recordings.push(rec.id);
-                    }
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        rec.dropped_packet_count += 1;
-                        warn!(recording_id = %rec.id, "recording channel full, dropping packet");
-                    }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    rec.dropped_packet_count += 1;
+                    warn!(recording_id = %rec_id, "recording channel full, dropping packet");
                 }
             }
         }
@@ -339,7 +462,6 @@ impl RecordingManager {
         for rec_id in dead_recordings {
             if let Some(recording) = self.recordings.remove(&rec_id) {
                 warn!(recording_id = %rec_id, path = %recording.file_path, "recording task died (write error), removing");
-                // Remove from endpoint tracking
                 if let Some(eid) = recording.endpoint_id
                     && let Some(recs) = self.endpoint_recordings.get_mut(&eid)
                 {
@@ -694,7 +816,7 @@ mod tests {
         // Flood the channel beyond capacity (1000) without giving the writer task time to drain.
         // This should not panic — packets should be silently dropped after the channel fills.
         for _ in 0..2000 {
-            mgr.record_packet(&ep, &[0xAA; 172], false);
+            mgr.record_packet(&ep, &[0xAA; 172]);
         }
 
         // Verify the recording is still functional after overflow
@@ -724,7 +846,7 @@ mod tests {
 
         // Record some packets — these go through the channel to the background writer
         for _ in 0..10 {
-            mgr.record_packet(&ep, &[0xCC; 172], false);
+            mgr.record_packet(&ep, &[0xCC; 172]);
         }
 
         // Give the writer task a chance to process
@@ -780,7 +902,7 @@ mod tests {
 
         // Record a few packets
         for _ in 0..5 {
-            mgr.record_packet(&ep, &[0xBB; 100], false);
+            mgr.record_packet(&ep, &[0xBB; 100]);
         }
 
         let stopped = mgr.stop_endpoint_recordings(&ep);
@@ -816,12 +938,12 @@ mod tests {
         // Start a session-wide recording (endpoint_id = None) with outbound capture
         // enabled so the third (outbound) packet is not filtered.
         let path = dir.join("session-wide.pcap").to_string_lossy().to_string();
-        mgr.start_with_options(None, path, true).await.unwrap();
+        mgr.start(None, path).await.unwrap();
 
         // Record packets from different endpoints
-        mgr.record_packet(&ep1, &[0xAA; 100], false);
-        mgr.record_packet(&ep2, &[0xBB; 100], false);
-        mgr.record_packet(&ep1, &[0xCC; 100], true);
+        mgr.record_packet(&ep1, &[0xAA; 100]);
+        mgr.record_packet(&ep2, &[0xBB; 100]);
+        mgr.record_packet(&ep1, &[0xCC; 100]);
 
         // Give the writer task a moment to process
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -890,8 +1012,8 @@ mod tests {
         let id3 = mgr.start(None, path3.clone()).await.unwrap();
 
         // Record some packets
-        mgr.record_packet(&ep1, &[0x11; 50], false);
-        mgr.record_packet(&ep2, &[0x22; 50], false);
+        mgr.record_packet(&ep1, &[0x11; 50]);
+        mgr.record_packet(&ep2, &[0x22; 50]);
 
         let stopped = mgr.stop_all();
         assert_eq!(
@@ -988,7 +1110,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Now record_packet should detect the dead channel and clean up
-        let stopped = mgr.record_packet(&ep, &[0xFF; 100], false);
+        let stopped = mgr.record_packet(&ep, &[0xFF; 100]);
         assert_eq!(
             stopped.len(),
             1,
@@ -1131,23 +1253,19 @@ mod tests {
         let path_a = dir.path().join("ep_a.pcap").to_string_lossy().to_string();
         let id_a = mgr.start(Some(ep_a), path_a.clone()).await.unwrap();
 
-        // Recording only for ep_b (opt into outbound so the outbound packets below
-        // are not filtered by the record_outbound flag).
+        // Recording only for ep_b.
         let path_b = dir.path().join("ep_b.pcap").to_string_lossy().to_string();
-        let id_b = mgr
-            .start_with_options(Some(ep_b), path_b.clone(), true)
-            .await
-            .unwrap();
+        let id_b = mgr.start(Some(ep_b), path_b.clone()).await.unwrap();
 
         // Send 3 packets to ep_a, 2 packets to ep_b
         let fake_rtp = [
             0x80, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0xA0, 0x00, 0x00, 0x00, 0x01,
         ];
         for _ in 0..3 {
-            mgr.record_packet(&ep_a, &fake_rtp, false);
+            mgr.record_packet(&ep_a, &fake_rtp);
         }
         for _ in 0..2 {
-            mgr.record_packet(&ep_b, &fake_rtp, true);
+            mgr.record_packet(&ep_b, &fake_rtp);
         }
 
         // Stop individually to check per-recording packet counts
@@ -1167,20 +1285,15 @@ mod tests {
 
         let ep = EndpointId::new_v4();
 
-        // Both recordings opt into outbound so the outbound packet below is not
-        // filtered by the record_outbound flag.
         let path_ep = dir.path().join("ep.pcap").to_string_lossy().to_string();
-        let id_ep = mgr
-            .start_with_options(Some(ep), path_ep, true)
-            .await
-            .unwrap();
+        let id_ep = mgr.start(Some(ep), path_ep).await.unwrap();
 
         let path_all = dir.path().join("all.pcap").to_string_lossy().to_string();
-        let id_all = mgr.start_with_options(None, path_all, true).await.unwrap();
+        let id_all = mgr.start(None, path_all).await.unwrap();
 
         let fake_rtp = [0x80u8; 12];
-        mgr.record_packet(&ep, &fake_rtp, false);
-        mgr.record_packet(&ep, &fake_rtp, true);
+        mgr.record_packet(&ep, &fake_rtp);
+        mgr.record_packet(&ep, &fake_rtp);
 
         // Endpoint-specific should get 2 packets
         let (_, _, pkts_ep, _) = mgr.stop(&id_ep).unwrap();
@@ -1194,47 +1307,106 @@ mod tests {
         );
     }
 
-    /// Recordings started without `record_outbound` must drop outbound packets
-    /// while still capturing inbound. Recordings started with `record_outbound = true`
-    /// must capture both directions.
-    #[tokio::test]
-    async fn test_record_outbound_flag_filters_outbound() {
-        let dir = tempfile::tempdir().expect("failed to create temp dir");
-        let mut mgr = RecordingManager::new();
+    fn sample_descriptor(ep: &EndpointId) -> StreamDescriptor {
+        StreamDescriptor {
+            v: crate::recording::meta::VERSION,
+            endpoint_id: ep.to_string(),
+            role: "remote".to_string(),
+            ep_type: "rtp".to_string(),
+            codec: "PCMU".to_string(),
+            pt: 0,
+            clock_rate: 8000,
+            channels: 1,
+            endian: None,
+            ssrc: None,
+            local: "10.0.0.1:4000".to_string(),
+            remote: "203.0.113.7:5004".to_string(),
+        }
+    }
 
+    fn read_pcap_payloads(path: &str) -> Vec<Vec<u8>> {
+        let file = std::fs::File::open(path).expect("pcap exists");
+        let mut reader = pcap_file::pcap::PcapReader::new(file).expect("valid pcap");
+        let mut out = Vec::new();
+        // Synthetic frames are Ethernet(14) + IPv4(20) + UDP(8) = 42.
+        while let Some(pkt) = reader.next_packet() {
+            let data = pkt.expect("valid packet").data.to_vec();
+            if data.len() > 42 {
+                out.push(data[42..].to_vec());
+            }
+        }
+        out
+    }
+
+    /// A descriptor is prepended before the media it describes, only re-emitted
+    /// when its content changes, and the decoder can parse it back.
+    #[tokio::test]
+    async fn test_descriptor_prepended_and_deduped() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = RecordingManager::new();
+        let ep = EndpointId::new_v4();
+        let path = dir.path().join("desc.pcap").to_string_lossy().to_string();
+        let id = mgr.start(Some(ep), path.clone()).await.unwrap();
+
+        let desc = sample_descriptor(&ep);
+        let fake_rtp = [0x80u8; 12];
+
+        // First packet: descriptor + media.
+        mgr.note_descriptor(&ep, &desc, None, None);
+        mgr.record_packet(&ep, &fake_rtp);
+        // Unchanged: media only (no re-prepend).
+        mgr.note_descriptor(&ep, &desc, None, None);
+        mgr.record_packet(&ep, &fake_rtp);
+        // Codec change: new descriptor + media.
+        let mut desc2 = desc.clone();
+        desc2.codec = "opus".to_string();
+        desc2.pt = 111;
+        desc2.clock_rate = 48000;
+        mgr.note_descriptor(&ep, &desc2, None, None);
+        mgr.record_packet(&ep, &fake_rtp);
+
+        let (file_path, _, packets, _) = mgr.stop(&id).unwrap();
+        // 2 descriptors + 3 media.
+        assert_eq!(packets, 5, "2 descriptors + 3 media packets");
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let payloads = read_pcap_payloads(&file_path);
+        assert_eq!(payloads.len(), 5);
+        // Order: descriptor(PCMU), media, media, descriptor(opus), media.
+        let d0 = StreamDescriptor::parse(&payloads[0]).expect("first is a descriptor");
+        assert_eq!(d0.codec, "PCMU");
+        assert!(
+            StreamDescriptor::parse(&payloads[1]).is_none(),
+            "media, not descriptor"
+        );
+        assert!(StreamDescriptor::parse(&payloads[2]).is_none());
+        let d3 = StreamDescriptor::parse(&payloads[3]).expect("re-emitted descriptor");
+        assert_eq!(d3.codec, "opus");
+        assert!(StreamDescriptor::parse(&payloads[4]).is_none());
+    }
+
+    /// A recording started mid-call replays the cached descriptor so it is
+    /// self-describing from byte 0.
+    #[tokio::test]
+    async fn test_descriptor_replayed_on_late_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = RecordingManager::new();
         let ep = EndpointId::new_v4();
 
-        let inbound_only_path = dir
-            .path()
-            .join("inbound-only.pcap")
-            .to_string_lossy()
-            .to_string();
-        let inbound_only_id = mgr.start(Some(ep), inbound_only_path).await.unwrap();
+        // Descriptor cached before any recording exists.
+        mgr.note_descriptor(&ep, &sample_descriptor(&ep), None, None);
 
-        let both_path = dir.path().join("both.pcap").to_string_lossy().to_string();
-        let both_id = mgr
-            .start_with_options(Some(ep), both_path, true)
-            .await
-            .unwrap();
+        let path = dir.path().join("late.pcap").to_string_lossy().to_string();
+        let id = mgr.start(Some(ep), path.clone()).await.unwrap();
+        mgr.record_packet(&ep, &[0x80u8; 12]);
 
-        let fake_rtp = [0x80u8; 12];
-        // 2 inbound, 3 outbound
-        mgr.record_packet(&ep, &fake_rtp, false);
-        mgr.record_packet(&ep, &fake_rtp, false);
-        mgr.record_packet(&ep, &fake_rtp, true);
-        mgr.record_packet(&ep, &fake_rtp, true);
-        mgr.record_packet(&ep, &fake_rtp, true);
-
-        let (_, _, inbound_only_pkts, _) = mgr.stop(&inbound_only_id).unwrap();
-        assert_eq!(
-            inbound_only_pkts, 2,
-            "default recording should drop outbound packets"
-        );
-
-        let (_, _, both_pkts, _) = mgr.stop(&both_id).unwrap();
-        assert_eq!(
-            both_pkts, 5,
-            "opt-in recording should capture inbound and outbound"
+        let (file_path, _, packets, _) = mgr.stop(&id).unwrap();
+        assert_eq!(packets, 2, "replayed descriptor + 1 media");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let payloads = read_pcap_payloads(&file_path);
+        assert!(
+            StreamDescriptor::parse(&payloads[0]).is_some(),
+            "late-started recording leads with the replayed descriptor"
         );
     }
 
@@ -1250,7 +1422,7 @@ mod tests {
         // Record some packets
         let fake_rtp = [0x80u8; 20];
         for _ in 0..7 {
-            mgr.record_packet(&ep, &fake_rtp, false);
+            mgr.record_packet(&ep, &fake_rtp);
         }
 
         // Small sleep so duration_ms is > 0
@@ -1303,7 +1475,7 @@ mod tests {
         // Record packets to ep1 so we can verify counts in the stopped info
         let fake_rtp = [0x80u8; 12];
         for _ in 0..4 {
-            mgr.record_packet(&ep1, &fake_rtp, false);
+            mgr.record_packet(&ep1, &fake_rtp);
         }
 
         // Stop only ep1 recordings
@@ -1345,8 +1517,8 @@ mod tests {
         let id3 = mgr.start(None, p3.clone()).await.unwrap();
 
         // Record some packets
-        mgr.record_packet(&ep1, &[0xAA; 100], false);
-        mgr.record_packet(&ep2, &[0xBB; 100], true);
+        mgr.record_packet(&ep1, &[0xAA; 100]);
+        mgr.record_packet(&ep2, &[0xBB; 100]);
 
         let stopped = mgr.stop_all();
         assert_eq!(stopped.len(), 3, "stop_all should stop all 3 recordings");

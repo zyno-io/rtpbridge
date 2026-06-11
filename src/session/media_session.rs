@@ -11,7 +11,7 @@ use super::audio_analysis;
 use super::endpoint::{InboundPacket, RoutedRtpPacket};
 use super::endpoint_enum::{
     Endpoint, endpoint_audio_codec, endpoint_last_rtp_timestamp, endpoint_rtp_clock_rate,
-    endpoint_send_pt,
+    endpoint_send_pt, endpoint_stream_descriptor,
 };
 use super::endpoint_file::FileEndpoint;
 use super::endpoint_rtp::RtpEndpoint;
@@ -127,7 +127,6 @@ pub enum SessionCommand {
         reply: oneshot::Sender<anyhow::Result<RecordingId>>,
         endpoint_id: Option<EndpointId>,
         file_path: String,
-        record_outbound: bool,
     },
     RecordingStop {
         reply: oneshot::Sender<anyhow::Result<(String, u64, u64, u64)>>,
@@ -476,25 +475,36 @@ impl SessionState {
                 reply,
                 endpoint_id,
                 file_path,
-                record_outbound,
             } => {
+                // Seed descriptors for already-negotiated endpoints so the new
+                // recording is self-describing from byte 0 (start() replays the
+                // cache). Without this, a recording started mid-call wouldn't carry
+                // an endpoint's descriptor until its next media packet.
+                let descs: Vec<(
+                    EndpointId,
+                    crate::recording::meta::StreamDescriptor,
+                    Option<SocketAddr>,
+                    Option<SocketAddr>,
+                )> = self
+                    .endpoints
+                    .iter()
+                    .filter_map(|(id, ep)| {
+                        let (local, remote) = endpoint_media_addrs(ep);
+                        endpoint_stream_descriptor(ep, local, remote)
+                            .map(|d| (*id, d, local, remote))
+                    })
+                    .collect();
+                for (id, d, local, remote) in &descs {
+                    self.recording_mgr.note_descriptor(id, d, *local, *remote);
+                }
+
                 // Validate that the endpoint exists before starting a recording
                 let result = if let Some(eid) = endpoint_id {
                     if self.endpoints.contains_key(&eid) {
-                        if record_outbound {
-                            self.recording_mgr
-                                .start_with_options(Some(eid), file_path, true)
-                                .await
-                        } else {
-                            self.recording_mgr.start(Some(eid), file_path).await
-                        }
+                        self.recording_mgr.start(Some(eid), file_path).await
                     } else {
                         Err(anyhow::anyhow!("Endpoint not found"))
                     }
-                } else if record_outbound {
-                    self.recording_mgr
-                        .start_with_options(None, file_path, true)
-                        .await
                 } else {
                     self.recording_mgr.start(None, file_path).await
                 };
@@ -1460,6 +1470,9 @@ impl SessionState {
         let file_rtp_state = self.file_rtp_states.remove(&endpoint_id);
         let url_source = self.url_sources.remove(&endpoint_id);
         let media_timeout_was_emitted = self.media_timeout_emitted.remove(&endpoint_id);
+        // Drop the cached recording descriptor: the endpoint leaves this session,
+        // and its synthetic address index may be recycled for a new endpoint.
+        self.recording_mgr.forget_endpoint(&endpoint_id);
 
         // Clear pending DTMF injection targeting this endpoint
         if self
@@ -2070,7 +2083,11 @@ impl SessionState {
                     Endpoint::WebRtc(w) => {
                         local_rtp_addr = Some(w.local_addr.to_string());
                         remote_rtp_addr = w.remote_addr.map(|a| a.to_string());
-                        ("webrtc".to_string(), Some("opus".to_string()), None)
+                        let codec = w
+                            .negotiated_codec()
+                            .map(|c| c.name.to_string())
+                            .unwrap_or_else(|| "opus".to_string());
+                        ("webrtc".to_string(), Some(codec), None)
                     }
                     Endpoint::Rtp(r) => {
                         local_rtp_addr = Some(r.local_rtp_addr.to_string());
@@ -2146,6 +2163,9 @@ impl SessionState {
         self.file_rtp_states.remove(&endpoint_id);
         self.tone_rtp_states.remove(&endpoint_id);
         self.media_timeout_emitted.remove(&endpoint_id);
+        // Drop the cached recording descriptor so a later recording doesn't replay
+        // a dead endpoint.
+        self.recording_mgr.forget_endpoint(&endpoint_id);
         if let Some(url) = self.url_sources.remove(&endpoint_id) {
             self.file_cache.release(&url).await;
         }
@@ -2529,13 +2549,17 @@ pub async fn run_media_session(
                     // Record at arrival, before the playout buffer, framed with the
                     // datagram's REAL source (not the latched remote, which can go
                     // stale after a post-lock NAT rebind).
-                    let local = state
-                        .endpoints
-                        .get(&routed.source_endpoint_id)
-                        .and_then(|ep| endpoint_media_addrs(ep).0);
+                    let (local, desc) = match state.endpoints.get(&routed.source_endpoint_id) {
+                        Some(ep) => {
+                            let local = endpoint_media_addrs(ep).0;
+                            (local, endpoint_stream_descriptor(ep, local, Some(pkt.source)))
+                        }
+                        None => (None, None),
+                    };
                     record_inbound(
                         &mut state.recording_mgr,
                         &routed,
+                        desc.as_ref(),
                         local,
                         Some(pkt.source),
                         &state.event_tx,
@@ -2550,10 +2574,9 @@ pub async fn run_media_session(
                     // port: frame remote = the datagram's real source, local = our
                     // RTCP-side local addr.
                     let local = state.endpoints.get(&eid).and_then(endpoint_rtcp_local);
-                    let dead = state.recording_mgr.record_packet_addr(
+                    let dead = state.recording_mgr.record_rtcp(
                         &eid,
                         &rtcp_bytes,
-                        false,
                         local,
                         Some(pkt.source),
                     );
@@ -2598,13 +2621,20 @@ pub async fn run_media_session(
                         handle_inbound_packet(&mut state.endpoints, &pkt, &state.metrics);
                     if let Some(routed) = routed {
                         // Record at arrival (pre-buffer) with the real datagram source.
-                        let local = state
-                            .endpoints
-                            .get(&routed.source_endpoint_id)
-                            .and_then(|ep| endpoint_media_addrs(ep).0);
+                        let (local, desc) = match state.endpoints.get(&routed.source_endpoint_id) {
+                            Some(ep) => {
+                                let local = endpoint_media_addrs(ep).0;
+                                (
+                                    local,
+                                    endpoint_stream_descriptor(ep, local, Some(pkt.source)),
+                                )
+                            }
+                            None => (None, None),
+                        };
                         record_inbound(
                             &mut state.recording_mgr,
                             &routed,
+                            desc.as_ref(),
                             local,
                             Some(pkt.source),
                             &state.event_tx,
@@ -2618,10 +2648,9 @@ pub async fn run_media_session(
                         // Real RTCP source (the datagram's source) + our RTCP-side
                         // local addr (the dedicated RTCP socket).
                         let local = state.endpoints.get(&eid).and_then(endpoint_rtcp_local);
-                        let dead = state.recording_mgr.record_packet_addr(
+                        let dead = state.recording_mgr.record_rtcp(
                             &eid,
                             &rtcp_bytes,
-                            false,
                             local,
                             Some(pkt.source),
                         );
@@ -2790,27 +2819,10 @@ pub async fn run_media_session(
         for ep in state.endpoints.values_mut() {
             if let Endpoint::Rtp(rep) = ep {
                 match rep.maybe_send_rtcp().await {
-                    Ok(Some(rtcp_bytes)) => {
-                        // Outbound RTCP: `maybe_send_rtcp` always transmits from the
-                        // dedicated RTCP socket, so frame it from that local addr ->
-                        // the peer's RTCP addr (regardless of rtcp-mux).
-                        let local = rep.rtcp_socket.local_addr().ok();
-                        let dead = state.recording_mgr.record_packet_addr(
-                            &rep.id,
-                            &rtcp_bytes,
-                            true,
-                            local,
-                            rep.remote_rtcp_addr,
-                        );
-                        emit_dead_recordings(
-                            &state.event_tx,
-                            &state.critical_event_tx,
-                            &state.dropped_events,
-                            &state.metrics,
-                            dead,
-                        );
-                    }
-                    Ok(None) => {}
+                    // `maybe_send_rtcp` already transmits on the wire; we no longer
+                    // record what we send (outbound recording dropped). Inbound RTCP
+                    // is still captured at arrival above.
+                    Ok(_) => {}
                     Err(e) => {
                         debug!(endpoint_id = %rep.id, error = %e, "RTCP send error");
                     }
@@ -3058,6 +3070,7 @@ fn endpoint_rtcp_local(ep: &Endpoint) -> Option<SocketAddr> {
 fn record_inbound(
     recording_mgr: &mut RecordingManager,
     pkt: &RoutedRtpPacket,
+    descriptor: Option<&crate::recording::meta::StreamDescriptor>,
     local: Option<SocketAddr>,
     remote: Option<SocketAddr>,
     event_tx: &Option<mpsc::Sender<Event>>,
@@ -3068,6 +3081,12 @@ fn record_inbound(
     if !recording_mgr.is_recording() {
         return;
     }
+    // Refresh the cached descriptor (no-op unless codec/addr changed) so it is
+    // prepended before this packet whenever it advanced — including after a
+    // plain-RTP source-address latch, where `remote` changes here.
+    if let Some(desc) = descriptor {
+        recording_mgr.note_descriptor(&pkt.source_endpoint_id, desc, local, remote);
+    }
     let raw_rtp = crate::media::rtp::RtpHeader::build(
         pkt.payload_type,
         pkt.sequence_number,
@@ -3076,8 +3095,7 @@ fn record_inbound(
         pkt.marker,
         &pkt.payload,
     );
-    let dead =
-        recording_mgr.record_packet_addr(&pkt.source_endpoint_id, &raw_rtp, false, local, remote);
+    let dead = recording_mgr.record_packet_addr(&pkt.source_endpoint_id, &raw_rtp, local, remote);
     emit_dead_recordings(event_tx, critical_event_tx, dropped_events, metrics, dead);
     metrics.packets_recorded.inc();
 }
@@ -3162,13 +3180,17 @@ async fn poll_and_route(
     // are paced generators with no real peer, so they frame with synthetic markers.
     if recording_mgr.is_recording() {
         for routed in &packets_to_route[generated_start..] {
-            let (local, remote) = endpoints
-                .get(&routed.source_endpoint_id)
-                .map(endpoint_media_addrs)
-                .unwrap_or((None, None));
+            let (local, remote, desc) = match endpoints.get(&routed.source_endpoint_id) {
+                Some(ep) => {
+                    let (local, remote) = endpoint_media_addrs(ep);
+                    (local, remote, endpoint_stream_descriptor(ep, local, remote))
+                }
+                None => (None, None, None),
+            };
             record_inbound(
                 recording_mgr,
                 routed,
+                desc.as_ref(),
                 local,
                 remote,
                 event_tx,
@@ -3194,9 +3216,11 @@ async fn poll_and_route(
                                 // Record at arrival (post-str0m-decrypt, pre-buffer)
                                 // with the nominated peer / matching-family local addr.
                                 let (local, remote) = wep.recording_addrs();
+                                let desc = wep.stream_descriptor(local, remote);
                                 record_inbound(
                                     recording_mgr,
                                     &pkt,
+                                    desc.as_ref(),
                                     local,
                                     remote,
                                     event_tx,
@@ -3452,21 +3476,10 @@ async fn poll_and_route(
                         Err(e) => {
                             warn!(src = %pkt.source_endpoint_id, dst = %dest_id, error = %e, "route error")
                         }
-                        Ok(wire) => {
+                        // The write_rtp above already sent to the peer; we no longer
+                        // record what we send (outbound recording dropped).
+                        Ok(_) => {
                             metrics.packets_routed.inc();
-                            if let Some(bytes) = wire {
-                                // Outbound: framed as our local -> the real peer addr.
-                                let (local, remote) = endpoint_media_addrs(dest_ep);
-                                let dead = recording_mgr
-                                    .record_packet_addr(&dest_id, &bytes, true, local, remote);
-                                emit_dead_recordings(
-                                    event_tx,
-                                    critical_event_tx,
-                                    dropped_events,
-                                    metrics,
-                                    dead,
-                                );
-                            }
                         }
                     }
                 }
@@ -3499,21 +3512,9 @@ async fn poll_and_route(
                 };
                 match result {
                     Err(e) => warn!(dst = %dest_id, error = %e, "mixer route error"),
-                    Ok(wire) => {
+                    // Outbound recording dropped — write_rtp already sent the packet.
+                    Ok(_) => {
                         metrics.packets_routed.inc();
-                        if let Some(bytes) = wire {
-                            // Outbound: framed as our local -> the real peer addr.
-                            let (local, remote) = endpoint_media_addrs(dest_ep);
-                            let dead = recording_mgr
-                                .record_packet_addr(&dest_id, &bytes, true, local, remote);
-                            emit_dead_recordings(
-                                event_tx,
-                                critical_event_tx,
-                                dropped_events,
-                                metrics,
-                                dead,
-                            );
-                        }
                     }
                 }
             }
@@ -4137,7 +4138,6 @@ mod tests {
                 timestamp: 0,
                 ssrc: 0,
                 last_poll: Instant::now(),
-                resampler: None,
             },
         );
         state
@@ -4323,38 +4323,6 @@ mod tests {
         assert!(
             emitted.insert(eid),
             "after remove, insert should succeed again"
-        );
-    }
-
-    #[test]
-    fn test_file_rtp_state_resampler_created_for_non_8k() {
-        let state_8k = FileRtpState {
-            seq_no: 0,
-            timestamp: 0,
-            ssrc: 0,
-            last_poll: Instant::now(),
-            resampler: None,
-        };
-        assert!(state_8k.resampler.is_none());
-
-        let state_48k = FileRtpState {
-            seq_no: 0,
-            timestamp: 0,
-            ssrc: 0,
-            last_poll: Instant::now(),
-            resampler: Some(crate::media::resample::Resampler::new(48000, 8000)),
-        };
-        assert!(state_48k.resampler.is_some());
-        // Verify the resampler can process samples
-        let mut r = crate::media::resample::Resampler::new(48000, 8000);
-        let input: Vec<i16> = vec![0; 960]; // 20ms at 48kHz
-        let mut output = Vec::new();
-        r.process(&input, &mut output);
-        // Should produce ~160 samples (8kHz, 20ms)
-        assert!(
-            output.len() >= 158 && output.len() <= 162,
-            "48kHz→8kHz resample should produce ~160 samples, got {}",
-            output.len()
         );
     }
 

@@ -881,7 +881,6 @@ async fn handle_recording_start(
             reply: reply_tx,
             endpoint_id: params.endpoint_id,
             file_path: resolved_path,
-            record_outbound: params.record_outbound,
         },
         reply_rx,
         &id,

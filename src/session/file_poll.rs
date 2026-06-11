@@ -14,9 +14,6 @@ pub struct FileRtpState {
     pub timestamp: u32,
     pub ssrc: u32,
     pub last_poll: Instant,
-    /// Resampler for converting file sample rate to 8kHz (for PCMU output).
-    /// None when the file is already at 8kHz.
-    pub resampler: Option<crate::media::resample::Resampler>,
 }
 
 /// Poll file endpoints for PCM output. Produces RoutedRtpPackets and emits
@@ -40,20 +37,14 @@ pub fn poll_file_endpoints(
                 tracing::warn!(endpoint_id = %fep.id, "file has sample_rate 0, skipping playback");
                 continue;
             }
-            let state = file_rtp_states.entry(fep.id).or_insert_with(|| {
-                let resampler = if file_rate != 8000 {
-                    Some(crate::media::resample::Resampler::new(file_rate, 8000))
-                } else {
-                    None
-                };
-                FileRtpState {
+            let state = file_rtp_states
+                .entry(fep.id)
+                .or_insert_with(|| FileRtpState {
                     seq_no: rand::random(),
                     timestamp: rand::random(),
                     ssrc: rand::random(),
                     last_poll: Instant::now() - Duration::from_millis(20),
-                    resampler,
-                }
-            });
+                });
             while state.last_poll.elapsed() >= Duration::from_millis(20) {
                 state.last_poll += Duration::from_millis(20);
                 // Clamp: don't burst more than 5 frames if we fell far behind
@@ -64,19 +55,18 @@ pub fn poll_file_endpoints(
                 let target_samples = (file_rate / 50) as usize; // 20ms at file's native rate
                 let was_playing = fep.state == EndpointState::Playing;
                 if let Some(pcm) = fep.next_pcm(target_samples) {
-                    // Resample to 8kHz if needed, then encode to PCMU
-                    let pcm_8k = if let Some(ref mut resampler) = state.resampler {
-                        let mut buf = Vec::new();
-                        resampler.process(&pcm, &mut buf);
-                        buf
-                    } else {
-                        pcm
-                    };
-                    let encoder = xlaw::PcmXLawEncoder::new_ulaw();
-                    let payload: Vec<u8> = pcm_8k.iter().map(|&s| encoder.encode(s)).collect();
+                    // Emit native-rate L16 (PT 127, little-endian — matching this
+                    // repo's L16 convention). The per-edge transcode/mixer then
+                    // encodes to each destination at full quality (G.722@16k,
+                    // Opus@48k) instead of bottlenecking the file through 8 kHz µ-law.
+                    let samples = pcm.len() as u32;
+                    let mut payload = Vec::with_capacity(pcm.len() * 2);
+                    for s in &pcm {
+                        payload.extend_from_slice(&s.to_le_bytes());
+                    }
                     packets_out.push(RoutedRtpPacket {
                         source_endpoint_id: fep.id,
-                        payload_type: 0, // PCMU
+                        payload_type: 127, // L16
                         sequence_number: state.seq_no,
                         timestamp: state.timestamp,
                         ssrc: state.ssrc,
@@ -84,7 +74,8 @@ pub fn poll_file_endpoints(
                         payload,
                     });
                     state.seq_no = state.seq_no.wrapping_add(1);
-                    state.timestamp = state.timestamp.wrapping_add(160); // always 160 at 8kHz
+                    // L16 RTP clock == sample rate, so advance by the sample count.
+                    state.timestamp = state.timestamp.wrapping_add(samples);
                 } else if was_playing && fep.state == EndpointState::Finished {
                     super::media_session::emit_event_with_priority(
                         event_tx,
@@ -148,8 +139,71 @@ mod tests {
         (id, Endpoint::File(Box::new(fep)))
     }
 
+    /// Mono 16-bit WAV at an arbitrary sample rate.
+    fn test_wav_at(path: &str, sample_rate: u32, duration_secs: f64) {
+        let num_samples = (sample_rate as f64 * duration_secs) as usize;
+        let data_size = (num_samples * 2) as u32;
+        let mut file = std::fs::File::create(path).unwrap();
+        file.write_all(b"RIFF").unwrap();
+        file.write_all(&(36 + data_size).to_le_bytes()).unwrap();
+        file.write_all(b"WAVE").unwrap();
+        file.write_all(b"fmt ").unwrap();
+        file.write_all(&16u32.to_le_bytes()).unwrap();
+        file.write_all(&1u16.to_le_bytes()).unwrap();
+        file.write_all(&1u16.to_le_bytes()).unwrap();
+        file.write_all(&sample_rate.to_le_bytes()).unwrap();
+        file.write_all(&(sample_rate * 2).to_le_bytes()).unwrap();
+        file.write_all(&2u16.to_le_bytes()).unwrap();
+        file.write_all(&16u16.to_le_bytes()).unwrap();
+        file.write_all(b"data").unwrap();
+        file.write_all(&data_size.to_le_bytes()).unwrap();
+        for i in 0..num_samples {
+            let t = i as f64 / sample_rate as f64;
+            let sample = (f64::sin(2.0 * std::f64::consts::PI * 440.0 * t) * 16000.0) as i16;
+            file.write_all(&sample.to_le_bytes()).unwrap();
+        }
+    }
+
+    /// A 48 kHz file must be captured at 48 kHz L16, NOT downsampled to 8 kHz —
+    /// this is the playback-quality fix. The per-edge transcode encodes to each
+    /// destination's codec from this full-rate source.
     #[test]
-    fn test_poll_produces_pcmu_packet() {
+    fn test_poll_emits_native_rate_l16_no_downsample() {
+        let path = "/tmp/rtpbridge-filepoll-48k.wav";
+        test_wav_at(path, 48000, 0.1);
+
+        let (id, ep) = make_file_endpoint(path);
+        let mut endpoints = HashMap::new();
+        endpoints.insert(id, ep);
+        let mut file_rtp_states = HashMap::new();
+        let dropped = AtomicU64::new(0);
+        let metrics = crate::metrics::Metrics::new();
+        let mut packets_out = Vec::new();
+
+        poll_file_endpoints(
+            &mut endpoints,
+            &mut file_rtp_states,
+            &None,
+            &None,
+            &dropped,
+            &metrics,
+            &mut packets_out,
+        );
+
+        assert_eq!(packets_out.len(), 1);
+        let pkt = &packets_out[0];
+        assert_eq!(pkt.payload_type, 127, "L16");
+        // 20ms @ 48kHz = 960 mono samples * 2 bytes = 1920 (not 8kHz/320).
+        assert_eq!(
+            pkt.payload.len(),
+            1920,
+            "file must be captured at native 48kHz, not downsampled to 8kHz"
+        );
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_poll_produces_l16_packet() {
         let path = "/tmp/rtpbridge-filepoll-basic.wav";
         test_wav(path, 0.5);
 
@@ -171,11 +225,12 @@ mod tests {
             &mut packets_out,
         );
 
-        assert_eq!(packets_out.len(), 1, "should produce one PCMU packet");
+        assert_eq!(packets_out.len(), 1, "should produce one L16 packet");
         let pkt = &packets_out[0];
         assert_eq!(pkt.source_endpoint_id, id);
-        assert_eq!(pkt.payload_type, 0, "payload type should be PCMU");
-        assert_eq!(pkt.payload.len(), 160, "20ms at 8kHz = 160 samples");
+        assert_eq!(pkt.payload_type, 127, "payload type should be L16");
+        // 20ms at 8kHz = 160 mono samples * 2 bytes (LE i16) = 320 bytes.
+        assert_eq!(pkt.payload.len(), 320, "20ms at 8kHz L16 = 320 bytes");
 
         std::fs::remove_file(path).ok();
     }

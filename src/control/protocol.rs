@@ -391,12 +391,6 @@ fn default_dtmf_volume() -> u8 {
 pub struct RecordingStartParams {
     pub endpoint_id: Option<EndpointId>,
     pub file_path: String,
-    /// When true, also capture the unencrypted outbound RTP/RTCP packets that
-    /// rtpbridge writes toward each endpoint. Default false because outbound
-    /// capture roughly doubles per-recording bandwidth and adds a clone of
-    /// every wire packet on the hot path.
-    #[serde(default)]
-    pub record_outbound: bool,
 }
 
 #[derive(Debug, Serialize)]

@@ -112,6 +112,144 @@ async fn test_recording_uses_real_remote_address() {
     client.request_ok("session.destroy", json!({})).await;
 }
 
+/// The PCAP must carry a codec descriptor (RBP1 + JSON) declaring the negotiated
+/// codec for a real RTP endpoint, before the first media packet.
+#[tokio::test]
+async fn test_recording_includes_codec_descriptor_for_rtp() {
+    let server = TestServer::start().await;
+    let mut client = TestControlClient::connect(&server.addr).await;
+    client.request_ok("session.create", json!({})).await;
+
+    let (mut peer_a, _peer_b, ep_a_id) = two_rtp_endpoints(&mut client).await;
+
+    let pcap_path = std::path::Path::new(&server.recording_dir).join("desc-rtp.pcap");
+    let rec = client
+        .request_ok(
+            "recording.start",
+            json!({"endpoint_id": ep_a_id, "file_path": pcap_path.to_str().unwrap()}),
+        )
+        .await;
+    let rec_id = rec["recording_id"].as_str().unwrap().to_string();
+
+    for _ in 0..10 {
+        peer_a.send_pcmu(&[0x80u8; 160]).await;
+        tokio::time::sleep(timing::PACING).await;
+    }
+    tokio::time::sleep(timing::scaled_ms(400)).await;
+    client
+        .request_ok("recording.stop", json!({"recording_id": rec_id}))
+        .await;
+    tokio::time::sleep(timing::scaled_ms(300)).await;
+
+    let frames = read_frames(&pcap_path);
+    let mut desc_idx = None;
+    let mut first_media_idx = None;
+    for (i, f) in frames.iter().enumerate() {
+        if f.len() <= ETH_IP_UDP {
+            continue;
+        }
+        let payload = &f[ETH_IP_UDP..];
+        if payload.starts_with(b"RBP1") {
+            if desc_idx.is_none() {
+                let d: serde_json::Value = serde_json::from_slice(&payload[4..]).unwrap();
+                assert_eq!(d["codec"].as_str().unwrap(), "PCMU");
+                assert_eq!(d["role"].as_str().unwrap(), "remote");
+                assert_eq!(d["type"].as_str().unwrap(), "rtp");
+                assert_eq!(d["endpoint_id"].as_str().unwrap(), ep_a_id);
+                assert_eq!(d["pt"].as_u64().unwrap(), 0);
+                desc_idx = Some(i);
+            }
+        } else if payload[0] & 0xC0 == 0x80 && payload[1] & 0x7F == 0 {
+            first_media_idx.get_or_insert(i);
+        }
+    }
+    let desc_idx = desc_idx.expect("a codec descriptor for the RTP endpoint");
+    let first_media_idx = first_media_idx.expect("RTP media in the capture");
+    assert!(
+        desc_idx < first_media_idx,
+        "descriptor (idx {desc_idx}) must precede first media (idx {first_media_idx})"
+    );
+
+    client.request_ok("session.destroy", json!({})).await;
+}
+
+/// A file source's descriptor declares native-rate L16 (the playback-quality fix),
+/// role internal, PT 127.
+#[tokio::test]
+async fn test_recording_file_source_descriptor_is_l16() {
+    let tmp = TempDir::new().unwrap();
+    let tmp_str = tmp.path().to_str().unwrap();
+    let server = TestServer::builder()
+        .media_dir(tmp_str)
+        .recording_dir(tmp_str)
+        .start()
+        .await;
+    let mut client = TestControlClient::connect(&server.addr).await;
+    client.request_ok("session.create", json!({})).await;
+
+    // A connected RTP peer gives the file a routing destination.
+    let mut peer = TestRtpPeer::new().await;
+    let res = client
+        .request_ok(
+            "endpoint.create_offer",
+            json!({"type": "rtp", "direction": "sendrecv"}),
+        )
+        .await;
+    let ep_id = res["endpoint_id"].as_str().unwrap().to_string();
+    peer.set_remote(parse_rtp_addr_from_sdp(res["sdp_offer"].as_str().unwrap()).unwrap());
+    client
+        .request_ok(
+            "endpoint.accept_answer",
+            json!({"endpoint_id": ep_id, "sdp": peer.make_sdp_answer()}),
+        )
+        .await;
+
+    // 8 kHz WAV — the descriptor should still declare L16 at the file's native rate.
+    let wav = tmp.path().join("rec-file-desc.wav");
+    generate_test_wav(&wav, 1.0, 440.0);
+    let res = client
+        .request_ok(
+            "endpoint.create_with_file",
+            json!({"source": wav.to_str().unwrap(), "shared": false, "loop_count": 0}),
+        )
+        .await;
+    let file_id = res["endpoint_id"].as_str().unwrap().to_string();
+
+    let pcap = std::path::Path::new(&server.recording_dir).join("file-desc.pcap");
+    let rec = client
+        .request_ok(
+            "recording.start",
+            json!({"endpoint_id": file_id, "file_path": pcap.to_str().unwrap()}),
+        )
+        .await;
+    let rec_id = rec["recording_id"].as_str().unwrap().to_string();
+
+    tokio::time::sleep(timing::scaled_ms(500)).await;
+    client
+        .request_ok("recording.stop", json!({"recording_id": rec_id}))
+        .await;
+    tokio::time::sleep(timing::scaled_ms(300)).await;
+
+    let frames = read_frames(&pcap);
+    let desc = frames
+        .iter()
+        .filter(|f| f.len() > ETH_IP_UDP)
+        .find_map(|f| {
+            let payload = &f[ETH_IP_UDP..];
+            payload
+                .starts_with(b"RBP1")
+                .then(|| serde_json::from_slice::<serde_json::Value>(&payload[4..]).unwrap())
+        })
+        .expect("file source must have a codec descriptor");
+    assert_eq!(desc["codec"].as_str().unwrap(), "L16");
+    assert_eq!(desc["role"].as_str().unwrap(), "internal");
+    assert_eq!(desc["type"].as_str().unwrap(), "file");
+    assert_eq!(desc["pt"].as_u64().unwrap(), 127);
+    assert_eq!(desc["endian"].as_str().unwrap(), "le");
+
+    client.request_ok("session.destroy", json!({})).await;
+}
+
 /// Out-of-order arrivals must be recorded in ARRIVAL order, not sorted — the tap
 /// is upstream of the playout/jitter buffer. Under the old post-buffer tap the
 /// Tracked buffer would have re-sorted these by sequence number.

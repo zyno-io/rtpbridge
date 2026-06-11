@@ -10,6 +10,8 @@ use super::endpoint_websocket::WebSocketEndpoint;
 use super::stats::EndpointStats;
 use crate::control::protocol::{EndpointDirection, EndpointId, EndpointState};
 use crate::media::codec::AudioCodec;
+use crate::recording::meta::StreamDescriptor;
+use std::net::SocketAddr;
 
 /// Unified endpoint wrapping WebRTC, plain RTP, file playback, and bridge
 pub enum Endpoint {
@@ -112,8 +114,11 @@ impl Endpoint {
                 .as_ref()
                 .map(|c| c.name.to_string())
                 .unwrap_or_default(),
-            Endpoint::WebRtc(_) => "opus".to_string(),
-            Endpoint::File(ep) => format!("pcm/{}Hz", ep.sample_rate()),
+            Endpoint::WebRtc(ep) => ep
+                .negotiated_codec()
+                .map(|c| c.name.to_string())
+                .unwrap_or_else(|| "opus".to_string()),
+            Endpoint::File(ep) => format!("L16/{}", ep.sample_rate()),
             Endpoint::Tone(ep) => format!("tone/{}Hz", ep.sample_rate()),
             Endpoint::Bridge(_) => "L16/48000".to_string(),
             Endpoint::WebSocket(ep) => ep.codec_label(),
@@ -226,7 +231,11 @@ pub fn endpoint_audio_codec(ep: &Endpoint) -> Option<AudioCodec> {
             .as_ref()
             .and_then(|c| AudioCodec::from_name(c.name)),
         Endpoint::WebRtc(_) => Some(AudioCodec::Opus),
-        Endpoint::File(_) => Some(AudioCodec::Pcmu),
+        // File emits native-rate L16 (PT 127) so the per-edge transcode/mixer
+        // encodes at each destination's full quality rather than 8 kHz µ-law.
+        Endpoint::File(ep) => Some(AudioCodec::L16 {
+            sample_rate: ep.sample_rate(),
+        }),
         Endpoint::Tone(_) => Some(AudioCodec::Pcmu),
         Endpoint::Bridge(_) => Some(AudioCodec::L16 { sample_rate: 48000 }),
         // WebSocket runs internally at its wire rate (no 48 kHz pivot); the
@@ -241,12 +250,89 @@ pub fn endpoint_audio_codec(ep: &Endpoint) -> Option<AudioCodec> {
 pub fn endpoint_send_pt(ep: &Endpoint) -> Option<u8> {
     match ep {
         Endpoint::Rtp(rep) => rep.send_codec.as_ref().map(|c| c.pt),
-        Endpoint::WebRtc(_) => Some(111),
-        Endpoint::File(_) => Some(0),
+        Endpoint::WebRtc(ep) => Some(ep.negotiated_codec().map(|c| c.pt).unwrap_or(111)),
+        Endpoint::File(_) => Some(127), // L16
         Endpoint::Tone(_) => Some(0),
         Endpoint::Bridge(_) => Some(127),
         Endpoint::WebSocket(_) => Some(127),
     }
+}
+
+/// Build the recording stream descriptor for an endpoint, framed with the given
+/// real socket addresses (or `None` → synthetic markers for internal sources).
+/// Returns `None` when the endpoint isn't ready to be described (e.g. a plain-RTP
+/// endpoint whose codec hasn't been negotiated yet).
+pub fn endpoint_stream_descriptor(
+    ep: &Endpoint,
+    local: Option<SocketAddr>,
+    remote: Option<SocketAddr>,
+) -> Option<StreamDescriptor> {
+    // WebRTC builds its own from str0m's negotiated codec.
+    if let Endpoint::WebRtc(w) = ep {
+        return w.stream_descriptor(local, remote);
+    }
+
+    let addr = |a: Option<SocketAddr>| a.map(|x| x.to_string()).unwrap_or_else(|| "-".to_string());
+    let (role, ep_type, codec, pt, clock_rate, channels, endian) = match ep {
+        Endpoint::Rtp(rep) => {
+            let c = rep.send_codec.as_ref()?;
+            (
+                "remote",
+                "rtp",
+                c.name.to_string(),
+                c.pt,
+                c.clock_rate,
+                c.channels.unwrap_or(1),
+                None,
+            )
+        }
+        // Internal generators. File emits native-rate L16 (little-endian); tone is
+        // synthesized 8 kHz µ-law; bridge/websocket are L16 at their wire rate.
+        Endpoint::File(f) => (
+            "internal",
+            "file",
+            "L16".to_string(),
+            127,
+            f.sample_rate(),
+            1,
+            Some("le".to_string()),
+        ),
+        Endpoint::Tone(_) => ("internal", "tone", "PCMU".to_string(), 0, 8000, 1, None),
+        Endpoint::Bridge(_) => (
+            "internal",
+            "bridge",
+            "L16".to_string(),
+            127,
+            48000,
+            1,
+            Some("le".to_string()),
+        ),
+        Endpoint::WebSocket(w) => (
+            "internal",
+            "websocket",
+            "L16".to_string(),
+            127,
+            w.sample_rate,
+            1,
+            Some("le".to_string()),
+        ),
+        Endpoint::WebRtc(_) => unreachable!("handled above"),
+    };
+
+    Some(StreamDescriptor {
+        v: crate::recording::meta::VERSION,
+        endpoint_id: ep.id().to_string(),
+        role: role.to_string(),
+        ep_type: ep_type.to_string(),
+        codec,
+        pt,
+        clock_rate,
+        channels,
+        endian,
+        ssrc: None,
+        local: addr(local),
+        remote: addr(remote),
+    })
 }
 
 /// Get the RTP clock rate for an endpoint's send codec
@@ -258,7 +344,7 @@ pub fn endpoint_rtp_clock_rate(ep: &Endpoint) -> u32 {
             .map(|c| c.clock_rate)
             .unwrap_or(8000),
         Endpoint::WebRtc(_) => 48000,
-        Endpoint::File(_) => 8000,
+        Endpoint::File(ep) => ep.sample_rate(),
         Endpoint::Tone(_) => 8000,
         Endpoint::Bridge(_) => 48000,
         Endpoint::WebSocket(ep) => ep.sample_rate,

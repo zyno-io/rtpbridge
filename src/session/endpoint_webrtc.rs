@@ -34,6 +34,16 @@ const WEBRTC_OPUS_RTP_CLOCK_HZ: u32 = 48_000;
 /// session task. See docs/WEBRTC_RECV_TASK_WEDGE.md.
 const RECV_TASK_START_GRACE: Duration = Duration::from_secs(2);
 
+/// The negotiated audio codec on a WebRTC endpoint, derived from str0m's media
+/// line. `name` is one of `opus`/`PCMU`/`PCMA` (str0m has no G.722 audio codec).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NegotiatedCodec {
+    pub name: &'static str,
+    pub pt: u8,
+    pub clock_rate: u32,
+    pub channels: u8,
+}
+
 /// A WebRTC endpoint backed by str0m
 pub struct WebRtcEndpoint {
     pub id: EndpointId,
@@ -846,6 +856,74 @@ impl WebRtcEndpoint {
         Ok(())
     }
 
+    /// The negotiated primary audio codec, read from str0m's media line after the
+    /// SDP answer is applied. Returns `None` until an audio mid exists and the
+    /// remote has agreed at least one audio payload type (pre-negotiation / pre-ICE).
+    ///
+    /// Replaces the hardcoded `opus`/PT-111 assumption — notably on the answerer /
+    /// re-negotiation path where the remote may pick a different PT. str0m's `Codec`
+    /// enum only carries Opus/PCMU/PCMA for audio (no G.722), so those are the
+    /// possible names.
+    pub fn negotiated_codec(&self) -> Option<NegotiatedCodec> {
+        let mid = self.audio_mid?;
+        let media = self.rtc.media(mid)?;
+        let remote_pts = media.remote_pts();
+        if remote_pts.is_empty() {
+            return None;
+        }
+        for p in self.rtc.codec_config().params() {
+            if !remote_pts.contains(&p.pt()) {
+                continue;
+            }
+            let spec = p.spec();
+            if !spec.codec.is_audio() {
+                continue;
+            }
+            let name = match spec.codec {
+                str0m::format::Codec::Opus => "opus",
+                str0m::format::Codec::PCMU => "PCMU",
+                str0m::format::Codec::PCMA => "PCMA",
+                // Skip non-audio / telephone-event-like / Null / Unknown.
+                _ => continue,
+            };
+            return Some(NegotiatedCodec {
+                name,
+                pt: *p.pt(),
+                clock_rate: spec.clock_rate.get(),
+                channels: spec.channels.unwrap_or(1),
+            });
+        }
+        None
+    }
+
+    /// Build this endpoint's recording stream descriptor from the negotiated codec,
+    /// or `None` if nothing is negotiated yet. Role is always `remote` (real peer).
+    pub fn stream_descriptor(
+        &self,
+        local: Option<std::net::SocketAddr>,
+        remote: Option<std::net::SocketAddr>,
+    ) -> Option<crate::recording::meta::StreamDescriptor> {
+        let nc = self.negotiated_codec()?;
+        Some(crate::recording::meta::StreamDescriptor {
+            v: crate::recording::meta::VERSION,
+            endpoint_id: self.id.to_string(),
+            role: "remote".to_string(),
+            ep_type: "webrtc".to_string(),
+            codec: nc.name.to_string(),
+            pt: nc.pt,
+            clock_rate: nc.clock_rate,
+            channels: nc.channels,
+            endian: None,
+            ssrc: None,
+            local: local
+                .map(|a| a.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            remote: remote
+                .map(|a| a.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+        })
+    }
+
     /// Stop recv tasks for transfer. Cancels the token, awaits the task,
     /// and creates a fresh CancellationToken for restart.
     pub async fn stop_recv_tasks(&mut self) {
@@ -1024,6 +1102,54 @@ mod tests {
     }
     use str0m::change::{SdpAnswer, SdpOffer};
     use str0m::media::{Direction, MediaKind};
+
+    /// After a real offer/answer, `negotiated_codec()` reports the actually agreed
+    /// audio codec (Opus) read from str0m — not the old hardcoded opus/PT-111
+    /// literal. Exercises the answerer-supplied PT path via str0m's own answer.
+    #[tokio::test]
+    async fn test_negotiated_codec_reads_from_str0m() {
+        let id = uuid::Uuid::new_v4();
+        let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let (tx, _rx) = mpsc::channel(16);
+        let metrics = Arc::new(Metrics::new());
+
+        let (mut ep, offer_sdp) = WebRtcEndpoint::create_offer(
+            id,
+            EndpointDirection::SendRecv,
+            &[bind_addr],
+            tx,
+            metrics,
+        )
+        .await
+        .expect("create_offer should succeed");
+
+        // Before any answer, nothing is negotiated yet.
+        assert!(
+            ep.negotiated_codec().is_none(),
+            "no codec before the answer is applied"
+        );
+
+        // A bare str0m client accepts the offer and produces an answer; applying it
+        // populates the media line's remote PTs.
+        let mut client = RtcConfig::new().set_rtp_mode(true).build(Instant::now());
+        let client_addr: std::net::SocketAddr = "127.0.0.1:40051".parse().unwrap();
+        client.add_local_candidate(Candidate::host(client_addr, "udp").unwrap());
+        let answer = client
+            .sdp_api()
+            .accept_offer(SdpOffer::from_sdp_string(&offer_sdp).unwrap())
+            .unwrap();
+
+        ep.accept_answer(&answer.to_sdp_string())
+            .expect("accept_answer should succeed");
+
+        let nc = ep
+            .negotiated_codec()
+            .expect("codec negotiated after answer");
+        assert_eq!(nc.name, "opus", "str0m negotiates Opus for audio");
+        assert_eq!(nc.clock_rate, 48000, "Opus RTP clock is 48 kHz");
+        // PT comes from str0m's negotiation, not a hardcoded 111.
+        assert!(nc.pt > 0, "a real dynamic PT was negotiated");
+    }
 
     /// Diagnostic: verify str0m RTP mode media flow between two instances.
     /// Server (ICE lite) creates offer → client accepts → ICE → server writes RTP → client receives.

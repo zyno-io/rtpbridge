@@ -65,6 +65,12 @@ pub struct WebRtcEndpoint {
     /// str0m computes these internally but does not expose them on
     /// MediaIngressStats, so we run our own pass over Event::RtpPacket.
     pub rtcp_stats: RtcpStats,
+    /// Most recent RTT to the WebRTC peer, in milliseconds, captured from
+    /// str0m's periodic stats (`PeerStats`/egress/ingress `rtt`). str0m owns
+    /// RTCP for WebRTC, so — unlike plain RTP — our own `rtcp_stats` never
+    /// computes RTT here; this is the value `Endpoint::rtt_ms()` reports for
+    /// WebRTC legs.
+    pub peer_rtt_ms: Option<f64>,
     pub rtc: Rtc,
     /// One UDP socket per bound address family (IPv4 and/or IPv6), each paired
     /// with its local address. We register one ICE host candidate per socket and
@@ -218,6 +224,10 @@ impl WebRtcEndpoint {
         let rtc = RtcConfig::new()
             .set_ice_lite(true)
             .set_rtp_mode(true)
+            // Emit periodic stats so we can surface RTT for the WebRTC leg.
+            // str0m owns RTCP here, so RTT only reaches us via these events
+            // (see `peer_rtt_ms` and the stats arms in the event loop).
+            .set_stats_interval(Some(Duration::from_secs(1)))
             .build(Instant::now());
 
         Ok(Self {
@@ -228,6 +238,7 @@ impl WebRtcEndpoint {
             raw_recv: Arc::new(RawRecvCounters::default()),
             ice_connection_state: None,
             rtcp_stats: RtcpStats::new(),
+            peer_rtt_ms: None,
             rtc,
             sockets,
             local_addr,
@@ -798,6 +809,7 @@ impl WebRtcEndpoint {
                     Event::RtpPacket(pkt) => {
                         self.stats.record_inbound(pkt.payload.len());
                         self.rtcp_stats.record_received(
+                            *pkt.header.ssrc,
                             pkt.header.sequence_number,
                             pkt.header.timestamp,
                             pkt.payload.len(),
@@ -817,6 +829,27 @@ impl WebRtcEndpoint {
                         debug!(endpoint_id = %self.id, mid = %media.mid, kind = ?media.kind, "media added");
                         if media.kind == MediaKind::Audio {
                             self.audio_mid = Some(media.mid);
+                        }
+                    }
+                    // RTT for the WebRTC leg. We capture whichever stats event
+                    // carries a value: PeerStats is ICE/transport-derived, but
+                    // because we run ICE-lite (str0m doesn't initiate STUN
+                    // binding requests) its `rtt` is often None, so the
+                    // egress/ingress RTCP round-trip is usually what fills this.
+                    // Any `Some` updates the field; a `None` never clobbers it.
+                    Event::PeerStats(s) => {
+                        if let Some(rtt) = s.rtt {
+                            self.peer_rtt_ms = Some(rtt.as_secs_f64() * 1000.0);
+                        }
+                    }
+                    Event::MediaEgressStats(s) => {
+                        if let Some(rtt) = s.rtt {
+                            self.peer_rtt_ms = Some(rtt.as_secs_f64() * 1000.0);
+                        }
+                    }
+                    Event::MediaIngressStats(s) => {
+                        if let Some(rtt) = s.rtt {
+                            self.peer_rtt_ms = Some(rtt.as_secs_f64() * 1000.0);
                         }
                     }
                     _ => {

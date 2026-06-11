@@ -973,6 +973,20 @@ impl RtpEndpoint {
                 }
                 self.latch_remote_addr(source);
             }
+        } else if self.remote_ssrc != Some(header.ssrc) {
+            // SSRC changed mid-call (e.g. a hold/re-INVITE that restarts the
+            // RTP stream with a fresh SSRC). Track the new source so the RTCP
+            // SR/RR we emit references it — `rtcp_stats` already re-baselines
+            // its sequence/loss/jitter on the same change. We do NOT re-latch
+            // the address here; a NAT rebind is handled by the windowed
+            // symmetric-RTP path below.
+            debug!(
+                endpoint_id = %self.id,
+                old_ssrc = ?self.remote_ssrc,
+                new_ssrc = header.ssrc,
+                "remote SSRC changed mid-call; tracking new source"
+            );
+            self.remote_ssrc = Some(header.ssrc);
         }
 
         // Symmetric RTP: keep tracking address changes within the learning
@@ -996,6 +1010,7 @@ impl RtpEndpoint {
         // Update stats
         self.stats.record_inbound(payload.len());
         self.rtcp_stats.record_received(
+            header.ssrc,
             header.sequence_number,
             header.timestamp,
             payload.len(),

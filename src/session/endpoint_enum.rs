@@ -146,10 +146,13 @@ impl Endpoint {
         }
     }
 
-    /// RTT in milliseconds (computed from remote's RR via RFC 3550 §6.4.1).
+    /// RTT in milliseconds. Plain RTP computes it from the remote's RR
+    /// (RFC 3550 §6.4.1); WebRTC surfaces str0m's stats RTT (`peer_rtt_ms`),
+    /// since str0m owns RTCP for those legs.
     pub fn rtt_ms(&self) -> Option<f64> {
         match self {
             Endpoint::Rtp(ep) => ep.rtcp_stats.rtt_ms,
+            Endpoint::WebRtc(ep) => ep.peer_rtt_ms,
             _ => None,
         }
     }

@@ -46,6 +46,12 @@ pub struct RtcpStats {
     pub jitter: u32,
     pub last_sr_ntp: u32, // middle 32 bits of NTP from last SR
     pub last_sr_received: Option<std::time::Instant>,
+    // SSRC of the source whose SR populated last_sr_ntp/last_sr_received. The
+    // LSR/DLSR we echo in an RR block are only meaningful for that SSRC, so
+    // build_sr_rr emits them only when reporting on this same source — keeping
+    // SR timing correct across SSRC changes and reordered/early SRs without
+    // depending on RTP-vs-RTCP arrival ordering.
+    last_sr_ssrc: Option<u32>,
 
     // RFC 3550 A.3 sequence number tracking
     seq_initialized: bool,
@@ -68,6 +74,15 @@ pub struct RtcpStats {
 
     // Computed RTT from the remote's RR (RFC 3550 §6.4.1)
     pub rtt_ms: Option<f64>,
+
+    // Source SSRC of the current stream generation. A mid-call SSRC change
+    // (a hold/re-INVITE that restarts the RTP stream with a fresh SSRC and
+    // sequence base) re-baselines the sequence tracking above, so cumulative
+    // loss doesn't balloon toward 100% from a stale baseline.
+    current_ssrc: Option<u32>,
+    // Loss folded in from prior SSRC generations, carried across re-baselines
+    // so cumulative_lost() reflects whole-leg loss without cross-stream inflation.
+    lost_accumulated: u32,
 }
 
 impl Default for RtcpStats {
@@ -84,6 +99,7 @@ impl RtcpStats {
             jitter: 0,
             last_sr_ntp: 0,
             last_sr_received: None,
+            last_sr_ssrc: None,
             seq_initialized: false,
             base_seq: 0,
             extended_max_seq: 0,
@@ -95,17 +111,52 @@ impl RtcpStats {
             octets_sent: 0,
             our_last_sr_ntp_middle: 0,
             rtt_ms: None,
+            current_ssrc: None,
+            lost_accumulated: 0,
         }
     }
 
-    /// Record an inbound RTP packet for stats (RFC 3550 A.3 sequence tracking)
+    /// Record an inbound RTP packet for stats (RFC 3550 A.3 sequence tracking).
+    ///
+    /// `ssrc` is the source SSRC of the packet. When it changes mid-stream
+    /// (a hold/re-INVITE that restarts RTP with a fresh SSRC and sequence
+    /// base), the prior generation's loss is folded into `lost_accumulated`
+    /// and the per-generation sequence/jitter state is re-baselined. Without
+    /// this, the stale baseline makes `expected_packets()` diverge wildly from
+    /// `packets_received` and cumulative loss balloons toward 100%.
     pub fn record_received(
         &mut self,
+        ssrc: u32,
         seq: u16,
         timestamp: u32,
         payload_len: usize,
         clock_rate: u32,
     ) {
+        if self.current_ssrc != Some(ssrc) {
+            if self.current_ssrc.is_some() {
+                // Fold the ending generation's loss into the accumulator before
+                // the reset, so whole-leg loss is preserved across the change.
+                self.lost_accumulated = self
+                    .lost_accumulated
+                    .saturating_add(self.current_gen_lost());
+            }
+            self.current_ssrc = Some(ssrc);
+            // Re-baseline sequence and jitter tracking for the new generation.
+            self.seq_initialized = false;
+            self.packets_received = 0;
+            self.octets_received = 0;
+            self.expected_prior = 0;
+            self.received_prior = 0;
+            // Jitter is per-source: clear both the smoothed value and the
+            // transit baseline so the new generation starts fresh rather than
+            // inheriting (and slowly decaying) the old stream's jitter.
+            self.last_transit = 0;
+            self.jitter = 0;
+            // last_sr_* is NOT cleared here: it's keyed by last_sr_ssrc and
+            // gated in build_sr_rr, so the old source's SR timing can never
+            // leak into the new SSRC's report block regardless of ordering.
+        }
+
         self.packets_received = self.packets_received.wrapping_add(1);
         self.octets_received = self.octets_received.wrapping_add(payload_len as u32);
 
@@ -159,10 +210,17 @@ impl RtcpStats {
         self.extended_max_seq - self.base_seq + 1
     }
 
-    /// Cumulative packets lost since start (RFC 3550 A.3)
-    pub fn cumulative_lost(&self) -> u32 {
+    /// Lost packets within the current SSRC generation (RFC 3550 A.3).
+    fn current_gen_lost(&self) -> u32 {
         self.expected_packets()
             .saturating_sub(self.packets_received)
+    }
+
+    /// Cumulative packets lost across the whole leg, including loss carried
+    /// forward from prior SSRC generations (see `record_received`).
+    pub fn cumulative_lost(&self) -> u32 {
+        self.lost_accumulated
+            .saturating_add(self.current_gen_lost())
     }
 
     /// Compute fraction lost since last RR and update prior counters (RFC 3550 A.3)
@@ -195,6 +253,7 @@ impl RtcpStats {
     pub fn process_sr(&mut self, sr: &SenderReport) {
         self.last_sr_ntp = ((sr.ntp_timestamp >> 16) & 0xFFFFFFFF) as u32;
         self.last_sr_received = Some(std::time::Instant::now());
+        self.last_sr_ssrc = Some(sr.ssrc);
     }
 
     /// Process a Receiver Report block that references our SSRC.
@@ -282,7 +341,10 @@ pub fn build_sr_rr(
     buf.extend_from_slice(&remote_ssrc.to_be_bytes());
     // Fraction lost (8 bits) + cumulative lost (24 bits) — RFC 3550 A.3
     let fraction_lost = stats.fraction_lost_and_update();
-    let cum_lost = stats.cumulative_lost() & 0x00FFFFFF;
+    // RFC 3550: the report block's cumulative-lost is scoped to the SSRC in
+    // this block (the current generation), not the whole-leg total that the
+    // session stats event reports via `cumulative_lost()`.
+    let cum_lost = stats.current_gen_lost() & 0x00FFFFFF;
     buf.push(fraction_lost);
     buf.push(((cum_lost >> 16) & 0xFF) as u8);
     buf.push(((cum_lost >> 8) & 0xFF) as u8);
@@ -293,17 +355,25 @@ pub fn build_sr_rr(
     let rate = if clock_rate > 0 { clock_rate } else { 8000 };
     let jitter_ts = (stats.jitter as u64 * rate as u64 / 1_000_000) as u32;
     buf.extend_from_slice(&jitter_ts.to_be_bytes());
-    // Last SR (middle 32 bits of NTP)
-    buf.extend_from_slice(&stats.last_sr_ntp.to_be_bytes());
-    // Delay since last SR (1/65536 sec units)
-    let dlsr = stats
-        .last_sr_received
-        .map(|t| {
-            let elapsed = t.elapsed();
-            ((elapsed.as_secs().min(0xFFFF) as u32) << 16)
-                | (elapsed.subsec_micros() as u64 * 65536 / 1_000_000) as u32
-        })
-        .unwrap_or(0);
+    // Last SR / Delay since last SR — only meaningful when our most recent SR
+    // came from the SSRC we're reporting on. After an SSRC change (or a
+    // straggler/early SR from a different source) the stored timing belongs to
+    // another source, so we emit 0 ("no SR received yet from this source")
+    // rather than a mismatched LSR that would make the peer compute a bogus RTT.
+    let (last_sr, dlsr) = if stats.last_sr_ssrc == Some(remote_ssrc) {
+        let dlsr = stats
+            .last_sr_received
+            .map(|t| {
+                let elapsed = t.elapsed();
+                ((elapsed.as_secs().min(0xFFFF) as u32) << 16)
+                    | (elapsed.subsec_micros() as u64 * 65536 / 1_000_000) as u32
+            })
+            .unwrap_or(0);
+        (stats.last_sr_ntp, dlsr)
+    } else {
+        (0, 0)
+    };
+    buf.extend_from_slice(&last_sr.to_be_bytes());
     buf.extend_from_slice(&dlsr.to_be_bytes());
 
     buf
@@ -520,7 +590,7 @@ mod tests {
         stats.octets_sent = 16000;
         // Simulate receiving 50 packets (seq 0..49)
         for seq in 0u16..50 {
-            stats.record_received(seq, seq as u32 * 160, 160, 8000);
+            stats.record_received(0x1111_1111u32, seq, seq as u32 * 160, 160, 8000);
         }
 
         let data = build_sr_rr(0x12345678, 0xAABBCCDD, &mut stats, 0, 8000);
@@ -643,7 +713,7 @@ mod tests {
     fn test_sequential_packets_no_loss() {
         let mut stats = RtcpStats::new();
         for seq in 0u16..100 {
-            stats.record_received(seq, seq as u32 * 160, 160, 8000);
+            stats.record_received(0x1111_1111u32, seq, seq as u32 * 160, 160, 8000);
         }
         assert_eq!(stats.expected_packets(), 100);
         assert_eq!(stats.packets_received, 100);
@@ -655,10 +725,10 @@ mod tests {
         let mut stats = RtcpStats::new();
         // Send seq 0..4, skip 5..9, send 10..14
         for seq in 0u16..5 {
-            stats.record_received(seq, seq as u32 * 160, 160, 8000);
+            stats.record_received(0x1111_1111u32, seq, seq as u32 * 160, 160, 8000);
         }
         for seq in 10u16..15 {
-            stats.record_received(seq, seq as u32 * 160, 160, 8000);
+            stats.record_received(0x1111_1111u32, seq, seq as u32 * 160, 160, 8000);
         }
         assert_eq!(stats.expected_packets(), 15); // 0..14 inclusive
         assert_eq!(stats.packets_received, 10);
@@ -669,10 +739,10 @@ mod tests {
     fn test_reordered_packets_no_spurious_loss() {
         let mut stats = RtcpStats::new();
         // Receive: 0, 2, 1, 3 (reordered, no actual loss)
-        stats.record_received(0, 0, 160, 8000);
-        stats.record_received(2, 320, 160, 8000);
-        stats.record_received(1, 160, 160, 8000); // reordered
-        stats.record_received(3, 480, 160, 8000);
+        stats.record_received(0x1111_1111u32, 0, 0, 160, 8000);
+        stats.record_received(0x1111_1111u32, 2, 320, 160, 8000);
+        stats.record_received(0x1111_1111u32, 1, 160, 160, 8000); // reordered
+        stats.record_received(0x1111_1111u32, 3, 480, 160, 8000);
         assert_eq!(stats.expected_packets(), 4);
         assert_eq!(stats.packets_received, 4);
         assert_eq!(stats.cumulative_lost(), 0);
@@ -683,11 +753,11 @@ mod tests {
         let mut stats = RtcpStats::new();
         // Start near wraparound
         for seq in 65534u16..=65535 {
-            stats.record_received(seq, seq as u32 * 160, 160, 8000);
+            stats.record_received(0x1111_1111u32, seq, seq as u32 * 160, 160, 8000);
         }
         // Wrap around
         for seq in 0u16..2 {
-            stats.record_received(seq, (65536 + seq as u32) * 160, 160, 8000);
+            stats.record_received(0x1111_1111u32, seq, (65536 + seq as u32) * 160, 160, 8000);
         }
         assert_eq!(stats.packets_received, 4);
         assert_eq!(stats.expected_packets(), 4);
@@ -699,13 +769,13 @@ mod tests {
         let mut stats = RtcpStats::new();
         // First interval: 10 expected, 10 received → 0 loss
         for seq in 0u16..10 {
-            stats.record_received(seq, seq as u32 * 160, 160, 8000);
+            stats.record_received(0x1111_1111u32, seq, seq as u32 * 160, 160, 8000);
         }
         assert_eq!(stats.fraction_lost_and_update(), 0);
 
         // Second interval: 10 expected (10..19), 5 received → 50% loss
         for seq in [10u16, 12, 14, 16, 18] {
-            stats.record_received(seq, seq as u32 * 160, 160, 8000);
+            stats.record_received(0x1111_1111u32, seq, seq as u32 * 160, 160, 8000);
         }
         // expected_interval = 19 - 10 + 1 - (10-10) = 10; received_interval = 15-10 = 5
         // lost_interval = 5; fraction = (5 << 8) / 10 = 128
@@ -869,11 +939,11 @@ mod tests {
     fn test_timestamp_u32_max_handling() {
         let mut stats = RtcpStats::new();
         // Record packets with timestamps near u32::MAX
-        stats.record_received(0, u32::MAX - 1000, 160, 8000);
-        stats.record_received(1, u32::MAX - 500, 160, 8000);
+        stats.record_received(0x1111_1111u32, 0, u32::MAX - 1000, 160, 8000);
+        stats.record_received(0x1111_1111u32, 1, u32::MAX - 500, 160, 8000);
         // Wrap around
-        stats.record_received(2, 100, 160, 8000);
-        stats.record_received(3, 600, 160, 8000);
+        stats.record_received(0x1111_1111u32, 2, 100, 160, 8000);
+        stats.record_received(0x1111_1111u32, 3, 600, 160, 8000);
 
         assert_eq!(stats.packets_received, 4);
         assert_eq!(stats.expected_packets(), 4);
@@ -1028,12 +1098,12 @@ mod tests {
         // Before the fix, ((N << 8) / N) = 256, and (256 as u8) wrapped to 0.
         let mut stats = RtcpStats::new();
         // First interval: receive seq 0 to establish baseline
-        stats.record_received(0, 0, 160, 8000);
+        stats.record_received(0x1111_1111u32, 0, 0, 160, 8000);
         stats.fraction_lost_and_update(); // snapshot priors
 
         // Second interval: advance expected by 100 but receive 0 more packets.
         // Directly advance extended_max_seq via record_received with a far seq.
-        stats.record_received(100, 100 * 160, 160, 8000);
+        stats.record_received(0x1111_1111u32, 100, 100 * 160, 160, 8000);
         // Now expected = 101, received = 2, but we want to test a full-loss interval.
         // expected_prior = 1, received_prior = 1 (from first update)
         // After receiving seq 100: expected = 101, received = 2
@@ -1053,7 +1123,7 @@ mod tests {
         // The fix uses u64 intermediate + min(255) to handle this correctly.
         let mut stats = RtcpStats::new();
         // Establish baseline
-        stats.record_received(0, 0, 160, 8000);
+        stats.record_received(0x1111_1111u32, 0, 0, 160, 8000);
         stats.fraction_lost_and_update(); // snapshot priors (expected_prior=1, received_prior=1)
 
         // Force a massive sequence jump by wrapping around many times.
@@ -1066,9 +1136,9 @@ mod tests {
         let mut ts = 160u32;
         for _ in 0..512 {
             // Jump to near-end of seq space to trigger rollover detection
-            stats.record_received(65535, ts, 160, 8000);
+            stats.record_received(0x1111_1111u32, 65535, ts, 160, 8000);
             ts = ts.wrapping_add(160);
-            stats.record_received(0, ts, 160, 8000);
+            stats.record_received(0x1111_1111u32, 0, ts, 160, 8000);
             ts = ts.wrapping_add(160);
         }
         // extended_max_seq should now be very large (512 rollovers * 65536 + some)
@@ -1099,14 +1169,14 @@ mod tests {
         let clock_rate = 8000u32; // G.722's RTP timestamp clock
 
         // Seed with one packet at ts=0.
-        stats.record_received(0, 0, 160, clock_rate);
+        stats.record_received(0x1111_1111u32, 0, 0, 160, clock_rate);
 
         // Burst of jittery arrivals: 50 packets where arrival time and RTP timestamp
         // are out of step, producing large |D| values.
         for i in 1..=50u32 {
             let ts = i.wrapping_mul(160);
             std::thread::sleep(std::time::Duration::from_millis(40));
-            stats.record_received(i as u16, ts, 160, clock_rate);
+            stats.record_received(0x1111_1111u32, i as u16, ts, 160, clock_rate);
         }
         let jittered = stats.jitter;
         assert!(jittered > 0, "burst should drive jitter above 0");
@@ -1116,7 +1186,7 @@ mod tests {
         for i in 51..=500u32 {
             let ts = i.wrapping_mul(160);
             std::thread::sleep(std::time::Duration::from_millis(20));
-            stats.record_received(i as u16, ts, 160, clock_rate);
+            stats.record_received(0x1111_1111u32, i as u16, ts, 160, clock_rate);
             assert!(
                 stats.jitter < 10_000_000,
                 "jitter must not diverge — got {} µs at iteration {}",
@@ -1130,5 +1200,210 @@ mod tests {
             jittered,
             stats.jitter
         );
+    }
+
+    #[test]
+    fn test_ssrc_change_rebaselines_no_inflation() {
+        // A hold/re-INVITE restarts the stream with a fresh SSRC and a low
+        // sequence base. Before the fix, the stale baseline (high extended_max
+        // vs. a low new seq) tripped the rollover heuristic and cumulative loss
+        // ballooned. With re-baselining, a clean second stream shows no loss.
+        let mut stats = RtcpStats::new();
+        let ssrc_a = 0xAAAA_AAAA;
+        let ssrc_b = 0xBBBB_BBBB;
+
+        // Stream A: clean run ending near seq 40000.
+        for seq in 39_998u16..=40_000 {
+            stats.record_received(ssrc_a, seq, seq as u32 * 160, 160, 8000);
+        }
+        assert_eq!(stats.cumulative_lost(), 0, "stream A is clean");
+
+        // Stream B: new SSRC, fresh low sequence base, also clean.
+        for seq in 100u16..110 {
+            stats.record_received(ssrc_b, seq, seq as u32 * 160, 160, 8000);
+        }
+        assert_eq!(
+            stats.cumulative_lost(),
+            0,
+            "SSRC change with a clean second stream must not inflate loss"
+        );
+    }
+
+    #[test]
+    fn test_ssrc_change_carries_forward_prior_loss() {
+        // Loss from before the SSRC change is preserved (not reset to zero),
+        // so cumulative_lost() reflects whole-leg loss.
+        let mut stats = RtcpStats::new();
+        let ssrc_a = 0xAAAA_AAAA;
+        let ssrc_b = 0xBBBB_BBBB;
+
+        // Stream A: seq 0..4 then 10..14 — a gap of 5 lost packets.
+        for seq in 0u16..5 {
+            stats.record_received(ssrc_a, seq, seq as u32 * 160, 160, 8000);
+        }
+        for seq in 10u16..15 {
+            stats.record_received(ssrc_a, seq, seq as u32 * 160, 160, 8000);
+        }
+        assert_eq!(stats.cumulative_lost(), 5, "stream A lost 5");
+
+        // Stream B: new SSRC, clean. Prior 5 must carry forward.
+        for seq in 0u16..10 {
+            stats.record_received(ssrc_b, seq, seq as u32 * 160, 160, 8000);
+        }
+        assert_eq!(
+            stats.cumulative_lost(),
+            5,
+            "prior-generation loss must carry forward across the SSRC change"
+        );
+
+        // Stream B then loses 2 (seq 20..21 skipped, resume at 22).
+        for seq in 22u16..25 {
+            stats.record_received(ssrc_b, seq, seq as u32 * 160, 160, 8000);
+        }
+        // Stream B expected 0..24 = 25, received 13 → gen lost 12; +5 carried = 17.
+        assert_eq!(
+            stats.cumulative_lost(),
+            17,
+            "carried-forward plus current-generation loss should sum"
+        );
+    }
+
+    #[test]
+    fn test_no_reset_on_steady_ssrc() {
+        // The very first packet sets the generation (no spurious accumulation),
+        // and a steady SSRC never re-baselines.
+        let mut stats = RtcpStats::new();
+        let ssrc = 0x1234_5678;
+        for seq in 0u16..50 {
+            stats.record_received(ssrc, seq, seq as u32 * 160, 160, 8000);
+        }
+        assert_eq!(stats.cumulative_lost(), 0);
+        assert_eq!(stats.expected_packets(), 50);
+        assert_eq!(stats.packets_received, 50);
+    }
+
+    #[test]
+    fn test_sr_rr_cumulative_lost_is_per_ssrc_not_whole_leg() {
+        // After an SSRC change, the emitted RR report block must carry only the
+        // current generation's loss (RFC 3550 scopes cumulative-lost to the
+        // block's SSRC), even though the session-level `cumulative_lost()`
+        // carries prior-generation loss forward for whole-leg reporting.
+        let mut stats = RtcpStats::new();
+        let ssrc_a = 0xAAAA_AAAA;
+        let ssrc_b = 0xBBBB_BBBB;
+
+        // Stream A loses 5 (seq 0..4 then 10..14).
+        for seq in 0u16..5 {
+            stats.record_received(ssrc_a, seq, seq as u32 * 160, 160, 8000);
+        }
+        for seq in 10u16..15 {
+            stats.record_received(ssrc_a, seq, seq as u32 * 160, 160, 8000);
+        }
+        // Switch to a clean stream B.
+        for seq in 0u16..10 {
+            stats.record_received(ssrc_b, seq, seq as u32 * 160, 160, 8000);
+        }
+
+        assert_eq!(stats.cumulative_lost(), 5, "whole-leg keeps prior loss");
+        assert_eq!(
+            stats.current_gen_lost(),
+            0,
+            "current generation (B) is clean"
+        );
+
+        // The wire RR must report the current-generation (per-SSRC) loss = 0.
+        let data = build_sr_rr(0x1234_5678, ssrc_b, &mut stats, 0, 8000);
+        match &parse_rtcp(&data)[0] {
+            RtcpPacket::SenderReport(sr) => {
+                assert_eq!(
+                    sr.report_blocks[0].cumulative_lost, 0,
+                    "RR block must carry per-SSRC loss, not the whole-leg total"
+                );
+            }
+            _ => panic!("expected SR"),
+        }
+    }
+
+    #[test]
+    fn test_sr_rr_lsr_dlsr_reset_on_ssrc_change() {
+        // After the remote changes SSRC, the RR block for the new source must
+        // not echo the old source's LSR/DLSR (which would make the peer compute
+        // a bogus RTT). Until we receive an SR from the new SSRC, LSR must be 0.
+        let mut stats = RtcpStats::new();
+        let ssrc_a = 0xAAAA_AAAA;
+        let ssrc_b = 0xBBBB_BBBB;
+
+        // Receive a packet and an SR from source A.
+        stats.record_received(ssrc_a, 0, 0, 160, 8000);
+        let sr_a = SenderReport {
+            ssrc: ssrc_a,
+            ntp_timestamp: 0x0000_1234_5678_0000,
+            rtp_timestamp: 0,
+            sender_packet_count: 1,
+            sender_octet_count: 160,
+            report_blocks: vec![],
+        };
+        stats.process_sr(&sr_a);
+        assert_ne!(stats.last_sr_ntp, 0, "LSR recorded from source A's SR");
+
+        // Source B takes over (SSRC change) — no SR from B received yet.
+        stats.record_received(ssrc_b, 0, 0, 160, 8000);
+
+        let data = build_sr_rr(0x1234_5678, ssrc_b, &mut stats, 0, 8000);
+        match &parse_rtcp(&data)[0] {
+            RtcpPacket::SenderReport(sr) => {
+                assert_eq!(
+                    sr.report_blocks[0].last_sr, 0,
+                    "RR block for the new SSRC must not echo the old source's LSR"
+                );
+                assert_eq!(
+                    sr.report_blocks[0].delay_since_last_sr, 0,
+                    "DLSR must be 0 when no SR has been received from the new source"
+                );
+            }
+            _ => panic!("expected SR"),
+        }
+    }
+
+    #[test]
+    fn test_sr_rr_emits_lsr_only_for_matching_ssrc() {
+        // SR timing is keyed to its source: build_sr_rr echoes LSR/DLSR only
+        // when reporting on the same SSRC the SR came from, and suppresses it
+        // (0) for any other SSRC — independent of RTP/RTCP arrival ordering.
+        let mut stats = RtcpStats::new();
+        let src = 0xCAFE_BABE;
+
+        // An SR arrives (even before any RTP for this source).
+        let sr = SenderReport {
+            ssrc: src,
+            ntp_timestamp: 0x0000_1111_2222_0000,
+            rtp_timestamp: 0,
+            sender_packet_count: 1,
+            sender_octet_count: 160,
+            report_blocks: vec![],
+        };
+        stats.process_sr(&sr);
+        stats.record_received(src, 0, 0, 160, 8000);
+
+        // Reporting on the SR's own SSRC → LSR present.
+        let data = build_sr_rr(0x1234_5678, src, &mut stats, 0, 8000);
+        match &parse_rtcp(&data)[0] {
+            RtcpPacket::SenderReport(s) => assert_ne!(
+                s.report_blocks[0].last_sr, 0,
+                "LSR must be echoed when reporting on the SR's own SSRC"
+            ),
+            _ => panic!("expected SR"),
+        }
+
+        // Reporting on a different SSRC → LSR suppressed.
+        let other = 0x0000_0099;
+        let data2 = build_sr_rr(0x1234_5678, other, &mut stats, 0, 8000);
+        match &parse_rtcp(&data2)[0] {
+            RtcpPacket::SenderReport(s) => assert_eq!(
+                s.report_blocks[0].last_sr, 0,
+                "LSR must be suppressed when reporting on a different SSRC"
+            ),
+            _ => panic!("expected SR"),
+        }
     }
 }

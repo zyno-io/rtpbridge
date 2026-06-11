@@ -262,15 +262,15 @@ async fn main() -> anyhow::Result<()> {
         {
             let mut api = rtc.direct_api();
             if let Some(tx) = api.stream_tx_by_mid(mid_t, None) {
-                let _ = tx.write_rtp(
-                    111.into(),
-                    seq.into(),
-                    (seq as u32).wrapping_mul(960),
-                    Instant::now(),
-                    seq == 0,
-                    str0m::rtp::ExtensionValues::default(),
-                    false,
-                    vec![0x80u8; 160],
+                tx.write_rtp(
+                    str0m::rtp::RtpWrite::new(
+                        111.into(),
+                        seq.into(),
+                        (seq as u32).wrapping_mul(960),
+                        Instant::now(),
+                        vec![0x80u8; 160],
+                    )
+                    .marker(seq == 0),
                 );
             }
             seq += 1;

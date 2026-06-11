@@ -1,12 +1,12 @@
 use std::fs::File;
 use std::path::Path;
 
-use symphonia::core::audio::SampleBuffer;
-use symphonia::core::codecs::DecoderOptions;
-use symphonia::core::formats::{FormatOptions, SeekMode, SeekTo};
+use symphonia::core::codecs::CodecParameters;
+use symphonia::core::codecs::audio::AudioDecoderOptions;
+use symphonia::core::formats::probe::Hint;
+use symphonia::core::formats::{FormatOptions, SeekMode, SeekTo, TrackType};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::Hint;
 use symphonia::core::units::Time;
 use tokio::sync::broadcast;
 use tracing::warn;
@@ -36,7 +36,7 @@ pub struct FileEndpoint {
     pub stats: EndpointStats,
 
     reader: Option<Box<dyn symphonia::core::formats::FormatReader>>,
-    decoder: Option<Box<dyn symphonia::core::codecs::Decoder>>,
+    decoder: Option<Box<dyn symphonia::core::codecs::audio::AudioDecoder>>,
     track_id: Option<u32>,
     sample_rate: Option<u32>,
 
@@ -319,7 +319,8 @@ impl FileEndpoint {
         let track_id = self
             .track_id
             .ok_or_else(|| anyhow::anyhow!("Track ID not initialized"))?;
-        let time = Time::new(position_ms / 1000, (position_ms % 1000) as f64 / 1000.0);
+        let time = Time::try_from_secs_f64(position_ms as f64 / 1000.0)
+            .ok_or_else(|| anyhow::anyhow!("Invalid seek position"))?;
         // Always reset decoder and clear buffers even if seek fails,
         // to avoid mixing stale samples from the old position.
         let result = reader.seek(
@@ -419,7 +420,8 @@ impl FileEndpoint {
         };
         loop {
             let packet = match reader.next_packet() {
-                Ok(p) => p,
+                Ok(Some(p)) => p,
+                Ok(None) => return false, // EOF
                 Err(symphonia::core::errors::Error::IoError(ref e))
                     if e.kind() == std::io::ErrorKind::UnexpectedEof =>
                 {
@@ -428,27 +430,24 @@ impl FileEndpoint {
                 Err(_) => return false,
             };
 
-            if packet.track_id() != track_id {
+            if packet.track_id != track_id {
                 continue;
             }
 
             match decoder.decode(&packet) {
                 Ok(audio_buf) => {
-                    let spec = *audio_buf.spec();
                     let n_frames = audio_buf.frames();
+                    let ch = audio_buf.spec().channels().count();
 
                     if n_frames == 0 {
                         continue;
                     }
 
-                    let mut sample_buf = SampleBuffer::<i16>::new(n_frames as u64, spec);
-                    sample_buf.copy_interleaved_ref(audio_buf);
-
-                    let samples = sample_buf.samples();
+                    let mut samples: Vec<i16> = Vec::with_capacity(n_frames * ch);
+                    audio_buf.copy_to_vec_interleaved(&mut samples);
 
                     // Convert to mono if stereo
-                    if spec.channels.count() > 1 {
-                        let ch = spec.channels.count();
+                    if ch > 1 {
                         for frame in 0..n_frames {
                             let mut sum: i32 = 0;
                             for c in 0..ch {
@@ -459,7 +458,7 @@ impl FileEndpoint {
                             self.pcm_buffer.push(mono);
                         }
                     } else {
-                        self.pcm_buffer.extend_from_slice(samples);
+                        self.pcm_buffer.extend_from_slice(&samples);
                     }
 
                     return true;
@@ -473,19 +472,19 @@ impl FileEndpoint {
 /// Return type for `open_audio_file`: (format_reader, decoder, track_id, sample_rate)
 type AudioFileComponents = (
     Box<dyn symphonia::core::formats::FormatReader>,
-    Box<dyn symphonia::core::codecs::Decoder>,
+    Box<dyn symphonia::core::codecs::audio::AudioDecoder>,
     u32,
     u32,
 );
 
 /// Codec registry with all default symphonia codecs plus Opus (via libopus).
-fn get_codecs() -> &'static symphonia::core::codecs::CodecRegistry {
+fn get_codecs() -> &'static symphonia::core::codecs::registry::CodecRegistry {
     use std::sync::LazyLock;
-    use symphonia::core::codecs::CodecRegistry;
+    use symphonia::core::codecs::registry::CodecRegistry;
     static REGISTRY: LazyLock<CodecRegistry> = LazyLock::new(|| {
         let mut registry = CodecRegistry::new();
         symphonia::default::register_enabled_codecs(&mut registry);
-        registry.register_all::<symphonia_adapter_libopus::OpusDecoder>();
+        registry.register_audio_decoder::<symphonia_adapter_libopus::OpusDecoder>();
         registry
     });
     &REGISTRY
@@ -501,28 +500,27 @@ fn open_audio_file(path: &str) -> anyhow::Result<AudioFileComponents> {
         hint.with_extension(ext);
     }
 
-    let probed = symphonia::default::get_probe().format(
+    let reader = symphonia::default::get_probe().probe(
         &hint,
         mss,
-        &FormatOptions::default(),
-        &MetadataOptions::default(),
+        FormatOptions::default(),
+        MetadataOptions::default(),
     )?;
 
-    let reader = probed.format;
-
     let track = reader
-        .tracks()
-        .iter()
-        .find(|t| t.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL)
+        .first_track_known_codec(TrackType::Audio)
         .ok_or_else(|| anyhow::anyhow!("No audio track found"))?;
 
     let track_id = track.id;
-    let sample_rate = track
-        .codec_params
+    let audio_params = match track.codec_params.as_ref() {
+        Some(CodecParameters::Audio(params)) => params,
+        _ => return Err(anyhow::anyhow!("No audio codec parameters")),
+    };
+    let sample_rate = audio_params
         .sample_rate
         .ok_or_else(|| anyhow::anyhow!("Unknown sample rate"))?;
 
-    let decoder = get_codecs().make(&track.codec_params, &DecoderOptions::default())?;
+    let decoder = get_codecs().make_audio_decoder(audio_params, &AudioDecoderOptions::default())?;
 
     Ok((reader, decoder, track_id, sample_rate))
 }

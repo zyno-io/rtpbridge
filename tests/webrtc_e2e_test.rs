@@ -722,15 +722,15 @@ async fn test_webrtc_rtp_bidirectional_media() {
         if let Some(stream_tx) = api.stream_tx_by_mid(mid, None) {
             let pt = 111.into();
             let seq_no: str0m::rtp::SeqNo = (seq as u64).into();
-            let _ = stream_tx.write_rtp(
-                pt,
-                seq_no,
-                seq as u32 * 960,
-                Instant::now(),
-                seq == 0,
-                str0m::rtp::ExtensionValues::default(),
-                false,
-                vec![0x80u8; 160],
+            stream_tx.write_rtp(
+                str0m::rtp::RtpWrite::new(
+                    pt,
+                    seq_no,
+                    seq as u32 * 960,
+                    Instant::now(),
+                    vec![0x80u8; 160],
+                )
+                .marker(seq == 0),
             );
         }
         drop(api);

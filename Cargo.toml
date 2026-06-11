@@ -38,7 +38,7 @@ anyhow = "1"
 rand = "0.10"
 
 # WebRTC
-str0m = { version = "0.19", default-features = false, features = ["openssl", "vendored"] }
+str0m = { version = "0.20", default-features = false, features = ["openssl", "vendored"] }
 
 # Codecs
 xlaw = "0.0.3"
@@ -46,8 +46,8 @@ ezk-g722 = "0.1"
 opus = "0.3"
 
 # Audio file decode
-symphonia = { version = "0.5", features = ["mp3", "ogg", "wav", "flac", "pcm", "vorbis"] }
-symphonia-adapter-libopus = { version = "0.2", default-features = false }
+symphonia = { version = "0.6", features = ["mp3", "ogg", "wav", "flac", "pcm", "vorbis"] }
+symphonia-adapter-libopus = { version = "0.3", default-features = false }
 reqwest = { version = "0.13", features = ["stream"] }
 
 # Recording

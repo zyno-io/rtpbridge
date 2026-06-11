@@ -686,7 +686,7 @@ impl WebRtcEndpoint {
                             timestamp: pkt.header.timestamp,
                             ssrc: *pkt.header.ssrc,
                             marker: pkt.header.marker,
-                            payload: pkt.payload,
+                            payload: pkt.payload.to_vec(),
                         }));
                     }
                     Event::MediaAdded(media) => {
@@ -718,16 +718,15 @@ impl WebRtcEndpoint {
             .ok_or_else(|| anyhow::anyhow!("No TX stream for mid {mid}"))?;
 
         // Clone needed: str0m takes ownership, but the same packet may route to multiple destinations
-        stream_tx.write_rtp(
+        let rtp = str0m::rtp::RtpWrite::new(
             pt,
             seq_no,
             packet.timestamp,
             Instant::now(),
-            packet.marker,
-            str0m::rtp::ExtensionValues::default(),
-            false,
             packet.payload.clone(),
-        )?;
+        )
+        .marker(packet.marker);
+        stream_tx.write_rtp(rtp);
 
         self.stats.record_outbound(packet.payload.len());
         Ok(())
@@ -1020,19 +1019,16 @@ mod tests {
                     let mut api = server.direct_api();
                     match api.stream_tx_by_mid(mid, None) {
                         Some(stream) => {
-                            let result = stream.write_rtp(
-                                111.into(),
-                                seq.into(),
-                                (seq as u32) * 960,
-                                now,
-                                seq == 0,
-                                str0m::rtp::ExtensionValues::default(),
-                                false,
-                                vec![0x80u8; 160],
+                            stream.write_rtp(
+                                str0m::rtp::RtpWrite::new(
+                                    111.into(),
+                                    seq.into(),
+                                    (seq as u32) * 960,
+                                    now,
+                                    vec![0x80u8; 160],
+                                )
+                                .marker(seq == 0),
                             );
-                            if let Err(e) = result {
-                                write_errors.push(format!("seq {seq}: {e}"));
-                            }
                         }
                         None => {
                             write_errors.push(format!("seq {seq}: no stream_tx for mid {mid}"));
@@ -1225,18 +1221,16 @@ mod tests {
                     let stream = api
                         .stream_tx_by_mid(mid, None)
                         .expect("TX stream must exist for recvonly mixing endpoint");
-                    stream
-                        .write_rtp(
+                    stream.write_rtp(
+                        str0m::rtp::RtpWrite::new(
                             111.into(),
                             seq.into(),
                             (seq as u32) * 960,
                             now,
-                            seq == 0,
-                            str0m::rtp::ExtensionValues::default(),
-                            false,
                             vec![0x80u8; 160],
                         )
-                        .expect("write_rtp must succeed");
+                        .marker(seq == 0),
+                    );
                 }
             }
         }

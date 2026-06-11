@@ -195,10 +195,11 @@ build:pcap2audio:
     - install -m 0755 target/release/pcap2audio pcap2audio
     - file pcap2audio
     # Hard gate: fail loudly if it didn't link fully static (rather than ship a
-    # binary that silently needs libopus/libssl/glibc at runtime).
+    # binary that silently needs libopus/libssl/glibc at runtime). A musl static
+    # binary reports "static-pie linked", so reject only the dynamically-linked case.
     - |
-      if ! file pcap2audio | grep -q "statically linked"; then
-        echo "ERROR: pcap2audio is not statically linked"
+      if file pcap2audio | grep -q "dynamically linked"; then
+        echo "ERROR: pcap2audio is dynamically linked (expected a fully static build)"
         exit 1
       fi
   artifacts:

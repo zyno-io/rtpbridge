@@ -21,8 +21,10 @@ rtpbridge [OPTIONS]
 # WebSocket/HTTP control plane (comma-separated addresses accepted)
 listen = "0.0.0.0:9100"
 
-# Media plane IP — used for RTP sockets and SDP/ICE candidates
+# Media plane IP(s) — used for RTP sockets and SDP/ICE candidates.
+# A single address, or a comma-separated IPv4+IPv6 pair for dual-stack.
 media_ip = "203.0.113.5"
+# media_ip = "203.0.113.5, 2001:db8::5"   # dual-stack
 
 # UDP port range for plain RTP endpoints [start, end]
 rtp_port_range = [30000, 39999]
@@ -99,7 +101,7 @@ log_level = "info"
 rtpbridge supports binding the control plane and media plane to different network interfaces:
 
 - **`listen`** — The WebSocket control plane. Bind to your management network (e.g., `10.0.1.5:9100`).
-- **`media_ip`** — All RTP/WebRTC UDP sockets. Bind to your media network (e.g., `10.0.2.5`).
+- **`media_ip`** — All RTP/WebRTC UDP sockets. Bind to your media network (e.g., `10.0.2.5`). Accepts a single address or a comma-separated list — at most one IPv4 and one IPv6 — to dual-bind both families on one instance.
 
 The `media_ip` is used directly in:
 - SDP `c=` lines (connection address)
@@ -107,6 +109,23 @@ The `media_ip` is used directly in:
 - Plain RTP socket binding
 
 No STUN/TURN discovery is performed — the configured IP is assumed to be directly reachable.
+
+### Dual-stack (IPv4 + IPv6)
+
+Set `media_ip` to one IPv4 and one IPv6 address to serve both families from a single instance:
+
+```toml
+media_ip = "203.0.113.5, 2001:db8::5"
+```
+
+Behavior:
+- **Plain RTP/SRTP** answers each offer with the family matching the remote SDP's `c=` line, allocating from that family's port pool. An offer for a family you did **not** configure is rejected (`ENDPOINT_ERROR`) rather than answered with an unreachable address. Re-negotiations (`update_remote_sdp`) that flip a bound endpoint's family are likewise rejected — sockets are not migrated across families.
+- **WebRTC** binds one UDP socket per family and offers an ICE host candidate for each; ICE nominates the working pair. (Note: the ICE library's default local preference favors IPv6, so a dual-stack browser typically connects over IPv6.)
+- **Offers rtpbridge originates** for plain RTP advertise a single `c=` line and prefer IPv4 when both families are configured.
+
+Validation rejects unspecified (`0.0.0.0` / `::`) and multicast media addresses; loopback and link-local addresses warn (IPv6 link-local cannot carry a scope id in SDP).
+
+**Limitation:** PCAP recordings always synthesize IPv4 framing regardless of the real media family — recorded packets do not carry real IPv6 headers.
 
 ## HTTP REST API
 
@@ -232,7 +251,7 @@ All configuration options with their types, defaults, and descriptions. All chan
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `listen` | `ip:port[,ip:port...]` | `0.0.0.0:9100` | WebSocket/HTTP control plane listen address(es), comma-separated |
-| `media_ip` | `ip` | `127.0.0.1` | IP for RTP/WebRTC UDP sockets; appears in SDP and ICE candidates |
+| `media_ip` | `ip[,ip]` | `127.0.0.1` | IP(s) for RTP/WebRTC UDP sockets; appears in SDP and ICE candidates. Comma-separated for dual-stack (≤1 IPv4, ≤1 IPv6) |
 | `rtp_port_range` | `[u16, u16]` | `[30000, 39999]` | UDP port range for plain RTP endpoints (must start even, >= 1024) |
 | `disconnect_timeout_secs` | `u64` | `30` | Seconds to keep orphaned sessions alive after WebSocket disconnect |
 | `shutdown_max_wait_secs` | `u64` | `300` | Maximum wait for session drain on graceful shutdown |

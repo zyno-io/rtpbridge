@@ -26,6 +26,27 @@ where
     parse_listen_addrs(&s).map_err(serde::de::Error::custom)
 }
 
+/// Parse a comma-separated list of media-plane bind IPs.
+fn parse_media_ips(s: &str) -> Result<Vec<IpAddr>, String> {
+    s.split(',')
+        .map(|part| {
+            part.trim()
+                .parse::<IpAddr>()
+                .map_err(|e| format!("invalid media_ip '{}': {e}", part.trim()))
+        })
+        .collect()
+}
+
+/// Deserialize media IPs from TOML — accepts a single string like `"10.0.0.1"`
+/// (back-compat) or comma-separated `"10.0.0.1, 2001:db8::1"`.
+fn deserialize_media_ips<'de, D>(deserializer: D) -> Result<Vec<IpAddr>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    parse_media_ips(&s).map_err(serde::de::Error::custom)
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "rtpbridge", about = "RTP media routing server")]
 pub struct Cli {
@@ -33,9 +54,10 @@ pub struct Cli {
     #[arg(short, long, default_value = "0.0.0.0:9100", value_delimiter = ',')]
     pub listen: Vec<SocketAddr>,
 
-    /// Media plane bind IP for RTP/WebRTC UDP sockets
-    #[arg(short, long)]
-    pub media_ip: Option<IpAddr>,
+    /// Media plane bind IPs for RTP/WebRTC UDP sockets (comma-separated; at most
+    /// one IPv4 and one IPv6 for dual-stack)
+    #[arg(short, long, value_delimiter = ',')]
+    pub media_ip: Option<Vec<IpAddr>>,
 
     /// Path to TOML configuration file
     #[arg(short, long)]
@@ -53,11 +75,15 @@ pub struct Config {
     #[serde(deserialize_with = "deserialize_listen_addrs")]
     pub listen: Vec<SocketAddr>,
 
-    /// Media plane bind IP for all RTP/WebRTC UDP sockets.
-    /// Used in SDP c= lines and ICE host candidates.
-    /// Separate from control plane to support split interfaces.
-    #[serde(default = "default_media_ip")]
-    pub media_ip: IpAddr,
+    /// Media plane bind IPs for all RTP/WebRTC UDP sockets (at most one IPv4 and
+    /// one IPv6). Used in SDP c= lines and ICE host candidates. Plain RTP picks
+    /// the family matching the remote SDP; WebRTC offers a host candidate per
+    /// family. Separate from control plane to support split interfaces.
+    #[serde(
+        default = "default_media_ip",
+        deserialize_with = "deserialize_media_ips"
+    )]
+    pub media_ip: Vec<IpAddr>,
 
     /// UDP port range for plain RTP endpoints (start, end inclusive)
     pub rtp_port_range: (u16, u16),
@@ -145,8 +171,8 @@ pub struct Config {
     pub log_level: String,
 }
 
-fn default_media_ip() -> IpAddr {
-    IpAddr::V4(Ipv4Addr::LOCALHOST)
+fn default_media_ip() -> Vec<IpAddr> {
+    vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]
 }
 
 fn default_recording_dir() -> PathBuf {
@@ -162,6 +188,7 @@ impl Default for Config {
                     .expect("hardcoded default listen address must parse"),
             ],
             media_ip: default_media_ip(),
+            // rtp_port_range applies per family — each media IP gets its own pool.
             rtp_port_range: (30000, 39999),
             disconnect_timeout_secs: 30,
             shutdown_max_wait_secs: 300,
@@ -218,8 +245,8 @@ impl Config {
         {
             config.listen = cli.listen.clone();
         }
-        if let Some(ip) = cli.media_ip {
-            config.media_ip = ip;
+        if let Some(ips) = &cli.media_ip {
+            config.media_ip = ips.clone();
         }
         if matches.value_source("log_level") == Some(ValueSource::CommandLine)
             || cli.config.is_none()
@@ -360,12 +387,56 @@ impl Config {
                 );
             }
         }
-        if self.media_ip.is_loopback() {
-            tracing::warn!(
-                media_ip = %self.media_ip,
-                "media_ip is a loopback address — remote peers cannot reach it. \
-                 Set media_ip to a routable address for production use."
+        self.validate_media_ips()?;
+        Ok(())
+    }
+
+    fn validate_media_ips(&self) -> anyhow::Result<()> {
+        if self.media_ip.is_empty() {
+            anyhow::bail!("media_ip must contain at least one address");
+        }
+        let v4_count = self.media_ip.iter().filter(|ip| ip.is_ipv4()).count();
+        let v6_count = self.media_ip.len() - v4_count;
+        if v4_count > 1 || v6_count > 1 {
+            anyhow::bail!(
+                "media_ip may contain at most one IPv4 and one IPv6 address (got {} IPv4, {} IPv6)",
+                v4_count,
+                v6_count
             );
+        }
+        for ip in &self.media_ip {
+            // Unspecified / multicast can't serve as an advertised media address,
+            // and str0m's ICE rejects them as host candidates anyway.
+            if ip.is_unspecified() {
+                anyhow::bail!(
+                    "media_ip {ip} is unspecified — bind a concrete address that peers can reach"
+                );
+            }
+            if ip.is_multicast() {
+                anyhow::bail!(
+                    "media_ip {ip} is a multicast address, which cannot be a media bind IP"
+                );
+            }
+            if ip.is_loopback() {
+                tracing::warn!(
+                    media_ip = %ip,
+                    "media_ip is a loopback address — remote peers cannot reach it. \
+                     Set media_ip to a routable address for production use."
+                );
+            }
+            // IPv6 link-local needs a scope id that SDP/ICE host candidates can't
+            // carry, so it's practically unusable as a media address.
+            let link_local = match ip {
+                IpAddr::V4(v4) => v4.is_link_local(),
+                IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80,
+            };
+            if link_local {
+                tracing::warn!(
+                    media_ip = %ip,
+                    "media_ip is a link-local address — it is generally unreachable for \
+                     media and IPv6 link-local cannot carry a scope id in SDP."
+                );
+            }
         }
         Ok(())
     }
@@ -393,7 +464,7 @@ mod tests {
             config.listen,
             vec!["0.0.0.0:9100".parse::<SocketAddr>().unwrap()]
         );
-        assert_eq!(config.media_ip, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(config.media_ip, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]);
         assert_eq!(config.rtp_port_range, (30000, 39999));
         assert_eq!(config.disconnect_timeout_secs, 30);
         assert_eq!(config.shutdown_max_wait_secs, 300);
@@ -418,7 +489,7 @@ mod tests {
             config.listen,
             vec!["127.0.0.1:9200".parse::<SocketAddr>().unwrap()]
         );
-        assert_eq!(config.media_ip, "10.0.0.1".parse::<IpAddr>().unwrap());
+        assert_eq!(config.media_ip, vec!["10.0.0.1".parse::<IpAddr>().unwrap()]);
         assert_eq!(config.rtp_port_range, (20000, 29999));
         assert_eq!(config.disconnect_timeout_secs, 60);
         assert_eq!(config.max_sessions, 500);
@@ -453,7 +524,7 @@ mod tests {
 
         let cli = Cli {
             listen: vec!["127.0.0.1:9100".parse().unwrap()],
-            media_ip: Some("192.168.1.1".parse().unwrap()),
+            media_ip: Some(vec!["192.168.1.1".parse().unwrap()]),
             config: Some(tmp.clone()),
             log_level: "debug".to_string(),
         };
@@ -471,9 +542,118 @@ mod tests {
         ]);
         let config = Config::load_with_matches(&cli, &matches).unwrap();
         // CLI media_ip should override TOML
-        assert_eq!(config.media_ip, "192.168.1.1".parse::<IpAddr>().unwrap());
+        assert_eq!(
+            config.media_ip,
+            vec!["192.168.1.1".parse::<IpAddr>().unwrap()]
+        );
         assert_eq!(config.log_level, "debug");
 
+        std::fs::remove_file(tmp).ok();
+    }
+
+    #[test]
+    fn test_media_ip_dual_stack_parse() {
+        let toml_content = r#"
+            media_ip = "203.0.113.5, 2001:db8::5"
+        "#;
+        let config: Config = toml::from_str(toml_content).unwrap();
+        assert_eq!(
+            config.media_ip,
+            vec![
+                "203.0.113.5".parse::<IpAddr>().unwrap(),
+                "2001:db8::5".parse::<IpAddr>().unwrap(),
+            ]
+        );
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn test_media_ip_single_string_back_compat() {
+        // A bare single string must still parse into a one-element list.
+        let toml_content = r#"
+            media_ip = "203.0.113.5"
+        "#;
+        let config: Config = toml::from_str(toml_content).unwrap();
+        assert_eq!(
+            config.media_ip,
+            vec!["203.0.113.5".parse::<IpAddr>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn test_media_ip_v6_only() {
+        let toml_content = r#"
+            media_ip = "2001:db8::5"
+        "#;
+        let config: Config = toml::from_str(toml_content).unwrap();
+        assert_eq!(
+            config.media_ip,
+            vec!["2001:db8::5".parse::<IpAddr>().unwrap()]
+        );
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn test_media_ip_reject_two_of_same_family() {
+        let mut config = Config::default();
+        config.media_ip = vec![
+            "203.0.113.5".parse().unwrap(),
+            "203.0.113.6".parse().unwrap(),
+        ];
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("at most one IPv4 and one IPv6"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_media_ip_reject_unspecified() {
+        let mut config = Config::default();
+        config.media_ip = vec!["0.0.0.0".parse().unwrap()];
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("unspecified"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_media_ip_reject_empty() {
+        let mut config = Config::default();
+        config.media_ip = vec![];
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("at least one address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_media_ip_absent_cli_keeps_config() {
+        // No --media-ip on the CLI; the TOML value must survive.
+        let toml_content = r#"
+            media_ip = "10.0.0.1, fd00::1"
+        "#;
+        let tmp = std::env::temp_dir().join("rtpbridge-test-media-ip-absent.toml");
+        std::fs::write(&tmp, toml_content).unwrap();
+
+        let cli = Cli {
+            listen: vec!["0.0.0.0:9100".parse().unwrap()],
+            media_ip: None,
+            config: Some(tmp.clone()),
+            log_level: "info".to_string(),
+        };
+        let matches =
+            Cli::command().get_matches_from(["rtpbridge", "--config", tmp.to_str().unwrap()]);
+        let config = Config::load_with_matches(&cli, &matches).unwrap();
+        assert_eq!(
+            config.media_ip,
+            vec![
+                "10.0.0.1".parse::<IpAddr>().unwrap(),
+                "fd00::1".parse::<IpAddr>().unwrap(),
+            ]
+        );
         std::fs::remove_file(tmp).ok();
     }
 

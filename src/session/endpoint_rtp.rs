@@ -282,6 +282,7 @@ impl RtpEndpoint {
                                     source,
                                     data: buf[..n].to_vec(),
                                     is_rtcp: false,
+                                    local: None,
                                 };
                                 if tx.send(packet).await.is_err() {
                                     exit_reason = "session channel closed";
@@ -329,6 +330,7 @@ impl RtpEndpoint {
                                     source,
                                     data: buf[..n].to_vec(),
                                     is_rtcp: true,
+                                    local: None,
                                 };
                                 if packet_tx.send(packet).await.is_err() {
                                     exit_reason = "session channel closed";
@@ -549,8 +551,34 @@ impl RtpEndpoint {
     }
 
     /// Accept a remote SDP answer
+    /// Reject a remote SDP whose connection address family differs from this
+    /// endpoint's already-bound local RTP socket family. The socket is bound to a
+    /// single family for its lifetime (we don't migrate sockets), so sending to
+    /// the other family would fail at runtime. Returns `Ok(())` when the remote
+    /// has no address or matches the bound family.
+    fn reject_family_change(&self, remote: Option<SocketAddr>) -> anyhow::Result<()> {
+        if let Some(remote) = remote {
+            let bound_is_v6 = self.local_rtp_addr.is_ipv6();
+            if remote.is_ipv6() != bound_is_v6 {
+                anyhow::bail!(
+                    "remote SDP address family ({}) does not match this endpoint's bound \
+                     media family ({}); socket migration across address families is not supported",
+                    if remote.is_ipv6() { "IPv6" } else { "IPv4" },
+                    if bound_is_v6 { "IPv6" } else { "IPv4" },
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub fn accept_answer(&mut self, answer_sdp: &str) -> anyhow::Result<()> {
         let parsed = sdp::parse_sdp(answer_sdp);
+
+        // Reject an address-family change before mutating any state: our RTP
+        // socket is already bound to one family, and we don't migrate sockets, so
+        // a v4↔v6 flip would leave us unable to reach the remote. Bail here (no
+        // partial mutation) rather than half-applying the SDP.
+        self.reject_family_change(parsed.remote_addr)?;
 
         if let Some(dir) = parsed
             .direction
@@ -692,6 +720,11 @@ impl RtpEndpoint {
     /// originally-negotiated one, causing one-way audio after hold/unhold.
     pub fn update_remote_sdp(&mut self, sdp: &str) -> anyhow::Result<String> {
         let parsed = sdp::parse_sdp(sdp);
+
+        // Reject a re-INVITE/re-negotiation that flips the address family before
+        // mutating any state — the bound socket can't reach the other family and
+        // we don't migrate sockets. Bail cleanly instead of half-applying.
+        self.reject_family_change(parsed.remote_addr)?;
 
         // Apply remote SDP direction by default unless an explicit manual
         // override is active via endpoint.update_direction.
@@ -1681,6 +1714,119 @@ mod tests {
         assert!(
             !answer.contains("telephone-event/48000"),
             "telephone-event must not be rewritten to 48000; answer:\n{answer}"
+        );
+    }
+
+    /// Build a minimal plain-RTP offer for the given connection family.
+    fn family_offer(is_v6: bool, port: u16) -> String {
+        let (ver, addr) = if is_v6 {
+            ("IP6", "::1")
+        } else {
+            ("IP4", "127.0.0.1")
+        };
+        format!(
+            "v=0\r\n\
+             o=- 1 1 IN {ver} {addr}\r\n\
+             s=-\r\n\
+             c=IN {ver} {addr}\r\n\
+             t=0 0\r\n\
+             m=audio {port} RTP/AVP 0 101\r\n\
+             a=rtpmap:0 PCMU/8000\r\n\
+             a=rtpmap:101 telephone-event/8000\r\n\
+             a=sendrecv\r\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn test_update_remote_sdp_rejects_address_family_flip() {
+        // A v4-bound RTP endpoint must reject a re-negotiation that flips the
+        // remote to IPv6: the socket is bound to one family and we don't migrate,
+        // so accepting it would leave us unable to reach the peer. The guard must
+        // also run before any state mutation (no half-applied SDP).
+        let pool =
+            crate::net::socket_pool::SocketPool::new("127.0.0.1".parse().unwrap(), 41500, 41600)
+                .unwrap();
+        let pair = pool.allocate_pair().await.unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+
+        let (mut ep, _answer) = RtpEndpoint::from_offer(
+            EndpointId::new_v4(),
+            EndpointDirection::SendRecv,
+            &family_offer(false, 20000),
+            pair,
+            "127.0.0.1".parse().unwrap(),
+            tx,
+        )
+        .unwrap();
+        assert!(ep.remote_rtp_addr.unwrap().is_ipv4());
+
+        let err = ep
+            .update_remote_sdp(&family_offer(true, 20000))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("address family"),
+            "unexpected error: {err}"
+        );
+        // State unchanged — the rejected v6 SDP must not have been applied.
+        assert!(
+            ep.remote_rtp_addr.unwrap().is_ipv4(),
+            "remote address must still be the original IPv4 after a rejected flip"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_remote_sdp_allows_same_family_renegotiation() {
+        // Same-family re-negotiation (e.g. a port change) must still work — the
+        // guard only blocks v4↔v6 flips.
+        let pool =
+            crate::net::socket_pool::SocketPool::new("127.0.0.1".parse().unwrap(), 41600, 41700)
+                .unwrap();
+        let pair = pool.allocate_pair().await.unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+
+        let (mut ep, _answer) = RtpEndpoint::from_offer(
+            EndpointId::new_v4(),
+            EndpointDirection::SendRecv,
+            &family_offer(false, 20000),
+            pair,
+            "127.0.0.1".parse().unwrap(),
+            tx,
+        )
+        .unwrap();
+
+        ep.update_remote_sdp(&family_offer(false, 21000)).unwrap();
+        assert_eq!(
+            ep.remote_rtp_addr.unwrap().port(),
+            21000,
+            "same-family re-INVITE should update the remote port"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_accept_answer_rejects_address_family_flip() {
+        // The same guard protects accept_answer: a v4-bound offerer must reject a
+        // v6 answer rather than half-apply it.
+        let pool =
+            crate::net::socket_pool::SocketPool::new("127.0.0.1".parse().unwrap(), 41700, 41800)
+                .unwrap();
+        let pair = pool.allocate_pair().await.unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+
+        let (mut ep, _offer) = RtpEndpoint::create_offer(
+            EndpointId::new_v4(),
+            EndpointDirection::SendRecv,
+            pair,
+            "127.0.0.1".parse().unwrap(),
+            &[sdp::CODEC_PCMU],
+            false,
+            tx,
+        )
+        .unwrap();
+
+        let err = ep.accept_answer(&family_offer(true, 20000)).unwrap_err();
+        assert!(
+            err.to_string().contains("address family"),
+            "unexpected error: {err}"
         );
     }
 

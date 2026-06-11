@@ -56,7 +56,13 @@ pub struct WebRtcEndpoint {
     /// MediaIngressStats, so we run our own pass over Event::RtpPacket.
     pub rtcp_stats: RtcpStats,
     pub rtc: Rtc,
-    pub socket: Arc<UdpSocket>,
+    /// One UDP socket per bound address family (IPv4 and/or IPv6), each paired
+    /// with its local address. We register one ICE host candidate per socket and
+    /// let ICE nominate a pair; inbound datagrams are tagged with the socket they
+    /// arrived on, and outbound `Transmit`s are routed by `transmit.source`.
+    pub sockets: Vec<(SocketAddr, Arc<UdpSocket>)>,
+    /// Primary local address (the first bound socket). Used for stats, logging,
+    /// and event payloads; not the sole transport address when dual-stack.
     pub local_addr: SocketAddr,
     /// Last destination str0m emitted a transmit to once ICE was nominated.
     /// Cleared on disconnect.
@@ -120,19 +126,84 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
     }
 }
 
+/// What the recv task should do after handling one datagram.
+enum RecvAction {
+    Continue,
+    Stop(&'static str),
+}
+
+/// Forward a single received datagram from a WebRTC socket into the session's
+/// packet channel, tagging it with the `local` address it arrived on (so the
+/// session can give str0m the correct `destination` for the dual-stack case).
+/// Shared by all sockets a single recv task multiplexes.
+#[allow(clippy::too_many_arguments)]
+fn forward_datagram(
+    result: std::io::Result<(usize, SocketAddr)>,
+    buf: &[u8],
+    local: SocketAddr,
+    endpoint_id: EndpointId,
+    raw_recv: &RawRecvCounters,
+    metrics: &Metrics,
+    packet_tx: &mpsc::Sender<InboundPacket>,
+) -> RecvAction {
+    match result {
+        Ok((n, source)) => {
+            // Wire-level count: every datagram, BEFORE str0m demuxes
+            // ICE/DTLS/RTCP from media. A dropped (overflow) packet still
+            // arrived on the path, so count before the try_send.
+            raw_recv.record(n);
+            let packet = InboundPacket {
+                endpoint_id,
+                source,
+                data: buf[..n].to_vec(),
+                is_rtcp: false,
+                local: Some(local),
+            };
+            // Non-blocking: a full session channel must never PARK the reader — a
+            // parked reader stops servicing the socket and blackholes the
+            // endpoint entirely (the very wedge this guards against), so we drop
+            // under backpressure. NOTE this drops STUN/DTLS as well as RTP/SRTP;
+            // a full channel is itself an overload signal
+            // (`webrtc_recv_overflow`), and dropping a setup packet is strictly
+            // better than wedging the socket.
+            match packet_tx.try_send(packet) {
+                Ok(()) => RecvAction::Continue,
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    metrics.webrtc_recv_overflow.inc();
+                    RecvAction::Continue
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => RecvAction::Stop("session_dropped"),
+            }
+        }
+        Err(e) => {
+            warn!(endpoint_id = %endpoint_id, error = %e, "UDP recv error");
+            RecvAction::Stop("udp_error")
+        }
+    }
+}
+
 impl WebRtcEndpoint {
     /// Create a new WebRTC endpoint with its own UDP socket
     async fn new_with_socket(
         id: EndpointId,
         config: EndpointConfig,
-        bind_addr: SocketAddr,
+        bind_addrs: &[SocketAddr],
         metrics: Arc<Metrics>,
     ) -> anyhow::Result<Self> {
         // WebRTC endpoints use OS-assigned ephemeral ports (not rtp_port_range).
         // ICE negotiates connectivity dynamically, so fixed port ranges don't apply.
-        let socket = UdpSocket::bind(bind_addr).await?;
-        let local_addr = socket.local_addr()?;
-        let socket = Arc::new(socket);
+        // One socket per configured address family (dual-stack): each becomes an
+        // ICE host candidate, and ICE nominates the working pair.
+        if bind_addrs.is_empty() {
+            anyhow::bail!("WebRTC endpoint requires at least one bind address");
+        }
+        let mut sockets = Vec::with_capacity(bind_addrs.len());
+        for &bind_addr in bind_addrs {
+            let socket = UdpSocket::bind(bind_addr).await?;
+            let local_addr = socket.local_addr()?;
+            sockets.push((local_addr, Arc::new(socket)));
+        }
+        let local_addr = sockets[0].0;
 
         let rtc = RtcConfig::new()
             .set_ice_lite(true)
@@ -148,7 +219,7 @@ impl WebRtcEndpoint {
             ice_connection_state: None,
             rtcp_stats: RtcpStats::new(),
             rtc,
-            socket,
+            sockets,
             local_addr,
             remote_addr: None,
             audio_mid: None,
@@ -165,6 +236,19 @@ impl WebRtcEndpoint {
             recv_start_deadline: None,
             recv_dead_reported: false,
         })
+    }
+
+    /// Register one ICE host candidate per bound socket. With dual-stack this
+    /// offers both an IPv4 and an IPv6 host candidate and lets ICE nominate the
+    /// pair that connects. Local addresses are collected first so we don't hold a
+    /// borrow of `self.sockets` across the `&mut self.rtc` call.
+    fn add_host_candidates(&mut self) -> anyhow::Result<()> {
+        let locals: Vec<SocketAddr> = self.sockets.iter().map(|(la, _)| *la).collect();
+        for local in locals {
+            let candidate = Candidate::host(local, "udp")?;
+            self.rtc.add_local_candidate(candidate);
+        }
+        Ok(())
     }
 
     /// Mark the start of a negotiation attempt for the connecting-watchdog.
@@ -231,7 +315,7 @@ impl WebRtcEndpoint {
     /// flags a task that never starts or later dies — off the hot path, so
     /// nothing here blocks creation or the session task.
     pub fn start_recv_task(&mut self, packet_tx: mpsc::Sender<InboundPacket>) {
-        let socket = Arc::clone(&self.socket);
+        let sockets = self.sockets.clone();
         let endpoint_id = self.id;
         let local_addr = self.local_addr;
         let token = self.cancel_token.clone();
@@ -253,52 +337,34 @@ impl WebRtcEndpoint {
                 recv_started.store(true, Ordering::Relaxed);
                 metrics.webrtc_recv_task_started.inc();
 
-                let mut buf = vec![0u8; 4096];
+                // A single recv task multiplexes every bound socket (one socket
+                // for single-family, two for dual-stack v4+v6). Keeping it one
+                // task preserves the liveness model (one `recv_started`, one
+                // handle for the wedge sweep). At most one v4 + one v6 socket, so
+                // a two-arm select covers it; each datagram is tagged with the
+                // local address it arrived on.
+                let (la0, s0) = sockets[0].clone();
+                let s1: Option<(SocketAddr, Arc<UdpSocket>)> = sockets.get(1).cloned();
+
+                let mut buf0 = vec![0u8; 4096];
+                let mut buf1 = vec![0u8; 4096];
                 let mut exit_reason = "cancelled";
                 loop {
                     tokio::select! {
-                        result = socket.recv_from(&mut buf) => {
-                            match result {
-                                Ok((n, source)) => {
-                                    // Wire-level count: every datagram, BEFORE
-                                    // str0m demuxes ICE/DTLS/RTCP from media. A
-                                    // dropped (overflow) packet still arrived on
-                                    // the path, so count before the try_send.
-                                    raw_recv.record(n);
-                                    let packet = InboundPacket {
-                                        endpoint_id,
-                                        source,
-                                        data: buf[..n].to_vec(),
-                                        is_rtcp: false,
-                                    };
-                                    // Non-blocking: a full session channel must
-                                    // never PARK the reader — a parked reader
-                                    // stops servicing the socket and blackholes
-                                    // the endpoint entirely (the very wedge this
-                                    // guards against), so we drop under
-                                    // backpressure. NOTE this drops STUN/DTLS as
-                                    // well as RTP/SRTP; a full 256-deep channel is
-                                    // itself an overload signal
-                                    // (`webrtc_recv_overflow`), and dropping a
-                                    // setup packet is strictly better than wedging
-                                    // the socket. Class-aware priority for
-                                    // STUN/DTLS is a documented follow-up (runbook).
-                                    match packet_tx.try_send(packet) {
-                                        Ok(()) => {}
-                                        Err(mpsc::error::TrySendError::Full(_)) => {
-                                            metrics.webrtc_recv_overflow.inc();
-                                        }
-                                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                                            exit_reason = "session_dropped";
-                                            break;
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!(endpoint_id = %endpoint_id, error = %e, "UDP recv error");
-                                    exit_reason = "udp_error";
-                                    break;
-                                }
+                        result = s0.recv_from(&mut buf0) => {
+                            match forward_datagram(result, &buf0, la0, endpoint_id, &raw_recv, &metrics, &packet_tx) {
+                                RecvAction::Continue => {}
+                                RecvAction::Stop(reason) => { exit_reason = reason; break; }
+                            }
+                        }
+                        // Disabled (and never polled) when there's no second
+                        // socket. The async block is lazy, so the unwrap only
+                        // runs when `s1` is Some.
+                        result = async { s1.as_ref().unwrap().1.recv_from(&mut buf1).await }, if s1.is_some() => {
+                            let la1 = s1.as_ref().unwrap().0;
+                            match forward_datagram(result, &buf1, la1, endpoint_id, &raw_recv, &metrics, &packet_tx) {
+                                RecvAction::Continue => {}
+                                RecvAction::Stop(reason) => { exit_reason = reason; break; }
                             }
                         }
                         _ = token.cancelled() => {
@@ -389,16 +455,15 @@ impl WebRtcEndpoint {
         id: EndpointId,
         direction: EndpointDirection,
         offer_sdp: &str,
-        bind_addr: SocketAddr,
+        bind_addrs: &[SocketAddr],
         packet_tx: mpsc::Sender<InboundPacket>,
         metrics: Arc<Metrics>,
     ) -> anyhow::Result<(Self, String)> {
         let config = EndpointConfig { direction };
-        let mut endpoint = Self::new_with_socket(id, config, bind_addr, metrics).await?;
+        let mut endpoint = Self::new_with_socket(id, config, bind_addrs, metrics).await?;
 
-        // Add local ICE candidate
-        let candidate = Candidate::host(endpoint.local_addr, "udp")?;
-        endpoint.rtc.add_local_candidate(candidate);
+        // One ICE host candidate per bound socket (IPv4 and/or IPv6).
+        endpoint.add_host_candidates()?;
 
         // Parse SDP offer (try raw SDP string first, then JSON)
         let offer = SdpOffer::from_sdp_string(offer_sdp).or_else(|_| {
@@ -420,16 +485,15 @@ impl WebRtcEndpoint {
     pub async fn create_offer(
         id: EndpointId,
         direction: EndpointDirection,
-        bind_addr: SocketAddr,
+        bind_addrs: &[SocketAddr],
         packet_tx: mpsc::Sender<InboundPacket>,
         metrics: Arc<Metrics>,
     ) -> anyhow::Result<(Self, String)> {
         let config = EndpointConfig { direction };
-        let mut endpoint = Self::new_with_socket(id, config, bind_addr, metrics).await?;
+        let mut endpoint = Self::new_with_socket(id, config, bind_addrs, metrics).await?;
 
-        // Add local ICE candidate
-        let candidate = Candidate::host(endpoint.local_addr, "udp")?;
-        endpoint.rtc.add_local_candidate(candidate);
+        // One ICE host candidate per bound socket (IPv4 and/or IPv6).
+        endpoint.add_host_candidates()?;
 
         // SDP direction is always sendrecv — the mixing direction is enforced
         // by the routing table, not the transport layer. This ensures str0m
@@ -539,14 +603,18 @@ impl WebRtcEndpoint {
         Ok((offer_str, self.offer_generation))
     }
 
-    /// Feed a received UDP packet into the str0m state machine
+    /// Feed a received UDP packet into the str0m state machine. `local` is the
+    /// address of the socket the datagram arrived on — for dual-stack endpoints
+    /// this differs per family, and str0m must be told the correct destination
+    /// so it matches the right local ICE candidate base.
     pub fn handle_receive(
         &mut self,
         source: SocketAddr,
+        local: SocketAddr,
         data: &[u8],
         now: Instant,
     ) -> anyhow::Result<()> {
-        let receive = Receive::new(Protocol::Udp, source, self.local_addr, data)?;
+        let receive = Receive::new(Protocol::Udp, source, local, data)?;
         let input = Input::Receive(now, receive);
         self.rtc.handle_input(input)?;
         Ok(())
@@ -572,14 +640,36 @@ impl WebRtcEndpoint {
                     if self.state == EndpointState::Connected {
                         self.remote_addr = Some(transmit.destination);
                     }
-                    // Use non-blocking send to avoid spawning a task per packet.
-                    // UDP sends almost never block; if the socket isn't ready we
-                    // drop the packet (acceptable for real-time media).
-                    if let Err(e) = self
-                        .socket
-                        .try_send_to(&transmit.contents, transmit.destination)
+                    // Route by `transmit.source`: str0m sets it to the local
+                    // candidate base (== one of our bound socket addresses), so
+                    // for dual-stack we must send from the socket of the
+                    // nominated family. An unmatched source means the ICE state
+                    // is inconsistent with our sockets; drop + warn rather than
+                    // silently sending from the wrong family.
+                    match self
+                        .sockets
+                        .iter()
+                        .find(|(local, _)| *local == transmit.source)
                     {
-                        trace!(error = %e, "UDP send dropped (would block)");
+                        Some((_, socket)) => {
+                            // Non-blocking send to avoid spawning a task per
+                            // packet. UDP sends almost never block; if the socket
+                            // isn't ready we drop (acceptable for real-time media).
+                            if let Err(e) =
+                                socket.try_send_to(&transmit.contents, transmit.destination)
+                            {
+                                trace!(error = %e, "UDP send dropped (would block)");
+                            }
+                        }
+                        None => {
+                            warn!(
+                                endpoint_id = %self.id,
+                                source = %transmit.source,
+                                destination = %transmit.destination,
+                                "WebRTC transmit.source matches no bound socket — dropping \
+                                 (ICE state inconsistent with bound sockets)"
+                            );
+                        }
                     }
                 }
                 Output::Event(event) => match event {
@@ -804,7 +894,7 @@ mod tests {
         let mut ep = WebRtcEndpoint::create_offer(
             id,
             EndpointDirection::SendRecv,
-            bind_addr,
+            &[bind_addr],
             tx,
             metrics.clone(),
         )
@@ -844,7 +934,7 @@ mod tests {
             EndpointConfig {
                 direction: EndpointDirection::SendRecv,
             },
-            bind_addr,
+            &[bind_addr],
             metrics.clone(),
         )
         .await
@@ -880,7 +970,7 @@ mod tests {
         let mut ep = WebRtcEndpoint::create_offer(
             id,
             EndpointDirection::SendRecv,
-            bind_addr,
+            &[bind_addr],
             tx,
             metrics.clone(),
         )
@@ -1069,7 +1159,7 @@ mod tests {
         let (ep, offer_sdp) = WebRtcEndpoint::create_offer(
             id,
             EndpointDirection::RecvOnly,
-            bind_addr,
+            &[bind_addr],
             tx,
             Arc::new(Metrics::new()),
         )
@@ -1105,7 +1195,7 @@ mod tests {
         let (_ep, offer_sdp) = WebRtcEndpoint::create_offer(
             id,
             EndpointDirection::SendOnly,
-            bind_addr,
+            &[bind_addr],
             tx,
             Arc::new(Metrics::new()),
         )
@@ -1261,7 +1351,7 @@ mod tests {
         let (mut ep, _offer_sdp) = WebRtcEndpoint::create_offer(
             id,
             EndpointDirection::SendRecv,
-            bind_addr,
+            &[bind_addr],
             tx,
             Arc::new(Metrics::new()),
         )
@@ -1305,7 +1395,7 @@ mod tests {
         let (mut ep, _offer) = WebRtcEndpoint::create_offer(
             id,
             EndpointDirection::SendRecv,
-            bind_addr,
+            &[bind_addr],
             tx,
             Arc::new(Metrics::new()),
         )
@@ -1337,7 +1427,7 @@ mod tests {
         let (mut ep, _offer) = WebRtcEndpoint::create_offer(
             id,
             EndpointDirection::SendRecv,
-            bind_addr,
+            &[bind_addr],
             tx,
             Arc::new(Metrics::new()),
         )
@@ -1369,7 +1459,7 @@ mod tests {
         let (mut ep, _offer) = WebRtcEndpoint::create_offer(
             id,
             EndpointDirection::SendRecv,
-            bind_addr,
+            &[bind_addr],
             tx,
             Arc::new(Metrics::new()),
         )
@@ -1413,11 +1503,16 @@ mod tests {
         let (tx, _rx) = mpsc::channel(16);
         let metrics = Arc::new(Metrics::new());
 
-        let mut ep =
-            WebRtcEndpoint::create_offer(id, EndpointDirection::SendRecv, bind_addr, tx, metrics)
-                .await
-                .expect("create_offer should succeed")
-                .0;
+        let mut ep = WebRtcEndpoint::create_offer(
+            id,
+            EndpointDirection::SendRecv,
+            &[bind_addr],
+            tx,
+            metrics,
+        )
+        .await
+        .expect("create_offer should succeed")
+        .0;
 
         assert!(
             ep.ice_connection_state.is_none(),
@@ -1431,5 +1526,68 @@ mod tests {
         // The wire-level counters exist for WebRTC and start at zero.
         assert_eq!(wrapped.raw_recv_packets(), Some(0));
         assert_eq!(wrapped.raw_recv_bytes(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn test_create_offer_dual_stack_binds_both_families() {
+        // Probe IPv6 loopback; skip on environments without IPv6 rather than
+        // failing spuriously.
+        if UdpSocket::bind("[::1]:0").await.is_err() {
+            return;
+        }
+        let v4: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let v6: std::net::SocketAddr = "[::1]:0".parse().unwrap();
+        let (tx, _rx) = mpsc::channel(16);
+        let metrics = Arc::new(Metrics::new());
+
+        let (ep, offer) = WebRtcEndpoint::create_offer(
+            EndpointId::new_v4(),
+            EndpointDirection::SendRecv,
+            &[v4, v6],
+            tx,
+            metrics,
+        )
+        .await
+        .expect("dual-stack create_offer should succeed");
+
+        // One socket per family, in the order supplied; one ICE host candidate
+        // is registered per socket (add_host_candidates), so str0m offers both.
+        assert_eq!(ep.sockets.len(), 2, "should bind one socket per family");
+        assert!(ep.sockets[0].0.is_ipv4(), "first (primary) socket is IPv4");
+        assert!(ep.sockets[1].0.is_ipv6(), "second socket is IPv6");
+        assert_eq!(
+            ep.local_addr, ep.sockets[0].0,
+            "primary local_addr is the first bound socket"
+        );
+        assert_ne!(ep.sockets[0].0.port(), 0, "v4 socket got an OS port");
+        assert_ne!(ep.sockets[1].0.port(), 0, "v6 socket got an OS port");
+        assert!(
+            offer.contains("m=audio"),
+            "offer must contain an audio m-line"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_offer_single_family_binds_one_socket() {
+        let v4: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let (tx, _rx) = mpsc::channel(16);
+        let metrics = Arc::new(Metrics::new());
+
+        let (ep, _offer) = WebRtcEndpoint::create_offer(
+            EndpointId::new_v4(),
+            EndpointDirection::SendRecv,
+            &[v4],
+            tx,
+            metrics,
+        )
+        .await
+        .expect("single-family create_offer should succeed");
+
+        assert_eq!(
+            ep.sockets.len(),
+            1,
+            "single family binds exactly one socket"
+        );
+        assert_eq!(ep.local_addr, ep.sockets[0].0);
     }
 }

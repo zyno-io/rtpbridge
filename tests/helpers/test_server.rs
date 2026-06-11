@@ -38,6 +38,7 @@ pub struct TestServerBuilder {
     ws_ping_interval_secs: u64,
     max_file_download_bytes: u64,
     empty_session_timeout_secs: u64,
+    media_ip: Vec<IpAddr>,
 }
 
 impl Default for TestServerBuilder {
@@ -55,6 +56,7 @@ impl Default for TestServerBuilder {
             ws_ping_interval_secs: 30,
             max_file_download_bytes: 100 * 1024 * 1024,
             empty_session_timeout_secs: 0,
+            media_ip: vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
         }
     }
 }
@@ -63,6 +65,13 @@ impl TestServerBuilder {
     pub fn media_dir(mut self, dir: &str) -> Self {
         std::fs::create_dir_all(dir).ok();
         self.media_dir = Some(dir.to_string());
+        self
+    }
+
+    /// Override the media-plane bind IP(s). Pass one address, or an IPv4 + IPv6
+    /// pair for dual-stack.
+    pub fn media_ip(mut self, ips: Vec<IpAddr>) -> Self {
+        self.media_ip = ips;
         self
     }
 
@@ -135,6 +144,7 @@ impl TestServerBuilder {
         let builder_max_connections = self.max_connections;
         let builder_ws_ping_interval_secs = self.ws_ping_interval_secs;
         let builder_max_file_download_bytes = self.max_file_download_bytes;
+        let media_ip = self.media_ip;
 
         const MAX_ATTEMPTS: usize = 3;
         for attempt in 0..MAX_ATTEMPTS {
@@ -162,7 +172,7 @@ impl TestServerBuilder {
 
             let config = Config {
                 listen: vec![listen_addr],
-                media_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                media_ip: media_ip.clone(),
                 rtp_port_range,
                 disconnect_timeout_secs,
                 shutdown_max_wait_secs: 86400,
@@ -199,7 +209,7 @@ impl TestServerBuilder {
             let manager = SessionManager::new(
                 shutdown.clone(),
                 config.disconnect_timeout_secs,
-                config.media_ip,
+                config.media_ip.clone(),
                 config.rtp_port_range,
                 config.max_sessions,
                 config.max_endpoints_per_session,

@@ -29,7 +29,7 @@ use tracing::{Instrument, error, warn};
 
 use crate::control::protocol::*;
 use crate::metrics::Metrics;
-use crate::net::socket_pool::SocketPool;
+use crate::net::socket_pool::MediaBindings;
 use crate::playback::file_cache::FileCache;
 use crate::shutdown::ShutdownCoordinator;
 
@@ -65,8 +65,7 @@ pub struct SessionManager {
     sessions: DashMap<SessionId, Session>,
     shutdown: ShutdownCoordinator,
     disconnect_timeout_secs: u64,
-    media_ip: IpAddr,
-    socket_pool: Arc<SocketPool>,
+    media_bindings: Arc<MediaBindings>,
     max_sessions: usize,
     max_endpoints_per_session: usize,
     max_recordings_per_session: usize,
@@ -93,7 +92,7 @@ impl SessionManager {
     pub fn new(
         shutdown: ShutdownCoordinator,
         disconnect_timeout_secs: u64,
-        media_ip: IpAddr,
+        media_ip: Vec<IpAddr>,
         rtp_port_range: (u16, u16),
         max_sessions: usize,
         max_endpoints_per_session: usize,
@@ -110,8 +109,10 @@ impl SessionManager {
         metrics: Arc<Metrics>,
         recording_dir: PathBuf,
     ) -> anyhow::Result<Arc<Self>> {
-        let socket_pool = Arc::new(SocketPool::new(
-            media_ip,
+        // One socket pool per configured media IP (≤1 per family), over the same
+        // RTP port range. Shared across all sessions.
+        let media_bindings = Arc::new(MediaBindings::new(
+            &media_ip,
             rtp_port_range.0,
             rtp_port_range.1,
         )?);
@@ -119,8 +120,7 @@ impl SessionManager {
             sessions: DashMap::new(),
             shutdown,
             disconnect_timeout_secs,
-            media_ip,
-            socket_pool,
+            media_bindings,
             max_sessions,
             max_endpoints_per_session,
             max_recordings_per_session,
@@ -190,8 +190,7 @@ impl SessionManager {
         // Spawn the media session task
         let manager = Arc::clone(self);
         let session_id = id;
-        let media_ip = self.media_ip;
-        let socket_pool = Arc::clone(&self.socket_pool);
+        let media_bindings = Arc::clone(&self.media_bindings);
         let media_dir = self.media_dir.clone();
         let file_cache = Arc::clone(&self.file_cache);
         let max_endpoints = self.max_endpoints_per_session;
@@ -235,8 +234,7 @@ impl SessionManager {
                 }));
                 let result = std::panic::AssertUnwindSafe(media_session::run_media_session(
                     session_id,
-                    media_ip,
-                    socket_pool,
+                    media_bindings,
                     media_dir,
                     file_cache,
                     endpoint_count.clone(),
@@ -424,8 +422,10 @@ impl SessionManager {
         self.disconnect_timeout_secs.saturating_mul(1000)
     }
 
-    pub fn media_ip(&self) -> IpAddr {
-        self.media_ip
+    /// All configured media-plane bind IPs (≤1 per family). Surfaced in
+    /// `server.info`.
+    pub fn media_ips(&self) -> Vec<IpAddr> {
+        self.media_bindings.ips().collect()
     }
 
     /// Query a session's detailed state (endpoints, recordings, VAD)
@@ -473,8 +473,8 @@ mod tests {
     fn test_manager() -> Arc<SessionManager> {
         let shutdown = ShutdownCoordinator::new();
         let metrics = Arc::new(Metrics::new());
-        let socket_pool = Arc::new(
-            SocketPool::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 30000, 30100).unwrap(),
+        let media_bindings = Arc::new(
+            MediaBindings::new(&[IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)], 30000, 30100).unwrap(),
         );
         let file_cache =
             Arc::new(FileCache::new(std::env::temp_dir().join("rtpbridge_test_cache")).unwrap());
@@ -482,8 +482,7 @@ mod tests {
             sessions: DashMap::new(),
             shutdown,
             disconnect_timeout_secs: 300,
-            media_ip: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            socket_pool,
+            media_bindings,
             max_sessions: 0,
             max_endpoints_per_session: 0,
             max_recordings_per_session: 100,

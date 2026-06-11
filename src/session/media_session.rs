@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -48,7 +48,7 @@ fn endpoint_type_label(endpoint: &Endpoint) -> &'static str {
     }
 }
 
-use crate::net::socket_pool::SocketPool;
+use crate::net::socket_pool::{MediaBinding, MediaBindings};
 use crate::recording::recorder::RecordingManager;
 
 /// Bundle of endpoint state for cross-session transfer
@@ -272,8 +272,7 @@ use tokio::sync::oneshot;
 /// and keep the select! loop thin.
 struct SessionState {
     session_id: SessionId,
-    media_ip: IpAddr,
-    socket_pool: Arc<SocketPool>,
+    media_bindings: Arc<MediaBindings>,
     media_dir: Option<std::path::PathBuf>,
     file_cache: Arc<crate::playback::file_cache::FileCache>,
     endpoint_count: Arc<std::sync::atomic::AtomicUsize>,
@@ -707,6 +706,26 @@ impl SessionState {
 
     // ── Endpoint creation ───────────────────────────────────────────
 
+    /// Choose the media binding for a plain-RTP endpoint that is answering a
+    /// remote offer. Matches the remote SDP connection-address family exactly; if
+    /// the remote announced a family we did not bind, returns an error rather than
+    /// answering with an unreachable address of the other family. When the remote
+    /// has no usable connection address, falls back to the primary binding.
+    fn select_rtp_binding(&self, remote: Option<SocketAddr>) -> anyhow::Result<&MediaBinding> {
+        match remote {
+            Some(addr) => {
+                let want_v6 = addr.is_ipv6();
+                self.media_bindings.for_family(want_v6).ok_or_else(|| {
+                    let fam = if want_v6 { "IPv6" } else { "IPv4" };
+                    anyhow::anyhow!(
+                        "remote SDP requests {fam} media but no {fam} address is bound (media_ip)"
+                    )
+                })
+            }
+            None => Ok(self.media_bindings.primary()),
+        }
+    }
+
     async fn handle_create_from_offer(
         &mut self,
         packet_tx: &mpsc::Sender<InboundPacket>,
@@ -737,12 +756,17 @@ impl SessionState {
         }
 
         let (answer, te_pt) = if parsed.is_webrtc {
-            let ep_bind = SocketAddr::new(self.media_ip, 0);
+            // WebRTC offers a host candidate per bound family; ICE nominates one.
+            let bind_addrs: Vec<SocketAddr> = self
+                .media_bindings
+                .ips()
+                .map(|ip| SocketAddr::new(ip, 0))
+                .collect();
             let (ep, answer) = WebRtcEndpoint::from_offer(
                 id,
                 direction,
                 sdp_str,
-                ep_bind,
+                &bind_addrs,
                 packet_tx.clone(),
                 self.metrics.clone(),
             )
@@ -758,15 +782,13 @@ impl SessionState {
             self.endpoints.insert(id, Endpoint::WebRtc(Box::new(ep)));
             (answer, Some(101u8))
         } else {
-            let pair = self.socket_pool.allocate_pair().await?;
-            let (ep, answer) = RtpEndpoint::from_offer(
-                id,
-                direction,
-                sdp_str,
-                pair,
-                self.media_ip,
-                packet_tx.clone(),
-            )?;
+            // Match the remote SDP's address family; reject if we didn't bind it.
+            let binding = self.select_rtp_binding(parsed.remote_addr)?;
+            let bind_ip = binding.ip;
+            let pool = Arc::clone(&binding.pool);
+            let pair = pool.allocate_pair().await?;
+            let (ep, answer) =
+                RtpEndpoint::from_offer(id, direction, sdp_str, pair, bind_ip, packet_tx.clone())?;
             let te = ep.telephone_event_pt;
             info!(
                 session_id = %self.session_id,
@@ -809,11 +831,16 @@ impl SessionState {
 
         let (offer, te_pt) = match endpoint_type {
             EndpointType::Webrtc => {
-                let ep_bind = SocketAddr::new(self.media_ip, 0);
+                // WebRTC offers a host candidate per bound family; ICE nominates one.
+                let bind_addrs: Vec<SocketAddr> = self
+                    .media_bindings
+                    .ips()
+                    .map(|ip| SocketAddr::new(ip, 0))
+                    .collect();
                 let (ep, offer) = WebRtcEndpoint::create_offer(
                     id,
                     direction,
-                    ep_bind,
+                    &bind_addrs,
                     packet_tx.clone(),
                     self.metrics.clone(),
                 )
@@ -830,7 +857,12 @@ impl SessionState {
                 (offer, Some(101u8))
             }
             EndpointType::Rtp => {
-                let pair = self.socket_pool.allocate_pair().await?;
+                // No remote yet and a plain-RTP offer carries a single c= line —
+                // advertise the primary (v4-preferred) binding.
+                let binding = self.media_bindings.primary();
+                let bind_ip = binding.ip;
+                let pool = Arc::clone(&binding.pool);
+                let pair = pool.allocate_pair().await?;
                 let all_codecs = vec![
                     sdp::CODEC_PCMU,
                     sdp::CODEC_G722,
@@ -852,7 +884,7 @@ impl SessionState {
                     id,
                     direction,
                     pair,
-                    self.media_ip,
+                    bind_ip,
                     &offer_codecs,
                     srtp,
                     packet_tx.clone(),
@@ -2362,8 +2394,7 @@ impl SessionState {
 #[allow(clippy::too_many_arguments)]
 pub async fn run_media_session(
     session_id: SessionId,
-    media_ip: IpAddr,
-    socket_pool: Arc<SocketPool>,
+    media_bindings: Arc<MediaBindings>,
     media_dir: Option<std::path::PathBuf>,
     file_cache: Arc<crate::playback::file_cache::FileCache>,
     endpoint_count: Arc<std::sync::atomic::AtomicUsize>,
@@ -2400,8 +2431,7 @@ pub async fn run_media_session(
 
     let mut state = SessionState {
         session_id,
-        media_ip,
-        socket_pool,
+        media_bindings,
         media_dir,
         file_cache,
         endpoint_count,
@@ -2797,7 +2827,11 @@ fn handle_inbound_packet(
     if let Some(ep) = endpoints.get_mut(&pkt.endpoint_id) {
         match ep {
             Endpoint::WebRtc(wep) => {
-                if let Err(e) = wep.handle_receive(pkt.source, &pkt.data, now) {
+                // Dual-stack: a datagram is tagged with the socket (local addr)
+                // it arrived on; fall back to the primary local addr for
+                // single-socket endpoints (which leave `local` unset).
+                let local = pkt.local.unwrap_or(wep.local_addr);
+                if let Err(e) = wep.handle_receive(pkt.source, local, &pkt.data, now) {
                     metrics.webrtc_packet_errors.inc();
                     if !wep.packet_error_warned {
                         wep.packet_error_warned = true;
@@ -3526,14 +3560,8 @@ mod tests {
         let (cmd_tx, _cmd_rx) = mpsc::channel(16);
         SessionState {
             session_id: SessionId::new_v4(),
-            media_ip: "127.0.0.1".parse().unwrap(),
-            socket_pool: Arc::new(
-                crate::net::socket_pool::SocketPool::new(
-                    "127.0.0.1".parse().unwrap(),
-                    50000,
-                    50100,
-                )
-                .unwrap(),
+            media_bindings: Arc::new(
+                MediaBindings::new(&["127.0.0.1".parse().unwrap()], 50000, 50100).unwrap(),
             ),
             media_dir: None,
             file_cache: Arc::new(
@@ -4508,6 +4536,7 @@ mod tests {
             source: "10.0.0.1:20001".parse().unwrap(),
             data: rtcp_data,
             is_rtcp: true,
+            local: None,
         };
 
         let (rtp, rtcp, _bye) =
@@ -4559,6 +4588,7 @@ mod tests {
             source: "10.0.0.1:20000".parse().unwrap(),
             data: rtp_data,
             is_rtcp: false,
+            local: None,
         };
 
         let (rtp, rtcp, _bye) =
@@ -4567,6 +4597,94 @@ mod tests {
         assert!(
             rtcp.is_none(),
             "RTP packet should not produce RTCP recording"
+        );
+    }
+
+    /// Minimal plain-RTP offer for a given connection family.
+    fn rtp_family_offer(is_v6: bool) -> String {
+        let (ver, addr) = if is_v6 {
+            ("IP6", "::1")
+        } else {
+            ("IP4", "127.0.0.1")
+        };
+        format!(
+            "v=0\r\n\
+             o=- 1 1 IN {ver} {addr}\r\n\
+             s=-\r\n\
+             c=IN {ver} {addr}\r\n\
+             t=0 0\r\n\
+             m=audio 20000 RTP/AVP 0 101\r\n\
+             a=rtpmap:0 PCMU/8000\r\n\
+             a=rtpmap:101 telephone-event/8000\r\n\
+             a=sendrecv\r\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn test_create_from_offer_rejects_unbound_address_family() {
+        // The default test session binds only IPv4. A plain-RTP offer with an
+        // IPv6 c= line must be rejected, not answered with an unreachable IPv4
+        // address.
+        let mut state = test_session_state();
+        let (tx, _rx) = mpsc::channel(16);
+
+        let err = state
+            .handle_create_from_offer(
+                &tx,
+                &rtp_family_offer(true),
+                EndpointDirection::SendRecv,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("IPv6"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_create_from_offer_dual_stack_answers_matching_family() {
+        // Skip if there's no IPv6 loopback to bind a ::1 pool on.
+        if tokio::net::UdpSocket::bind("[::1]:0").await.is_err() {
+            return;
+        }
+        let mut state = test_session_state();
+        state.media_bindings = Arc::new(
+            MediaBindings::new(
+                &["127.0.0.1".parse().unwrap(), "::1".parse().unwrap()],
+                55200,
+                55400,
+            )
+            .unwrap(),
+        );
+        let (tx, _rx) = mpsc::channel(16);
+
+        // IPv6 offer → IPv6 answer, allocated from the v6 pool.
+        let (_id6, answer6) = state
+            .handle_create_from_offer(
+                &tx,
+                &rtp_family_offer(true),
+                EndpointDirection::SendRecv,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            answer6.contains("c=IN IP6"),
+            "IPv6 offer must get an IPv6 answer; answer:\n{answer6}"
+        );
+
+        // IPv4 offer → IPv4 answer.
+        let (_id4, answer4) = state
+            .handle_create_from_offer(
+                &tx,
+                &rtp_family_offer(false),
+                EndpointDirection::SendRecv,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            answer4.contains("c=IN IP4"),
+            "IPv4 offer must get an IPv4 answer; answer:\n{answer4}"
         );
     }
 }

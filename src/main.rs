@@ -34,7 +34,7 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(filter)
         .with_target(true)
         .init();
-    info!(listen = ?config.listen, media_ip = %config.media_ip, "rtpbridge starting");
+    info!(listen = ?config.listen, media_ip = ?config.media_ip, "rtpbridge starting");
 
     if config.max_sessions == 0 {
         warn!(
@@ -113,7 +113,7 @@ async fn main() -> anyhow::Result<()> {
     let manager = SessionManager::new(
         shutdown.clone(),
         config.disconnect_timeout_secs,
-        config.media_ip,
+        config.media_ip.clone(),
         config.rtp_port_range,
         config.max_sessions,
         config.max_endpoints_per_session,

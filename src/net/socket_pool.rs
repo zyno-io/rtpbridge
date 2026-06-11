@@ -1,4 +1,5 @@
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
 
 use tokio::net::UdpSocket;
@@ -128,6 +129,62 @@ impl SocketPool {
                 return current;
             }
         }
+    }
+}
+
+/// One local media binding: an address family's advertised IP and its socket
+/// pool. RTP/SRTP endpoints allocate their port pair from `pool`, and the SDP
+/// `c=` line advertises `ip`.
+#[derive(Clone)]
+pub struct MediaBinding {
+    pub ip: IpAddr,
+    pub pool: Arc<SocketPool>,
+}
+
+/// The set of local media bindings — at most one IPv4 and one IPv6. Built once
+/// from the configured `media_ip` list and shared across all sessions.
+pub struct MediaBindings {
+    bindings: Vec<MediaBinding>,
+}
+
+impl MediaBindings {
+    /// Build one [`SocketPool`] per configured media IP over the same RTP port
+    /// range. Binding port N on IPv4 and on IPv6 are independent sockets, so the
+    /// families share the range without colliding.
+    pub fn new(media_ips: &[IpAddr], port_start: u16, port_end: u16) -> anyhow::Result<Self> {
+        if media_ips.is_empty() {
+            anyhow::bail!("media_ips must contain at least one address");
+        }
+        let mut bindings = Vec::with_capacity(media_ips.len());
+        for &ip in media_ips {
+            let pool = Arc::new(SocketPool::new(ip, port_start, port_end)?);
+            bindings.push(MediaBinding { ip, pool });
+        }
+        Ok(Self { bindings })
+    }
+
+    /// Exact-family lookup: the binding for the requested family, or `None` if
+    /// that family isn't bound. Never substitutes the other family — answering a
+    /// peer on a family we did not bind yields an unreachable media path, so
+    /// callers must reject instead of falling back.
+    pub fn for_family(&self, want_v6: bool) -> Option<&MediaBinding> {
+        self.bindings.iter().find(|b| b.ip.is_ipv6() == want_v6)
+    }
+
+    /// The binding to use when there is no known remote family: locally generated
+    /// plain-RTP offers (a single `c=` line) and WebRTC (which binds every
+    /// configured family anyway). IPv4 is preferred, else the sole binding.
+    pub fn primary(&self) -> &MediaBinding {
+        self.bindings
+            .iter()
+            .find(|b| b.ip.is_ipv4())
+            .unwrap_or(&self.bindings[0])
+    }
+
+    /// All bound media IPs — used to build WebRTC bind addresses (one socket per
+    /// family).
+    pub fn ips(&self) -> impl Iterator<Item = IpAddr> + '_ {
+        self.bindings.iter().map(|b| b.ip)
     }
 }
 
@@ -414,5 +471,44 @@ mod tests {
             next, 65530,
             "counter should wrap to port_start, not overflow"
         );
+    }
+
+    #[test]
+    fn test_media_bindings_for_family_exact() {
+        let v4: IpAddr = "127.0.0.1".parse().unwrap();
+        let v6: IpAddr = "::1".parse().unwrap();
+        let mb = MediaBindings::new(&[v4, v6], 41400, 41500).unwrap();
+
+        assert_eq!(mb.for_family(false).unwrap().ip, v4);
+        assert_eq!(mb.for_family(true).unwrap().ip, v6);
+    }
+
+    #[test]
+    fn test_media_bindings_for_family_absent_is_none() {
+        let v4: IpAddr = "127.0.0.1".parse().unwrap();
+        let mb = MediaBindings::new(&[v4], 41500, 41600).unwrap();
+
+        assert_eq!(mb.for_family(false).unwrap().ip, v4);
+        // No IPv6 bound — exact lookup must return None, never substitute v4.
+        assert!(mb.for_family(true).is_none());
+    }
+
+    #[test]
+    fn test_media_bindings_primary_prefers_v4() {
+        let v4: IpAddr = "127.0.0.1".parse().unwrap();
+        let v6: IpAddr = "::1".parse().unwrap();
+
+        // Order shouldn't matter: v4 is always primary when present.
+        let mb = MediaBindings::new(&[v6, v4], 41600, 41700).unwrap();
+        assert_eq!(mb.primary().ip, v4);
+
+        // v6-only → the sole binding is primary.
+        let mb6 = MediaBindings::new(&[v6], 41700, 41800).unwrap();
+        assert_eq!(mb6.primary().ip, v6);
+    }
+
+    #[test]
+    fn test_media_bindings_empty_rejected() {
+        assert!(MediaBindings::new(&[], 41800, 41900).is_err());
     }
 }

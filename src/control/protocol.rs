@@ -141,7 +141,10 @@ pub struct ServerInfoParams {}
 #[derive(Debug, Serialize)]
 pub struct ServerInfoResult {
     pub hostname: String,
-    pub media_ip: std::net::IpAddr,
+    /// All configured media-plane bind IPs (≤1 per family). This is an array to
+    /// support dual-stack (IPv4 + IPv6); it was a scalar `IpAddr` before
+    /// dual-stack support.
+    pub media_ip: Vec<std::net::IpAddr>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -67,6 +67,7 @@ impl BridgeEndpoint {
             source: "0.0.0.0:0".parse().unwrap(), // bridge packets have no real source addr
             data: packet.payload.clone(),
             is_rtcp: false,
+            local: None,
         };
 
         // Non-blocking send — drop on backpressure rather than blocking the routing loop

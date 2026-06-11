@@ -15,7 +15,8 @@ cargo test
 - **Session model**: 1 WS connection = 1 session. Orphan timeout on disconnect, `session.attach` to reclaim.
 - **Endpoint types**: WebRTC (str0m), Plain RTP/SRTP, File playback, Tone generator, WebSocket audio, Bridge
 - **Threading**: One tokio task per session. All endpoints in a session share the task. No Arc/Mutex on str0m Rtc instances.
-- **UDP sockets**: Per socket-backed endpoint (not shared mux). WebRTC binds one OS-assigned UDP port; plain RTP/SRTP binds an even/odd RTP/RTCP pair from `rtp_port_range`. File, tone, bridge, and WebSocket endpoints do not allocate RTP ports.
+- **UDP sockets**: Per socket-backed endpoint (not shared mux). WebRTC binds one OS-assigned UDP port per configured `media_ip` family; plain RTP/SRTP binds an even/odd RTP/RTCP pair from `rtp_port_range`. File, tone, bridge, and WebSocket endpoints do not allocate RTP ports.
+- **Dual-stack**: `media_ip` is a list (≤1 IPv4, ≤1 IPv6, via `MediaBindings` in `net/socket_pool.rs`). Plain RTP picks the family matching the remote SDP `c=` line (rejects an unbound/known family, and rejects a family flip on re-negotiation — no socket migration); WebRTC offers a host candidate per family and lets ICE nominate. `server.info`'s `media_ip` is an array. PCAP recording stays IPv4-synthetic.
 - **Routing**: Auto-rebuilt routing table respecting sendrecv/recvonly/sendonly/inactive directions.
 - **Mixing**: Per-destination audio mixer for 3+ party conferences. When a destination receives from 2+ sources, all sources are decoded to PCM, summed with saturation, and re-encoded with monotonic timestamps. With exactly 1 source, packets are forwarded directly (passthrough/transcode). Mixer state lives in `session/mixer.rs`; lifecycle managed by `rebuild_mixers()` on routing table changes.
 

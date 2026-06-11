@@ -124,11 +124,17 @@ async fn test_server_info() {
         .as_str()
         .expect("hostname should be a string");
     assert!(!hostname.is_empty(), "hostname must be non-empty: {resp}");
+    // media_ip is an array (dual-stack support): at most one IPv4 + one IPv6.
+    let media_ips = resp["result"]["media_ip"]
+        .as_array()
+        .expect("media_ip should be an array");
     assert_eq!(
-        resp["result"]["media_ip"]
-            .as_str()
-            .expect("media_ip should be a string"),
-        "127.0.0.1"
+        media_ips
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>(),
+        vec!["127.0.0.1"],
+        "test server binds a single IPv4 media address: {resp}"
     );
 
     ws.close(None).await.ok();

@@ -67,7 +67,7 @@ websocat ws://localhost:9100
 
 ```toml
 listen = "0.0.0.0:9100"
-media_ip = "203.0.113.5"
+media_ip = "203.0.113.5"            # or "203.0.113.5, 2001:db8::5" for dual-stack
 rtp_port_range = [30000, 39999]
 disconnect_timeout_secs = 30
 shutdown_max_wait_secs = 300

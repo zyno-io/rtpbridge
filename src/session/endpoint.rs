@@ -14,6 +14,11 @@ pub struct InboundPacket {
     pub data: Vec<u8>,
     /// True when the packet arrived on the dedicated RTCP socket (not the RTP socket)
     pub is_rtcp: bool,
+    /// The local socket address the datagram arrived on. Only set by dual-socket
+    /// endpoints (WebRTC) that bind one socket per address family, so the
+    /// receiver can tell str0m the correct `destination`. `None` for
+    /// single-socket / non-str0m endpoints, which ignore it.
+    pub local: Option<std::net::SocketAddr>,
 }
 
 /// An RTP packet routed between endpoints (post-decryption)

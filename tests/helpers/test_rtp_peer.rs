@@ -27,7 +27,23 @@ pub struct TestRtpPeer {
 
 impl TestRtpPeer {
     pub async fn new() -> Self {
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        Self::bind("127.0.0.1:0").await
+    }
+
+    /// IPv6-loopback variant. Binds `[::1]:0`; callers should skip the test if
+    /// this returns `None` (host has no IPv6 loopback).
+    pub async fn new_v6() -> Option<Self> {
+        match UdpSocket::bind("[::1]:0").await {
+            Ok(socket) => Some(Self::from_socket(socket)),
+            Err(_) => None,
+        }
+    }
+
+    async fn bind(addr: &str) -> Self {
+        Self::from_socket(UdpSocket::bind(addr).await.unwrap())
+    }
+
+    fn from_socket(socket: UdpSocket) -> Self {
         let local_addr = socket.local_addr().unwrap();
         Self {
             socket: Arc::new(socket),
@@ -49,19 +65,29 @@ impl TestRtpPeer {
         self.remote_addr = Some(addr);
     }
 
+    /// SDP connection family token (`IP4`/`IP6`) for this peer's address.
+    fn sdp_family(&self) -> &'static str {
+        if self.local_addr.is_ipv4() {
+            "IP4"
+        } else {
+            "IP6"
+        }
+    }
+
     /// Build a plain RTP/AVP SDP offer pointing to this peer's address
     pub fn make_sdp_offer(&self) -> String {
         format!(
             "v=0\r\n\
-             o=- 100 1 IN IP4 {ip}\r\n\
+             o=- 100 1 IN {fam} {ip}\r\n\
              s=-\r\n\
-             c=IN IP4 {ip}\r\n\
+             c=IN {fam} {ip}\r\n\
              t=0 0\r\n\
              m=audio {port} RTP/AVP 0 101\r\n\
              a=rtpmap:0 PCMU/8000\r\n\
              a=rtpmap:101 telephone-event/8000\r\n\
              a=fmtp:101 0-16\r\n\
              a=sendrecv\r\n",
+            fam = self.sdp_family(),
             ip = self.local_addr.ip(),
             port = self.local_addr.port(),
         )
@@ -71,15 +97,16 @@ impl TestRtpPeer {
     pub fn make_sdp_answer(&self) -> String {
         format!(
             "v=0\r\n\
-             o=- 200 1 IN IP4 {ip}\r\n\
+             o=- 200 1 IN {fam} {ip}\r\n\
              s=-\r\n\
-             c=IN IP4 {ip}\r\n\
+             c=IN {fam} {ip}\r\n\
              t=0 0\r\n\
              m=audio {port} RTP/AVP 0 101\r\n\
              a=rtpmap:0 PCMU/8000\r\n\
              a=rtpmap:101 telephone-event/8000\r\n\
              a=fmtp:101 0-16\r\n\
              a=sendrecv\r\n",
+            fam = self.sdp_family(),
             ip = self.local_addr.ip(),
             port = self.local_addr.port(),
         )
@@ -340,7 +367,10 @@ pub fn parse_rtp_addr_from_sdp(sdp: &str) -> Option<SocketAddr> {
     let mut port = 0u16;
     for line in sdp.lines() {
         let line = line.trim();
-        if let Some(addr) = line.strip_prefix("c=IN IP4 ") {
+        if let Some(addr) = line
+            .strip_prefix("c=IN IP4 ")
+            .or_else(|| line.strip_prefix("c=IN IP6 "))
+        {
             ip = addr.to_string();
         }
         if line.starts_with("m=audio ") {

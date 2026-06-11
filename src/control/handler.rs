@@ -381,7 +381,7 @@ fn handle_server_info(id: String, manager: &Arc<SessionManager>) -> Response {
         id,
         ServerInfoResult {
             hostname: server_hostname(),
-            media_ip: manager.media_ip(),
+            media_ip: manager.media_ips(),
         },
     )
 }

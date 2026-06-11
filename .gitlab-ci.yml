@@ -166,6 +166,43 @@ build:main:
     buildah push ${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHA}
     buildah push ${CI_REGISTRY_IMAGE}:main
 
+# Standalone PCAP-recording -> WAV decoder, published as a downloadable artifact.
+# Built as a FULLY STATIC musl binary so it runs anywhere with no libopus/libssl/
+# glibc dependency: musl statically links libc, openssl is vendored (built from
+# source, linked statically), and libopus is linked statically via pkg-config.
+build:pcap2audio:
+  stage: build
+  image: rust:1.94-alpine
+  dependencies: []
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH == "main"
+  variables:
+    OPUS_VERSION: "1.5.2"
+    # Make pkg-config emit static link flags for libopus, and find the libopus we
+    # build below.
+    PKG_CONFIG_ALL_STATIC: "1"
+    PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
+  before_script:
+    # build-base+perl: vendored OpenSSL build; file: the static-link gate; curl: fetch libopus.
+    - apk add --no-cache build-base perl pkgconf linux-headers file curl
+    # Build a static libopus from source so the link doesn't depend on distro
+    # packaging shipping a .a (deterministic across Alpine versions).
+    - curl -sSL "https://downloads.xiph.org/releases/opus/opus-${OPUS_VERSION}.tar.gz" | tar xz
+    - cd "opus-${OPUS_VERSION}" && ./configure --disable-shared --enable-static --prefix=/usr/local && make -j"$(nproc)" && make install && cd ..
+  script:
+    - cargo build --release --bin pcap2audio --features vendored-openssl
+    - install -m 0755 target/release/pcap2audio pcap2audio
+    - file pcap2audio
+    # Hard gate: fail loudly if it didn't link fully static (rather than ship a
+    # binary that silently needs libopus/libssl/glibc at runtime).
+    - file pcap2audio | grep -q "statically linked" || { echo "ERROR: pcap2audio is not statically linked"; exit 1; }
+  artifacts:
+    name: "pcap2audio-${CI_COMMIT_SHORT_SHA}"
+    paths:
+      - pcap2audio
+    expire_in: 30 days
+
 build:release:
   extends: .build-base
   stage: release

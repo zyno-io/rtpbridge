@@ -196,7 +196,11 @@ build:pcap2audio:
     - file pcap2audio
     # Hard gate: fail loudly if it didn't link fully static (rather than ship a
     # binary that silently needs libopus/libssl/glibc at runtime).
-    - file pcap2audio | grep -q "statically linked" || { echo "ERROR: pcap2audio is not statically linked"; exit 1; }
+    - |
+      if ! file pcap2audio | grep -q "statically linked"; then
+        echo "ERROR: pcap2audio is not statically linked"
+        exit 1
+      fi
   artifacts:
     name: "pcap2audio-${CI_COMMIT_SHORT_SHA}"
     paths:

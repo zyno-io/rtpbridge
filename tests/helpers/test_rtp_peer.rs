@@ -121,6 +121,14 @@ impl TestRtpPeer {
         self.timestamp = self.timestamp.wrapping_add(160);
     }
 
+    /// Send a PCMU packet with an explicit sequence number and timestamp, for
+    /// out-of-order / jitter tests where the caller controls arrival order.
+    pub async fn send_pcmu_with_seq(&mut self, seq: u16, timestamp: u32, payload: &[u8]) {
+        let remote = self.remote_addr.expect("remote address not set");
+        let packet = build_rtp_packet(0, seq, timestamp, self.ssrc, false, payload);
+        self.socket.send_to(&packet, remote).await.unwrap();
+    }
+
     /// Send an RFC 4733 DTMF event packet
     pub async fn send_dtmf_event(&mut self, event_id: u8, end: bool, duration: u16) {
         let remote = self.remote_addr.expect("remote address not set");

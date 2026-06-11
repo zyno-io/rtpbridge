@@ -1,12 +1,54 @@
 use std::io::Write;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use pcap_file::pcap::{PcapHeader, PcapPacket, PcapWriter};
 
-/// Builds a synthetic Ethernet + IPv4 + UDP frame wrapping an RTP/RTCP payload.
-/// This allows PCAP files to be opened in Wireshark with proper protocol dissection.
+/// Builds an Ethernet + IP + UDP frame wrapping an RTP/RTCP payload so the PCAP
+/// opens in Wireshark with proper protocol dissection. The IP family follows the
+/// addresses: a real IPv4 or IPv6 header is emitted (both endpoints of one frame
+/// always share a family — the dual-stack guards forbid a v4/v6 mix). A stray
+/// mismatch defensively falls back to the IPv4 path with the IPv6 side folded.
 pub fn build_pcap_frame(src_addr: SocketAddr, dst_addr: SocketAddr, payload: &[u8]) -> Vec<u8> {
+    match (src_addr.ip(), dst_addr.ip()) {
+        (IpAddr::V6(src), IpAddr::V6(dst)) => {
+            build_ipv6_frame(src, src_addr.port(), dst, dst_addr.port(), payload)
+        }
+        (src, dst) => build_ipv4_frame(
+            ipv4_octets(src),
+            src_addr.port(),
+            ipv4_octets(dst),
+            dst_addr.port(),
+            payload,
+        ),
+    }
+}
+
+/// IPv4 octets for an address. A V6 address (only reached on a defensive
+/// family-mismatch fallback) is XOR-folded into a synthetic `10.x.x.x`.
+fn ipv4_octets(ip: IpAddr) -> [u8; 4] {
+    match ip {
+        IpAddr::V4(ip) => ip.octets(),
+        IpAddr::V6(ip) => {
+            let b = ip.octets();
+            [
+                10,
+                b[0] ^ b[1] ^ b[2] ^ b[3] ^ b[4] ^ b[5],
+                b[6] ^ b[7] ^ b[8] ^ b[9] ^ b[10],
+                b[11] ^ b[12] ^ b[13] ^ b[14] ^ b[15],
+            ]
+        }
+    }
+}
+
+/// Ethernet + IPv4 + UDP frame. UDP checksum 0 is legal for IPv4.
+fn build_ipv4_frame(
+    src_ip: [u8; 4],
+    src_port: u16,
+    dst_ip: [u8; 4],
+    dst_port: u16,
+    payload: &[u8],
+) -> Vec<u8> {
     let mut buf = Vec::with_capacity(14 + 20 + 8 + payload.len());
 
     // Ethernet header (14 bytes) — dummy MACs, EtherType = IPv4
@@ -16,29 +58,6 @@ pub fn build_pcap_frame(src_addr: SocketAddr, dst_addr: SocketAddr, payload: &[u
 
     // IPv4 header (20 bytes, no options)
     let total_len = (20 + 8 + payload.len()).min(u16::MAX as usize) as u16;
-    let src_ip = match src_addr.ip() {
-        std::net::IpAddr::V4(ip) => ip.octets(),
-        std::net::IpAddr::V6(ip) => {
-            // XOR-fold all 16 bytes into 3 synthetic octets for better
-            // distribution across distinct IPv6 addresses in PCAP.
-            let b = ip.octets();
-            let o1 = b[0] ^ b[1] ^ b[2] ^ b[3] ^ b[4] ^ b[5];
-            let o2 = b[6] ^ b[7] ^ b[8] ^ b[9] ^ b[10];
-            let o3 = b[11] ^ b[12] ^ b[13] ^ b[14] ^ b[15];
-            [10, o1, o2, o3]
-        }
-    };
-    let dst_ip = match dst_addr.ip() {
-        std::net::IpAddr::V4(ip) => ip.octets(),
-        std::net::IpAddr::V6(ip) => {
-            let b = ip.octets();
-            let o1 = b[0] ^ b[1] ^ b[2] ^ b[3] ^ b[4] ^ b[5];
-            let o2 = b[6] ^ b[7] ^ b[8] ^ b[9] ^ b[10];
-            let o3 = b[11] ^ b[12] ^ b[13] ^ b[14] ^ b[15];
-            [10, o1, o2, o3]
-        }
-    };
-
     let ip_header_start = buf.len();
     buf.push(0x45); // version=4, IHL=5
     buf.push(0x00); // DSCP/ECN
@@ -56,16 +75,52 @@ pub fn build_pcap_frame(src_addr: SocketAddr, dst_addr: SocketAddr, payload: &[u
     buf[ip_header_start + 10] = (checksum >> 8) as u8;
     buf[ip_header_start + 11] = (checksum & 0xFF) as u8;
 
-    // UDP header (8 bytes)
+    // UDP header (8 bytes) — checksum 0 (optional for IPv4)
     let udp_len = (8 + payload.len()).min(u16::MAX as usize) as u16;
-    buf.extend_from_slice(&src_addr.port().to_be_bytes());
-    buf.extend_from_slice(&dst_addr.port().to_be_bytes());
+    buf.extend_from_slice(&src_port.to_be_bytes());
+    buf.extend_from_slice(&dst_port.to_be_bytes());
     buf.extend_from_slice(&udp_len.to_be_bytes());
     buf.extend_from_slice(&[0x00, 0x00]); // checksum (0 = not computed)
 
-    // Payload (RTP or RTCP)
     buf.extend_from_slice(payload);
+    buf
+}
 
+/// Ethernet + IPv6 + UDP frame. IPv6 UDP requires a real checksum (0 is illegal),
+/// so it is computed over the IPv6 pseudo-header.
+fn build_ipv6_frame(
+    src: Ipv6Addr,
+    src_port: u16,
+    dst: Ipv6Addr,
+    dst_port: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(14 + 40 + 8 + payload.len());
+
+    // Ethernet header (14 bytes) — dummy MACs, EtherType = IPv6
+    buf.extend_from_slice(&[0x00; 6]); // dst MAC
+    buf.extend_from_slice(&[0x00; 6]); // src MAC
+    buf.extend_from_slice(&[0x86, 0xDD]); // EtherType IPv6
+
+    let udp_len = (8 + payload.len()).min(u16::MAX as usize) as u16;
+
+    // IPv6 header (40 bytes)
+    buf.push(0x60); // version=6, traffic class high nibble=0
+    buf.extend_from_slice(&[0x00, 0x00, 0x00]); // traffic class low + flow label
+    buf.extend_from_slice(&udp_len.to_be_bytes()); // payload length (UDP header + data)
+    buf.push(17); // next header = UDP
+    buf.push(64); // hop limit
+    buf.extend_from_slice(&src.octets());
+    buf.extend_from_slice(&dst.octets());
+
+    // UDP header (8 bytes) with a computed checksum (mandatory for IPv6)
+    let checksum = udp6_checksum(&src, &dst, src_port, dst_port, payload);
+    buf.extend_from_slice(&src_port.to_be_bytes());
+    buf.extend_from_slice(&dst_port.to_be_bytes());
+    buf.extend_from_slice(&udp_len.to_be_bytes());
+    buf.extend_from_slice(&checksum.to_be_bytes());
+
+    buf.extend_from_slice(payload);
     buf
 }
 
@@ -84,6 +139,47 @@ fn ipv4_checksum(header: &[u8]) -> u16 {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
     !sum as u16
+}
+
+/// UDP checksum over the IPv6 pseudo-header (RFC 8200 §8.1 / RFC 768). The result
+/// is never 0 — a computed 0 is transmitted as 0xFFFF.
+fn udp6_checksum(
+    src: &Ipv6Addr,
+    dst: &Ipv6Addr,
+    src_port: u16,
+    dst_port: u16,
+    payload: &[u8],
+) -> u16 {
+    fn add_bytes(sum: &mut u32, bytes: &[u8]) {
+        let mut i = 0;
+        while i + 1 < bytes.len() {
+            *sum += ((bytes[i] as u32) << 8) | bytes[i + 1] as u32;
+            i += 2;
+        }
+        if i < bytes.len() {
+            *sum += (bytes[i] as u32) << 8;
+        }
+    }
+
+    let udp_len = (8 + payload.len()).min(u16::MAX as usize) as u16;
+    let mut sum: u32 = 0;
+    // Pseudo-header: src(16) + dst(16) + upper-layer length(32) + next-header(8, zero-padded)
+    add_bytes(&mut sum, &src.octets());
+    add_bytes(&mut sum, &dst.octets());
+    sum += udp_len as u32; // upper-layer packet length (high 16 bits are 0)
+    sum += 17; // next header (UDP)
+    // UDP header (checksum field counted as 0)
+    sum += src_port as u32;
+    sum += dst_port as u32;
+    sum += udp_len as u32;
+    // Payload
+    add_bytes(&mut sum, payload);
+
+    while sum > 0xFFFF {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    let cs = !sum as u16;
+    if cs == 0 { 0xFFFF } else { cs }
 }
 
 /// A packet to be recorded, with metadata
@@ -385,12 +481,49 @@ mod tests {
     }
 
     #[test]
-    fn test_ipv6_address_stays_in_10_range() {
-        let src: SocketAddr = "[ff02::1]:5000".parse().unwrap();
-        let dst: SocketAddr = "[::1]:6000".parse().unwrap();
+    fn test_ipv4_frame_uses_real_addresses() {
+        let src: SocketAddr = "203.0.113.5:5000".parse().unwrap();
+        let dst: SocketAddr = "198.51.100.9:6000".parse().unwrap();
         let frame = build_pcap_frame(src, dst, &[0x80]);
-        // Source IP at offset 26, Dest IP at offset 30
-        assert_eq!(frame[26], 10, "Synthetic src IP first octet must be 10");
-        assert_eq!(frame[30], 10, "Synthetic dst IP first octet must be 10");
+        assert_eq!(&frame[12..14], &[0x08, 0x00], "EtherType should be IPv4");
+        // Real addresses appear verbatim — IPv4 src at 26..30, dst at 30..34.
+        assert_eq!(&frame[26..30], &[203, 0, 113, 5], "real IPv4 source");
+        assert_eq!(&frame[30..34], &[198, 51, 100, 9], "real IPv4 dest");
+        assert_eq!(u16::from_be_bytes([frame[34], frame[35]]), 5000);
+        assert_eq!(u16::from_be_bytes([frame[36], frame[37]]), 6000);
+    }
+
+    #[test]
+    fn test_ipv6_frame_has_real_addresses_and_checksum() {
+        let src: SocketAddr = "[2001:db8::1]:5000".parse().unwrap();
+        let dst: SocketAddr = "[2001:db8::2]:6000".parse().unwrap();
+        let payload = [0x80, 0x00, 0x01, 0x02];
+        let frame = build_pcap_frame(src, dst, &payload);
+
+        // Ethernet → IPv6, UDP.
+        assert_eq!(&frame[12..14], &[0x86, 0xDD], "EtherType should be IPv6");
+        assert_eq!(frame[14] & 0xF0, 0x60, "IP version should be 6");
+        assert_eq!(frame[20], 17, "next header should be UDP");
+
+        // Real IPv6 addresses are embedded verbatim (not folded to a 10.x synth).
+        let IpAddr::V6(src_v6) = src.ip() else {
+            unreachable!()
+        };
+        let IpAddr::V6(dst_v6) = dst.ip() else {
+            unreachable!()
+        };
+        assert_eq!(&frame[22..38], &src_v6.octets(), "real IPv6 source address");
+        assert_eq!(&frame[38..54], &dst_v6.octets(), "real IPv6 dest address");
+        assert_eq!(u16::from_be_bytes([frame[54], frame[55]]), 5000);
+        assert_eq!(u16::from_be_bytes([frame[56], frame[57]]), 6000);
+
+        // IPv6 UDP checksum is mandatory — must not be zero.
+        assert_ne!(
+            u16::from_be_bytes([frame[60], frame[61]]),
+            0,
+            "IPv6 UDP checksum must be computed (0 is illegal)"
+        );
+        // Payload follows the 8-byte UDP header.
+        assert_eq!(&frame[62..66], &payload);
     }
 }

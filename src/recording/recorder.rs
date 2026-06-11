@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime};
 
@@ -231,23 +232,57 @@ impl RecordingManager {
         !self.recordings.is_empty()
     }
 
-    /// Record a packet for the given endpoint. Sends to all relevant recordings.
-    /// Returns info about any recordings that died due to write errors.
+    /// Test-only convenience: record with synthetic per-endpoint addresses (no
+    /// real socket). The media path uses [`Self::record_packet_addr`] so the PCAP
+    /// carries the real remote IP:port.
+    #[cfg(test)]
     pub fn record_packet(
         &mut self,
         endpoint_id: &EndpointId,
         payload: &[u8],
         is_outbound: bool,
     ) -> Vec<StoppedRecordingInfo> {
+        self.record_packet_addr(endpoint_id, payload, is_outbound, None, None)
+    }
+
+    /// Record a packet for the given endpoint, framing it with the real local and
+    /// remote socket addresses when known. Inbound packets are framed as
+    /// `remote -> local`, outbound as `local -> remote`. When either address is
+    /// unknown (endpoints with no real socket, or a remote not yet learned) it
+    /// falls back to synthetic per-endpoint `10.x` markers. Returns info about
+    /// any recordings that died due to write errors.
+    pub fn record_packet_addr(
+        &mut self,
+        endpoint_id: &EndpointId,
+        payload: &[u8],
+        is_outbound: bool,
+        local: Option<SocketAddr>,
+        remote: Option<SocketAddr>,
+    ) -> Vec<StoppedRecordingInfo> {
         if self.recordings.is_empty() {
             return Vec::new();
         }
 
-        let ep_index = self.get_endpoint_index(endpoint_id);
-        let src = pcap_writer::synthetic_addr(ep_index);
-        let dst = pcap_writer::synthetic_addr(0xFFFF);
-
-        let (src, dst) = if is_outbound { (dst, src) } else { (src, dst) };
+        let (src, dst) = match (local, remote) {
+            (Some(local), Some(remote)) => {
+                if is_outbound {
+                    (local, remote)
+                } else {
+                    (remote, local)
+                }
+            }
+            _ => {
+                // No real socket pair — fall back to synthetic markers so distinct
+                // endpoints remain distinguishable in Wireshark.
+                let ep = pcap_writer::synthetic_addr(self.get_endpoint_index(endpoint_id));
+                let bridge = pcap_writer::synthetic_addr(0xFFFF);
+                if is_outbound {
+                    (bridge, ep)
+                } else {
+                    (ep, bridge)
+                }
+            }
+        };
 
         let pkt = RecordPacket {
             src_addr: src,

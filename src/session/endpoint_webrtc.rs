@@ -626,6 +626,30 @@ impl WebRtcEndpoint {
         Ok(())
     }
 
+    /// `(local, remote)` socket addresses for recording: the ICE-nominated peer
+    /// and the bound local socket of the *matching family*. With dual-stack, ICE
+    /// may nominate the non-primary (e.g. IPv6) socket, so we must not assume the
+    /// primary `local_addr`. Returns `(None, None)` until a peer is nominated, so
+    /// pre-connection packets fall back to synthetic framing rather than a
+    /// mismatched v4-local / v6-remote frame.
+    pub fn recording_addrs(&self) -> (Option<SocketAddr>, Option<SocketAddr>) {
+        match self.remote_addr {
+            Some(remote) => {
+                // Strictly same-family: if no bound socket matches the nominated
+                // remote's family (shouldn't happen — our candidates are our
+                // sockets), return None so framing falls back to synthetic rather
+                // than emitting a mismatched v4-local / v6-remote frame.
+                let local = self
+                    .sockets
+                    .iter()
+                    .find(|(la, _)| la.is_ipv6() == remote.is_ipv6())
+                    .map(|(la, _)| *la);
+                (local, Some(remote))
+            }
+            None => (None, None),
+        }
+    }
+
     /// Poll str0m for output, returning events and transmits.
     /// Returns the next timeout.
     pub fn poll_output(&mut self) -> anyhow::Result<(Vec<WebRtcEvent>, Instant)> {
@@ -1589,5 +1613,48 @@ mod tests {
             "single family binds exactly one socket"
         );
         assert_eq!(ep.local_addr, ep.sockets[0].0);
+    }
+
+    #[tokio::test]
+    async fn test_recording_addrs_picks_nominated_family() {
+        if UdpSocket::bind("[::1]:0").await.is_err() {
+            return; // no IPv6 loopback
+        }
+        let v4: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let v6: std::net::SocketAddr = "[::1]:0".parse().unwrap();
+        let (tx, _rx) = mpsc::channel(16);
+        let metrics = Arc::new(Metrics::new());
+
+        let (mut ep, _offer) = WebRtcEndpoint::create_offer(
+            EndpointId::new_v4(),
+            EndpointDirection::SendRecv,
+            &[v4, v6],
+            tx,
+            metrics,
+        )
+        .await
+        .expect("dual-stack create_offer should succeed");
+
+        // No peer nominated yet → synthetic fallback (None, None).
+        assert_eq!(ep.recording_addrs(), (None, None));
+
+        // Nominated IPv6 peer → local must be the IPv6 socket, NOT the v4 primary.
+        let peer6: std::net::SocketAddr = "[::1]:40000".parse().unwrap();
+        ep.remote_addr = Some(peer6);
+        let (local, remote) = ep.recording_addrs();
+        assert_eq!(remote, Some(peer6));
+        assert!(
+            local.is_some_and(|l| l.is_ipv6()),
+            "local must match the nominated IPv6 family, got {local:?}"
+        );
+
+        // Nominated IPv4 peer → local must be the IPv4 socket.
+        let peer4: std::net::SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        ep.remote_addr = Some(peer4);
+        let (local, _remote) = ep.recording_addrs();
+        assert!(
+            local.is_some_and(|l| l.is_ipv4()),
+            "local must match the nominated IPv4 family, got {local:?}"
+        );
     }
 }

@@ -17,7 +17,18 @@ All metrics use the `rtpbridge_` prefix.
 | `rtpbridge_srtp_errors_total` | SRTP authentication or replay check failures |
 | `rtpbridge_transcode_errors_total` | Codec transcode failures (decode or encode) |
 | `rtpbridge_dtmf_events_total` | DTMF digits detected |
+| `rtpbridge_playout_late_drops_total` | Playout packets dropped after their play slot |
+| `rtpbridge_playout_overflow_drops_total` | Playout frames dropped to bound latency |
+| `rtpbridge_playout_underflow_fills_total` | Synthesized silence fills for clockless-source underflow |
 | `rtpbridge_events_dropped_total` | WebSocket events dropped due to client backpressure |
+| `rtpbridge_webrtc_packet_errors_total` | Inbound WebRTC packets rejected by str0m |
+| `rtpbridge_webrtc_connecting_stuck_total` | WebRTC endpoints stuck in Connecting past the watchdog threshold |
+| `rtpbridge_webrtc_ice_restart_conflicts_total` | ICE restart requests rejected because an unanswered offer was pending |
+| `rtpbridge_webrtc_recv_task_started_total` | WebRTC receive tasks that reached their receive loop |
+| `rtpbridge_webrtc_recv_task_exited_total` | WebRTC receive tasks that exited cooperatively |
+| `rtpbridge_webrtc_recv_task_dead_total` | Live WebRTC endpoints whose receive task had finished |
+| `rtpbridge_webrtc_recv_task_start_timeout_total` | WebRTC receive tasks that did not start within the grace window |
+| `rtpbridge_webrtc_recv_overflow_total` | Inbound WebRTC packets dropped because the session channel was full |
 
 ### Gauges
 
@@ -44,6 +55,10 @@ Scale linearly with active sessions to estimate expected throughput.
 **Transcode errors** — `rate(rtpbridge_transcode_errors_total[5m])` should be zero. Non-zero values indicate codec failures (e.g., corrupt Opus frames). Occasional errors on noisy links are expected; sustained errors suggest a codec negotiation problem.
 
 **Events dropped** — `rate(rtpbridge_events_dropped_total[5m])` > 0 means clients aren't reading WebSocket events fast enough. This doesn't affect media flow but means your application is missing events (DTMF, VAD, stats).
+
+**WebRTC receive supervision** — `increase(rtpbridge_webrtc_recv_task_start_timeout_total[15m])` or `increase(rtpbridge_webrtc_recv_task_dead_total[15m])` > 0 means a live WebRTC endpoint lost, or never started, its UDP receive task. Treat this as a media-path incident.
+
+**Playout drops/fills** — `rate(rtpbridge_playout_late_drops_total[5m])`, `rate(rtpbridge_playout_overflow_drops_total[5m])`, and `rate(rtpbridge_playout_underflow_fills_total[5m])` show buffering pressure for paced sources. Occasional fills on bursty clockless sources can be normal; sustained drops indicate jitter, overload, or a producer running ahead.
 
 ### Capacity
 
@@ -95,6 +110,24 @@ groups:
         annotations:
           summary: "Events being dropped on {{ $labels.instance }} — client too slow"
 
+      # WebRTC receive task lost
+      - alert: RtpbridgeWebrtcRecvTaskDead
+        expr: increase(rtpbridge_webrtc_recv_task_dead_total[15m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Live WebRTC endpoint lost its receive task on {{ $labels.instance }}"
+
+      # WebRTC receive task never started
+      - alert: RtpbridgeWebrtcRecvTaskStartTimeout
+        expr: increase(rtpbridge_webrtc_recv_task_start_timeout_total[15m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "WebRTC receive task failed to start on {{ $labels.instance }}"
+
       # Approaching session capacity
       # Adjust the threshold to 80% of your configured max_sessions value.
       - alert: RtpbridgeHighSessionLoad
@@ -121,11 +154,13 @@ groups:
 
 | Metric | Normal | Investigate | Alert |
 |--------|--------|-------------|-------|
-| `rate(srtp_errors_total[5m])` | 0 | > 0.1/s | > 1/s sustained 5m |
-| `rate(transcode_errors_total[5m])` | 0 | > 0 | > 0 sustained 10m |
-| `rate(events_dropped_total[5m])` | 0 | > 0 | > 0 sustained 5m |
-| `sessions_active` vs configured `max_sessions` | < 50% | > 70% | > 80% |
-| `rate(packets_routed_total[5m])` with active sessions | > 0 | == 0 for 2m | == 0 for 5m |
+| `rate(rtpbridge_srtp_errors_total[5m])` | 0 | > 0.1/s | > 1/s sustained 5m |
+| `rate(rtpbridge_transcode_errors_total[5m])` | 0 | > 0 | > 0 sustained 10m |
+| `rate(rtpbridge_events_dropped_total[5m])` | 0 | > 0 | > 0 sustained 5m |
+| `increase(rtpbridge_webrtc_recv_task_dead_total[15m])` | 0 | > 0 | > 0 |
+| `increase(rtpbridge_webrtc_recv_task_start_timeout_total[15m])` | 0 | > 0 | > 0 |
+| `rtpbridge_sessions_active` vs configured `max_sessions` | < 50% | > 70% | > 80% |
+| `rate(rtpbridge_packets_routed_total[5m])` with active sessions | > 0 | == 0 for 2m | == 0 for 5m |
 
 ## Dashboards
 
@@ -148,6 +183,11 @@ Recommended panels for a Grafana dashboard:
 - Total sessions (counter) — `rtpbridge_sessions_total`
 - Total DTMF events (counter) — `rtpbridge_dtmf_events_total`
 - Packets recorded (counter) — `rtpbridge_packets_recorded_total`
+
+**Row 4 — WebRTC / Playout**
+- WebRTC receive task failures — `increase(rtpbridge_webrtc_recv_task_dead_total[15m])`, `increase(rtpbridge_webrtc_recv_task_start_timeout_total[15m])`
+- WebRTC receive overflow — `rate(rtpbridge_webrtc_recv_overflow_total[1m])`
+- Playout drops/fills — `rate(rtpbridge_playout_late_drops_total[1m])`, `rate(rtpbridge_playout_overflow_drops_total[1m])`, `rate(rtpbridge_playout_underflow_fills_total[1m])`
 
 ## Per-Session Observability
 

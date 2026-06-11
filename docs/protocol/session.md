@@ -82,7 +82,7 @@ Get details about the current session.
   "result": {
     "session_id": "550e8400-...",
     "state": "active",
-    "created_at": "1711324800s",
+    "created_at": "2024-01-15T10:30:00Z",
     "endpoints": [],
     "recordings": [],
     "vad_active": [],
@@ -115,7 +115,7 @@ List all sessions on the server (not just this connection's session).
 
 Create a bidirectional audio bridge between the current session and a target session. This inserts a virtual "bridge endpoint" into each session. Audio routed to a bridge endpoint is forwarded to the paired session as decoded PCM (L16 at 48kHz), preserving full audio quality with zero lossy re-encoding at the bridge boundary.
 
-Bridge-to-bridge routing is excluded to prevent audio loops — bridge endpoints only exchange audio with real endpoints (WebRTC, RTP, File), never with other bridge endpoints.
+Bridge-to-bridge routing is excluded to prevent audio loops — bridge endpoints only exchange audio with non-bridge endpoints (WebRTC, RTP, file, tone, or WebSocket), never with other bridge endpoints.
 
 Removing either bridge endpoint via `endpoint.remove` automatically removes the paired endpoint in the other session.
 
@@ -133,7 +133,7 @@ Removing either bridge endpoint via `endpoint.remove` automatically removes the 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | `target_session_id` | string | required | Session to bridge to |
-| `direction` | string | `"sendrecv"` | `"sendrecv"`, `"recvonly"`, or `"sendonly"` |
+| `direction` | string | `"sendrecv"` | `"sendrecv"`, `"recvonly"`, `"sendonly"`, or `"inactive"` |
 
 **Response:**
 ```json

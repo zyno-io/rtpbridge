@@ -14,7 +14,9 @@ Create a send-only endpoint that plays audio from a local file or URL.
     "loop_count": 0,
     "cache_ttl_secs": 300,
     "shared": false,
-    "timeout_ms": 10000
+    "timeout_ms": 10000,
+    "headers": { "Authorization": "Bearer ..." },
+    "gain_db": 0.0
   }
 }
 ```
@@ -27,6 +29,8 @@ Create a send-only endpoint that plays audio from a local file or URL.
 | `cache_ttl_secs` | u32 | `300` | For URLs: cache lifetime in seconds. `0` = delete after use |
 | `shared` | bool | `false` | Share decode pipeline across sessions |
 | `timeout_ms` | u32 | `10000` | Max milliseconds to wait for download (URL sources only; ignored for local files). Min: 1, max: 60000 |
+| `headers` | object or null | `null` | Optional HTTP headers for URL sources. Header values are included in the cache key so authenticated URLs do not share cached content across different headers |
+| `gain_db` | number | `0.0` | Playback gain in decibels; negative values attenuate, positive values amplify |
 
 Supported formats: WAV, MP3, OGG/Vorbis, FLAC.
 

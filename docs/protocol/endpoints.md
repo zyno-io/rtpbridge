@@ -5,6 +5,13 @@ Endpoint commands are grouped by transport:
 - `endpoint.rtp.*` for plain RTP/SRTP signaling and re-INVITE flows
 - generic `endpoint.*` for cross-transport lifecycle operations
 
+Compatibility aliases are also supported:
+- `endpoint.create_from_offer` auto-detects WebRTC vs plain RTP/SRTP from SDP.
+- `endpoint.create_offer` uses `params.type` (`"webrtc"` or `"rtp"`).
+- `endpoint.accept_answer` dispatches by endpoint type.
+- `endpoint.accept_offer` and `endpoint.ice_restart` are WebRTC aliases.
+- `endpoint.srtp_rekey` is an RTP/SRTP alias.
+
 ## WebRTC Commands
 
 ### endpoint.webrtc.create_from_offer
@@ -25,7 +32,7 @@ Create a WebRTC endpoint from a remote WebRTC SDP offer.
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | `sdp` | string | required | Remote SDP offer |
-| `direction` | string | `"sendrecv"` | `"sendrecv"`, `"recvonly"`, or `"sendonly"` |
+| `direction` | string | `"sendrecv"` | `"sendrecv"`, `"recvonly"`, `"sendonly"`, or `"inactive"` |
 
 **Response:**
 ```json
@@ -48,7 +55,7 @@ Create a new WebRTC endpoint and generate an SDP offer to send to the remote pee
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
-| `direction` | string | `"sendrecv"` | Endpoint direction |
+| `direction` | string | `"sendrecv"` | `"sendrecv"`, `"recvonly"`, `"sendonly"`, or `"inactive"` |
 
 **Response:**
 ```json
@@ -137,7 +144,7 @@ Perform an ICE restart on a WebRTC endpoint. Returns a new SDP offer with fresh 
 **Failure scenarios:**
 - If the remote peer is unreachable, ICE will time out and the endpoint remains `disconnected`
 - If the endpoint was removed, the request returns `ENDPOINT_ERROR`
-- Multiple rapid ICE restarts are safe; each generates fresh credentials
+- Overlapping rapid ICE restarts are rejected while a prior restart offer is still unanswered. Serialize the restart-to-answer cycle per endpoint.
 
 ## RTP Commands
 
@@ -159,7 +166,7 @@ Create a plain RTP endpoint from a remote RTP/SRTP SDP offer.
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | `sdp` | string | required | Remote SDP offer |
-| `direction` | string | `"sendrecv"` | `"sendrecv"`, `"recvonly"`, or `"sendonly"` |
+| `direction` | string | `"sendrecv"` | `"sendrecv"`, `"recvonly"`, `"sendonly"`, or `"inactive"` |
 
 **Response:**
 ```json
@@ -184,7 +191,7 @@ Create a new plain RTP endpoint and generate an SDP offer.
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
-| `direction` | string | `"sendrecv"` | Endpoint direction |
+| `direction` | string | `"sendrecv"` | `"sendrecv"`, `"recvonly"`, `"sendonly"`, or `"inactive"` |
 | `srtp` | bool | `false` | Include `a=crypto` in offer |
 | `codecs` | string[] | all | Preferred codec order |
 
@@ -267,6 +274,38 @@ Initiate an SDES SRTP rekey on a plain RTP endpoint. Not applicable to WebRTC en
 
 ## Generic Endpoint Commands
 
+### endpoint.create_tone
+
+Create a send-only generated tone endpoint. Tone endpoints produce PCMU audio at 8 kHz and do not receive media.
+
+```json
+{
+  "id": "tone-1",
+  "method": "endpoint.create_tone",
+  "params": {
+    "tone": "beep",
+    "duration_ms": 1000
+  }
+}
+```
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `tone` | string | required | `"ringback"`, `"ringing"`, `"busy"`, `"beep"`, or `"sine"` |
+| `frequency` | number | tone default | Custom frequency for `"sine"`; must be 20-20000 Hz when provided |
+| `duration_ms` | u64 or null | `null` | Stop automatically after this duration; `null` means play until removed |
+
+**Response:**
+```json
+{"id":"tone-1","result":{"endpoint_id":"...","tone":"beep"}}
+```
+
+When a duration-limited tone finishes, rtpbridge emits `endpoint.tone.finished`.
+
+### endpoint.create_websocket
+
+Create a raw PCM WebSocket audio endpoint. See [WebSocket audio endpoint](./websocket.md) for the audio-plane URL, wire format, and lifecycle events.
+
 ### endpoint.update_direction
 
 Change endpoint direction policy in the routing table.
@@ -333,7 +372,7 @@ Remove an endpoint from the session.
 
 ### endpoint.transfer
 
-Transfer an endpoint from the current session to a different session. The endpoint keeps its connection (sockets, ICE, DTLS, SRTP state). Active recordings on the endpoint are stopped. File endpoints cannot be transferred.
+Transfer an endpoint from the current session to a different session. The endpoint keeps its connection (sockets, ICE, DTLS, SRTP state). Active recordings on the endpoint are stopped. File, tone, and WebSocket endpoints cannot be transferred.
 
 ```json
 {
@@ -364,7 +403,7 @@ If the target session is at capacity (`max_endpoints_per_session`), the transfer
 
 **Error codes:**
 - `NO_SESSION` — no session bound
-- `INVALID_PARAMS` — self-transfer or file endpoint
+- `INVALID_PARAMS` — self-transfer or file, tone, or WebSocket endpoint
 - `SESSION_NOT_FOUND` — target session doesn't exist
 - `ENDPOINT_ERROR` — endpoint not found or extraction failed
 - `TRANSFER_FAILED` — insertion into target failed (endpoint rolled back)
@@ -381,3 +420,4 @@ Endpoint state is reported in `endpoint.state_changed` events and session detail
 | File (URL) | `buffering` → `playing` → `paused` → `playing` → `finished` | `buffering` until download completes |
 | Tone | `playing` → `finished` | Auto-finish after optional duration |
 | Bridge | `new` → `connected` | Virtual wiring endpoint for cross-session bridge |
+| WebSocket | `connecting` → `connected` → `disconnected` | Raw PCM audio socket endpoint; auto-removed if dial-in times out |

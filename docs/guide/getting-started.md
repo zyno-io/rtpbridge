@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Rust 1.88+ with Cargo
+- Rust 1.94+ with Cargo
 - libopus-dev (Debian/Ubuntu), libopus-devel (Fedora), or opus (macOS Homebrew) — required for Opus codec support
 - A WebSocket client for testing (e.g., [websocat](https://github.com/vi/websocat))
 

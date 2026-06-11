@@ -68,10 +68,11 @@ Memory usage is modest:
 ### Network
 
 Each endpoint consumes:
-- 1–2 UDP sockets (1 for WebRTC, 2 for plain RTP without rtcp-mux)
+- 1 UDP socket for WebRTC endpoints, on an OS-assigned port
+- 2 UDP sockets for plain RTP/SRTP endpoints, allocated as an even/odd RTP/RTCP pair from `rtp_port_range`
 - Bandwidth proportional to codec bitrate and ptime
 
-For plain RTP endpoints, each endpoint uses one port from `rtp_port_range`. The default range (30000-39999) provides 10,000 ports. With even/odd pairing, this supports up to 5,000 concurrent RTP endpoint pairs.
+For plain RTP endpoints, each endpoint uses one even/odd pair from `rtp_port_range`. The default range (30000-39999) provides 10,000 ports, which supports up to 5,000 concurrent plain RTP endpoints.
 
 ### Disk I/O (Recordings)
 
@@ -95,10 +96,10 @@ recording_flush_timeout_secs = 30  # 30s for slow NFS
 
 ### Port Range
 
-The default `rtp_port_range = [30000, 39999]` provides 10,000 ports. Increase this if you need more concurrent plain RTP endpoints:
+The default `rtp_port_range = [30000, 39999]` provides 10,000 ports, or 5,000 RTP/RTCP pairs. Increase this if you need more concurrent plain RTP endpoints:
 
 ```toml
-rtp_port_range = [20000, 49999]  # 30,000 ports
+rtp_port_range = [20000, 49999]  # 30,000 ports = 15,000 RTP/RTCP pairs
 ```
 
 The start port must be even (RTP uses even/odd port pairs) and >= 1024.

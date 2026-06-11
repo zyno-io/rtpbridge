@@ -63,7 +63,9 @@ Resource requirements depend on workload — transcoding (especially Opus) is CP
 
 ### Port Ranges
 
-For plain RTP endpoints, you need to expose the configured `rtp_port_range` (default: 30000-39999). WebRTC endpoints use ICE and can work with any available ports.
+Plain RTP endpoints allocate even/odd RTP/RTCP port pairs from `rtp_port_range` (default: 30000-39999), so expose that UDP range for plain RTP/SRTP.
+
+WebRTC endpoints do **not** use `rtp_port_range`: each WebRTC endpoint binds one OS-assigned UDP port on `media_ip`, and that port is advertised as the ICE host candidate. In environments with external firewalls or NAT, allow the host/container ephemeral UDP range or run with a network model where those OS-assigned host-candidate ports are directly reachable.
 
 ### Health Checks
 
@@ -137,7 +139,18 @@ All metrics use the `rtpbridge_` prefix:
 | `rtpbridge_packets_recorded_total` | Counter | Total packets recorded to PCAP |
 | `rtpbridge_recordings_active` | Gauge | Currently active recordings |
 | `rtpbridge_dtmf_events_total` | Counter | DTMF events detected |
+| `rtpbridge_playout_late_drops_total` | Counter | Playout packets dropped after their play slot |
+| `rtpbridge_playout_overflow_drops_total` | Counter | Playout frames dropped to bound latency |
+| `rtpbridge_playout_underflow_fills_total` | Counter | Synthesized silence fills for clockless-source underflow |
 | `rtpbridge_events_dropped_total` | Counter | Events dropped (backpressure) |
+| `rtpbridge_webrtc_packet_errors_total` | Counter | Inbound WebRTC packets rejected by str0m |
+| `rtpbridge_webrtc_connecting_stuck_total` | Counter | WebRTC endpoints stuck in Connecting past watchdog threshold |
+| `rtpbridge_webrtc_ice_restart_conflicts_total` | Counter | ICE restarts rejected because an unanswered offer was pending |
+| `rtpbridge_webrtc_recv_task_started_total` | Counter | WebRTC receive tasks that reached their receive loop |
+| `rtpbridge_webrtc_recv_task_exited_total` | Counter | WebRTC receive tasks that exited cooperatively |
+| `rtpbridge_webrtc_recv_task_dead_total` | Counter | Live WebRTC endpoints whose receive task had finished |
+| `rtpbridge_webrtc_recv_task_start_timeout_total` | Counter | WebRTC receive tasks that did not start within the grace window |
+| `rtpbridge_webrtc_recv_overflow_total` | Counter | Inbound WebRTC packets dropped because the session channel was full |
 
 ### Suggested Alerts
 
@@ -236,17 +249,17 @@ Key settings:
 
 ### File Descriptor Sizing
 
-Each RTP endpoint uses 2 UDP sockets (RTP + RTCP). WebRTC endpoints use 1. File playback endpoints use 0. Size your file descriptor limit accordingly:
+Plain RTP/SRTP endpoints use 2 UDP sockets (RTP + RTCP). WebRTC endpoints use 1 UDP socket. File, tone, bridge, and WebSocket audio endpoints use 0 UDP sockets. Size your file descriptor limit from the expected endpoint mix:
 
 ```
-fd_estimate = (max_sessions × avg_endpoints_per_session × 2) + 200
+fd_estimate = (plain_rtp_endpoints × 2) + webrtc_endpoints + recording_files + control_connections + 200
 ```
 
-For example, 5000 sessions with 2 endpoints each: `(5000 × 2 × 2) + 200 = 20,200`. Set `LimitNOFILE` in your systemd unit to at least this value.
+For example, 5000 sessions with two plain RTP endpoints each: `(10,000 × 2) + 200 = 20,200`. Set `LimitNOFILE` in your systemd unit to at least your estimated value.
 
 ### Event Backpressure
 
-The control plane uses bounded channels (`event_channel_size`, default 256) for events. If a WebSocket client reads events slower than they are produced, excess events are dropped and an `events.dropped` event is sent with the count. Critical events (like `session.idle_timeout` and `recording.stopped`) use a separate priority channel (`critical_event_channel_size`, default 64) to avoid being dropped during bursts of normal events.
+The control plane uses bounded channels (`event_channel_size`, default 256) for events. If a WebSocket client reads events slower than they are produced, excess events are dropped and an `events.dropped` event is sent with the count. Critical events (such as endpoint state changes, ICE state changes, recording stops, file completion, and session timeout events) use a separate priority channel (`critical_event_channel_size`, default 64) to avoid being dropped during bursts of normal events.
 
 If you observe frequent `events.dropped` events, increase `event_channel_size` or ensure your client processes events promptly.
 
@@ -287,16 +300,16 @@ rtpbridge uses **ICE-lite** for WebRTC endpoints: the server is always the contr
 This means:
 
 - **`media_ip` must be directly reachable** by all peers. Set it to the public/external IP address if peers connect over the internet.
-- **For NAT environments**: Set `media_ip` to the public IP and ensure the entire `rtp_port_range` (default 30000-39999) is port-forwarded (UDP) to the rtpbridge host.
-- **WebRTC peers** must be able to reach `media_ip` directly. Since rtpbridge only offers host candidates (no server-reflexive or relay candidates), peers behind symmetric NATs may fail to connect unless they use a TURN server on the peer side.
+- **For NAT environments**: Set `media_ip` to the public IP. Forward `rtp_port_range` (UDP) for plain RTP/SRTP endpoints, and also allow/forward the OS-assigned UDP ports used by WebRTC endpoints.
+- **WebRTC peers** must be able to reach the advertised `media_ip:port` host candidates directly. Since rtpbridge only offers host candidates (no server-reflexive or relay candidates), peers behind symmetric NATs may fail to connect unless they use a TURN server on the peer side.
 - **Plain RTP endpoints** use even/odd port pairs from `rtp_port_range` for RTP/RTCP. Ensure this range is open in your firewall.
-- **Firewall rules**: Open `rtp_port_range` (UDP) for media traffic and the control port (default 9100 TCP) for WebSocket/HTTP.
+- **Firewall rules**: Open `rtp_port_range` (UDP) for plain RTP/SRTP, the reachable WebRTC UDP host-candidate port range, and the control port (default 9100 TCP) for WebSocket/HTTP.
 
 ## Docker
 
 ```dockerfile
 # Pin Rust version to match rust-version in Cargo.toml
-FROM rust:1.88-bookworm AS builder
+FROM rust:1.94-trixie AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends libopus-dev && rm -rf /var/lib/apt/lists/*
 
@@ -315,14 +328,22 @@ RUN mkdir -p src benches \
 COPY . .
 RUN touch src/main.rs && cargo build --release
 
-FROM debian:bookworm-20250317-slim
-RUN apt-get update && apt-get install -y --no-install-recommends libopus0 libssl3 ca-certificates && rm -rf /var/lib/apt/lists/* \
+FROM debian:trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends libopus0 libssl3t64 ca-certificates && rm -rf /var/lib/apt/lists/* \
     && useradd -r -s /sbin/nologin rtpbridge \
     && mkdir -p /var/lib/rtpbridge/recordings /var/lib/rtpbridge/media /var/lib/rtpbridge/cache \
     && chown -R rtpbridge:rtpbridge /var/lib/rtpbridge
 COPY --from=builder /app/target/release/rtpbridge /usr/local/bin/rtpbridge
 EXPOSE 9100
 USER rtpbridge
+# Recommended: run with minimal capabilities in production
+# docker run --cap-drop=ALL --cap-add=NET_BIND_SERVICE --read-only rtpbridge
+# In Kubernetes:
+#   securityContext:
+#     readOnlyRootFilesystem: true
+#     capabilities:
+#       drop: [ALL]
+#       add: [NET_BIND_SERVICE]  # only if binding to ports < 1024
 ENTRYPOINT ["rtpbridge"]
 ```
 

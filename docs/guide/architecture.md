@@ -37,7 +37,7 @@ WebRTC endpoints use [str0m](https://github.com/algesten/str0m) in Sans-I/O mode
 
 ### Per-Endpoint Sockets
 
-Each endpoint (WebRTC or RTP) binds its own UDP socket(s) rather than sharing a mux. WebRTC endpoints use a single socket (ICE multiplexes RTP and RTCP). Plain RTP endpoints use two sockets (RTP + RTCP) unless `rtcp-mux` is negotiated, in which case they also use one. This is simpler and works well with ICE, which handles port discovery. For WebRTC, the OS-assigned port becomes the ICE candidate.
+Each socket-backed endpoint binds its own UDP socket(s) rather than sharing a mux. WebRTC endpoints use one OS-assigned UDP socket, with ICE multiplexing RTP/RTCP and DTLS/SRTP on that port. Plain RTP/SRTP endpoints allocate an even/odd pair from `rtp_port_range` for RTP and RTCP sockets; if `rtcp-mux` is negotiated, RTCP traffic is demuxed on the RTP socket but the local pair is still allocated. For WebRTC, the OS-assigned port becomes the ICE host candidate.
 
 ### Symmetric RTP
 

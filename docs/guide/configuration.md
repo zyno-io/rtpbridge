@@ -10,7 +10,7 @@ rtpbridge [OPTIONS]
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `-l, --listen <ADDR>` | `0.0.0.0:9100` | WebSocket control plane listen address |
+| `-l, --listen <ADDRS>` | `0.0.0.0:9100` | WebSocket/HTTP control plane listen address(es), comma-separated |
 | `-m, --media-ip <IP>` | `127.0.0.1` | IP address for all media sockets |
 | `-c, --config <PATH>` | — | Path to TOML configuration file |
 | `--log-level <LEVEL>` | `info` | Log level: trace, debug, info, warn, error |
@@ -18,7 +18,7 @@ rtpbridge [OPTIONS]
 ## TOML Config File
 
 ```toml
-# WebSocket control plane
+# WebSocket/HTTP control plane (comma-separated addresses accepted)
 listen = "0.0.0.0:9100"
 
 # Media plane IP — used for RTP sockets and SDP/ICE candidates
@@ -78,6 +78,9 @@ session_idle_timeout_secs = 0
 # Empty session timeout (0 = disabled)
 # Sessions with zero endpoints for this duration are auto-destroyed
 # empty_session_timeout_secs = 0
+
+# Media timeout event threshold (seconds)
+media_timeout_secs = 5
 
 # Recording channel buffer size (packets)
 recording_channel_size = 1000
@@ -150,6 +153,7 @@ The HTTP recording API (`GET /recordings/{path}`, `DELETE /recordings/{path}`) a
 | `GET /recordings/{path}` | `200 OK` | File returned (`application/vnd.tcpdump.pcap`) |
 | `GET /recordings/{path}` | `403 Forbidden` | Path traversal attempt detected |
 | `GET /recordings/{path}` | `404 Not Found` | File does not exist |
+| `GET /recordings/{path}` | `413 Payload Too Large` | Recording exceeds `max_recording_download_bytes` |
 | `DELETE /recordings/{path}` | `200 OK` | File deleted (`{"deleted":true}`) |
 | `DELETE /recordings/{path}` | `404 Not Found` | File does not exist |
 | `DELETE /recordings/{path}` | `500 Internal Server Error` | Deletion failed |
@@ -167,17 +171,22 @@ The HTTP recording API (`GET /recordings/{path}`, `DELETE /recordings/{path}`) a
   "endpoints": [
     {
       "endpoint_id": "...",
-      "type": "rtp",
+      "endpoint_type": "rtp",
       "state": "connected",
       "direction": "sendrecv",
-      "codec": "PCMU"
+      "codec": "PCMU",
+      "local_rtp_addr": "203.0.113.5:30000",
+      "local_rtcp_addr": "203.0.113.5:30001",
+      "remote_rtp_addr": "198.51.100.10:40000",
+      "remote_rtcp_addr": "198.51.100.10:40001"
     }
   ],
   "recordings": [
     {
       "recording_id": "...",
       "file_path": "/var/lib/rtpbridge/recordings/call-1.pcap",
-      "endpoint_id": null
+      "endpoint_id": null,
+      "state": "active"
     }
   ],
   "vad_active": ["endpoint-id-1"],
@@ -222,7 +231,7 @@ All configuration options with their types, defaults, and descriptions. All chan
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `listen` | `ip:port` | `0.0.0.0:9100` | WebSocket/HTTP control plane listen address |
+| `listen` | `ip:port[,ip:port...]` | `0.0.0.0:9100` | WebSocket/HTTP control plane listen address(es), comma-separated |
 | `media_ip` | `ip` | `127.0.0.1` | IP for RTP/WebRTC UDP sockets; appears in SDP and ICE candidates |
 | `rtp_port_range` | `[u16, u16]` | `[30000, 39999]` | UDP port range for plain RTP endpoints (must start even, >= 1024) |
 | `disconnect_timeout_secs` | `u64` | `30` | Seconds to keep orphaned sessions alive after WebSocket disconnect |
@@ -263,7 +272,7 @@ The following fields must be greater than zero:
 `max_concurrent_downloads`, `max_recordings_per_session`, `recording_flush_timeout_secs`,
 `ws_max_message_size_kb`, `max_sdp_size_kb`, `ws_ping_interval_secs`,
 `event_channel_size`, `critical_event_channel_size`, `recording_channel_size`,
-`transcode_cache_size`
+`transcode_cache_size`, `media_timeout_secs`
 
 Note: `max_sessions`, `max_endpoints_per_session`, and `max_connections` accept `0` to mean unlimited.
 
@@ -273,6 +282,7 @@ Note: `max_sessions`, `max_endpoints_per_session`, and `max_connections` accept 
 |-------|---------|-------|
 | `ws_max_message_size_kb` | 512000 | 512 MB |
 | `max_sdp_size_kb` | 10000 | 10 MB |
+| `media_timeout_secs` | 300 | 5 minutes |
 
 ### Port Range Rules
 

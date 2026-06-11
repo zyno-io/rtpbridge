@@ -42,4 +42,4 @@ All codecs use 20ms ptime:
 
 ## Telephone-Event
 
-RFC 4733 telephone-event is always negotiated (PT 101 by default). The `a=fmtp:101 0-16` line supports digits 0-9, *, #, A-D, and flash.
+For WebRTC endpoints, RFC 4733 telephone-event uses PT 101. For plain RTP/SRTP endpoints, generated SDP includes telephone-event by default and answers retain the offered telephone-event payload type and clock rate. The `a=fmtp:101 0-16` line supports digits 0-9, *, #, A-D, and flash. File, tone, bridge, and WebSocket audio endpoints do not negotiate telephone-event.

@@ -34,6 +34,38 @@ File playback completed or errored.
 {"event":"endpoint.file.finished","data":{"endpoint_id":"...","reason":"completed","error":null}}
 ```
 
+## endpoint.tone.finished
+
+Duration-limited tone generation completed.
+
+```json
+{"event":"endpoint.tone.finished","data":{"endpoint_id":"..."}}
+```
+
+## endpoint.ws.connected
+
+WebSocket audio socket attached to an endpoint created by `endpoint.create_websocket`.
+
+```json
+{"event":"endpoint.ws.connected","data":{"endpoint_id":"..."}}
+```
+
+## endpoint.ws.disconnected
+
+WebSocket audio socket closed or errored.
+
+```json
+{"event":"endpoint.ws.disconnected","data":{"endpoint_id":"..."}}
+```
+
+## endpoint.ws.connect_timeout
+
+WebSocket audio endpoint was not dialed in within 30 seconds and was auto-removed.
+
+```json
+{"event":"endpoint.ws.connect_timeout","data":{"endpoint_id":"..."}}
+```
+
 ## endpoint.media_timeout
 
 No RTP packets received from a remote endpoint for 5 seconds. This threshold defaults to 5 seconds and can be configured via `media_timeout_secs`. The event is factual — it could mean the remote is silent, or there's a network issue. The event fires once per timeout period and resets when packets resume.
@@ -130,6 +162,14 @@ Periodic silence notification.
 {"event":"vad.silence","data":{"endpoint_id":"...","silence_duration_ms":3000}}
 ```
 
+## vad.error
+
+The analysis decoder could not be created for the endpoint's codec, so VAD cannot process that stream.
+
+```json
+{"event":"vad.error","data":{"endpoint_id":"...","error":"VAD decoder creation failed: ..."}}
+```
+
 ## fax.cng_detected
 
 Fax calling tone (CNG, 1100 Hz) detected on the endpoint. See [Fax Tone Detection](fax.md).
@@ -144,4 +184,12 @@ Fax/modem answer tone (CED, 2100 Hz) detected on the endpoint. See [Fax Tone Det
 
 ```json
 {"event":"fax.ced_detected","data":{"endpoint_id":"..."}}
+```
+
+## fax.error
+
+The analysis decoder could not be created for the endpoint's codec, so fax detection cannot process that stream.
+
+```json
+{"event":"fax.error","data":{"endpoint_id":"...","error":"Fax detection decoder creation failed: ..."}}
 ```

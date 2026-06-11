@@ -62,7 +62,7 @@ Events are emitted asynchronously and are not correlated to requests.
 - **Ordering**: Events within the same priority tier are delivered in order. Priority events (see below) may be delivered ahead of normal events queued at the same time.
 - **Delivery guarantee**: At-most-once. Under backpressure (slow client), events may be dropped rather than block the media pipeline.
 - **Drop notification**: When events are dropped, the server sends an `events.dropped` notification with a `count` field indicating how many events were lost since the last successful delivery.
-- **Priority events**: Critical events (`endpoint.state_changed`, `recording.stopped`, `endpoint.file.finished`, `session.idle_timeout`) are routed through a separate priority channel and are dropped only when both the priority and normal channels are full.
+- **Priority events**: Critical events (`endpoint.state_changed`, `endpoint.ice_state_changed`, `recording.stopped`, `endpoint.file.finished`, `session.idle_timeout`, `session.empty_timeout`) are routed through a separate priority channel and are dropped only when both the priority and normal channels are full.
 
 ## Error Codes
 
@@ -83,7 +83,9 @@ Events are emitted asynchronously and are not correlated to requests.
 | `ENDPOINT_ERROR` | Endpoint operation failed |
 | `RECORDING_ERROR` | Recording operation failed |
 | `VAD_ERROR` | VAD operation failed |
+| `FAX_DETECT_ERROR` | Fax tone detection operation failed |
 | `STATS_ERROR` | Statistics subscribe/unsubscribe failed |
+| `TRANSFER_FAILED` | Endpoint transfer failed after extraction; rollback was attempted |
 | `INVALID_REQUEST` | Request `id` field is empty or invalid |
 | `INTERNAL_ERROR` | Internal server error (e.g., serialization failure) |
 
@@ -106,6 +108,11 @@ Most methods that require a session can return `NO_SESSION` (no session bound), 
 
 | Method | Additional Error Codes |
 |--------|----------------------|
+| `endpoint.create_from_offer` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
+| `endpoint.create_offer` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
+| `endpoint.accept_answer` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
+| `endpoint.accept_offer` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
+| `endpoint.ice_restart` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
 | `endpoint.webrtc.create_from_offer` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
 | `endpoint.webrtc.create_offer` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
 | `endpoint.webrtc.accept_answer` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
@@ -120,6 +127,7 @@ Most methods that require a session can return `NO_SESSION` (no session bound), 
 | `endpoint.rtp.create_offer` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
 | `endpoint.rtp.accept_answer` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
 | `endpoint.rtp.reinvite` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
+| `endpoint.srtp_rekey` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
 | `endpoint.rtp.srtp_rekey` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
 
 ### Generic Endpoint Commands
@@ -127,12 +135,17 @@ Most methods that require a session can return `NO_SESSION` (no session bound), 
 | Method | Additional Error Codes |
 |--------|----------------------|
 | `endpoint.update_direction` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
+| `endpoint.update_remote_sdp` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
 | `endpoint.remove` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
+| `endpoint.transfer` | `INVALID_PARAMS`, `SESSION_NOT_FOUND`, `ENDPOINT_ERROR`, `TRANSFER_FAILED` |
 | `endpoint.dtmf.inject` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
 | `endpoint.create_with_file` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
+| `endpoint.create_tone` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
+| `endpoint.create_websocket` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
 | `endpoint.file.seek` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
 | `endpoint.file.pause` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
 | `endpoint.file.resume` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
+| `session.bridge` | `INVALID_PARAMS`, `SESSION_NOT_FOUND`, `ENDPOINT_ERROR` |
 
 ### Recording, VAD, and Stats
 

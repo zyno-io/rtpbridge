@@ -32,10 +32,12 @@ export default defineConfig({
           { text: 'Sessions', link: '/protocol/session' },
           { text: 'Server', link: '/protocol/server' },
           { text: 'Endpoints', link: '/protocol/endpoints' },
+          { text: 'WebSocket Audio', link: '/protocol/websocket' },
           { text: 'File Playback', link: '/protocol/file-playback' },
           { text: 'DTMF', link: '/protocol/dtmf' },
           { text: 'Recording', link: '/protocol/recording' },
           { text: 'VAD', link: '/protocol/vad' },
+          { text: 'Fax Tone Detection', link: '/protocol/fax' },
           { text: 'Statistics', link: '/protocol/stats' },
           { text: 'Events', link: '/protocol/events' }
         ]

@@ -41,21 +41,23 @@ Result:
 
 The client constructs the audio URL itself as `/audio/<connect_token>`.
 
-Direction is from rtpbridge's perspective, matching plain RTP/WebRTC endpoints:
+Direction uses the same peer/SDP perspective as plain RTP and WebRTC endpoints:
 
 - `sendonly` — the endpoint is a **source only**: the peer's audio enters rtpbridge
   (other endpoints hear the WS peer).
 - `recvonly` — the endpoint is a **destination only**: rtpbridge sends other
   endpoints' audio to the WS peer.
 - `sendrecv` — both.
+- `inactive` — neither source nor destination; the endpoint stays attached but is
+  isolated from routing.
 
 ## Wire format
 
 Binary WebSocket frames only. Each frame is **raw little-endian 16-bit mono PCM**
 at the negotiated `sample_rate`. Frames may be any length; rtpbridge reframes the
 inbound stream to 20 ms internally (a trailing partial sample is buffered until the
-next frame). Text frames are ignored; Ping is answered with Pong; Close ends the
-session.
+next frame). Text frames are ignored; Ping is answered with Pong; Close disconnects
+the audio endpoint.
 
 - **Inbound** (peer → rtpbridge): carried as L16 at `sample_rate` (no resampling at
   the socket) and routed to destinations (resampled/transcoded to their codecs as

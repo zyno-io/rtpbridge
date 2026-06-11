@@ -1,6 +1,6 @@
 # DTMF
 
-DTMF (telephone-event, RFC 4733) is always negotiated on every endpoint. DTMF packets are **never transcoded** — they bypass the audio transcode pipeline and are forwarded directly between endpoints, with payload type remapping if needed.
+DTMF uses telephone-event RTP packets (RFC 4733). WebRTC endpoints use payload type 101, and plain RTP/SRTP endpoints use the negotiated telephone-event payload type when present. File, tone, bridge, and WebSocket audio endpoints do not have a telephone-event payload type. DTMF packets are **never transcoded** — they bypass the audio transcode pipeline and are forwarded directly between compatible RTP/WebRTC endpoints, with payload type remapping if needed.
 
 ## Detection
 
@@ -23,7 +23,7 @@ Supported digits: `0`-`9`, `*`, `#`, `A`-`D`.
 
 ### endpoint.dtmf.inject
 
-Send a DTMF digit into an endpoint's outbound stream.
+Send a DTMF digit into an endpoint's outbound stream. The endpoint must have a telephone-event payload type, so this is supported for WebRTC and plain RTP/SRTP endpoints.
 
 ```json
 {
@@ -49,4 +49,4 @@ The digit is sent as RFC 4733 telephone-event RTP packets with proper start/cont
 
 ## Forwarding
 
-DTMF packets received from one endpoint are forwarded to all other endpoints in the session according to the routing table. If the source and destination endpoints negotiated different payload types for telephone-event, the PT is remapped automatically.
+DTMF packets received from one endpoint are forwarded to compatible destinations in the session according to the routing table. If the source and destination endpoints negotiated different payload types for telephone-event, the PT is remapped automatically.

@@ -25,7 +25,7 @@ rtpbridge sits between VoIP endpoints, routing audio between them with support f
 ### Build
 
 ```bash
-# Requires Rust 1.88+, cmake (for Opus)
+# Requires Rust 1.94+ and libopus development headers
 cargo build --release
 ```
 
@@ -58,7 +58,7 @@ websocat ws://localhost:9100
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--listen` | `0.0.0.0:9100` | WebSocket control plane address |
+| `--listen` | `0.0.0.0:9100` | WebSocket/HTTP control plane address(es), comma-separated |
 | `--media-ip` | `127.0.0.1` | IP for all media sockets (RTP/WebRTC) |
 | `--config` | — | Path to TOML config file |
 | `--log-level` | `info` | Log level (trace/debug/info/warn/error) |
@@ -101,9 +101,14 @@ All communication uses JSON over WebSocket. Each connection is bound to exactly 
 | `endpoint.create_from_offer` | Create endpoint from remote SDP offer (auto-detects WebRTC vs RTP) |
 | `endpoint.create_offer` | Create a new endpoint and generate SDP offer |
 | `endpoint.accept_answer` | Accept remote SDP answer |
+| `endpoint.accept_offer` | Accept remote SDP offer for an existing endpoint |
 | `endpoint.create_with_file` | Create file playback endpoint |
+| `endpoint.create_tone` | Create generated tone endpoint |
+| `endpoint.create_websocket` | Create raw PCM WebSocket audio endpoint |
 | `endpoint.remove` | Remove an endpoint |
 | `endpoint.ice_restart` | ICE restart (WebRTC only) |
+| `endpoint.update_direction` | Override or restore endpoint routing direction |
+| `endpoint.update_remote_sdp` | Update remote RTP address/SRTP state without codec changes |
 | `endpoint.file.seek` | Seek file playback position |
 | `endpoint.file.pause` | Pause file playback |
 | `endpoint.file.resume` | Resume file playback |
@@ -126,7 +131,12 @@ All communication uses JSON over WebSocket. Each connection is bound to exactly 
 |-------|-------------|
 | `dtmf` | DTMF digit detected from remote endpoint |
 | `endpoint.state_changed` | Endpoint state transition |
+| `endpoint.ice_state_changed` | WebRTC ICE state transition |
 | `endpoint.file.finished` | File playback completed |
+| `endpoint.tone.finished` | Tone generation completed |
+| `endpoint.ws.connected` | WebSocket audio socket attached |
+| `endpoint.ws.disconnected` | WebSocket audio socket closed |
+| `endpoint.ws.connect_timeout` | WebSocket audio endpoint was not dialed in before timeout |
 | `endpoint.media_timeout` | No media received from remote endpoint |
 | `endpoint.rtcp_bye` | RTCP BYE received from remote endpoint |
 | `endpoint.transferred_out` | Endpoint transferred to another session |
@@ -139,14 +149,16 @@ All communication uses JSON over WebSocket. Each connection is bound to exactly 
 | `stats` | Periodic session statistics |
 | `vad.speech_started` | Speech detected after silence |
 | `vad.silence` | Periodic silence notification |
+| `vad.error` | VAD analysis decoder could not be created |
 | `fax.cng_detected` | Fax calling tone (CNG, 1100 Hz) detected |
 | `fax.ced_detected` | Fax/modem answer tone (CED, 2100 Hz) detected |
+| `fax.error` | Fax analysis decoder could not be created |
 
 See [Events Reference](docs/protocol/events.md) for detailed payload schemas.
 
 ### HTTP REST API
 
-rtpbridge also serves HTTP endpoints on the same listen address. See [Configuration — HTTP REST API](docs/guide/configuration.md#http-rest-api) for full details including status codes and pagination.
+rtpbridge also serves HTTP endpoints on the same listen address(es). See [Configuration — HTTP REST API](docs/guide/configuration.md#http-rest-api) for full details including status codes and pagination.
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|

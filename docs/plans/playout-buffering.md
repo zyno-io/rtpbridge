@@ -1,5 +1,10 @@
 # Plan: ingress playout / re-pacing buffering
 
+> Status: historical design plan, not a configuration reference. The current
+> implementation lives in `src/session/playout.rs` and related session/mixer
+> code. The proposed `playout_*` config tunables and `playout_depth_ms` gauge
+> described below are not currently exposed.
+
 > Revision 2. Incorporates Codex round-1 review: DTMF split before buffering, shared
 > mixer grid + flush ordering, one-frame-per-source-per-tick guarantee, policy recompute on
 > tap changes, explicit `TrackedClock` SSRC/wrap spec.

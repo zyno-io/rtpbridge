@@ -1,0 +1,14 @@
+# Minimal image carrying only the fully-static pcap2audio binary.
+#
+# The binary is built upstream by the build:pcap2audio CI job (fully-static musl,
+# vendored OpenSSL, static libopus) and dropped into the build context, so this
+# image needs no base layer at all.
+#
+# Two ways to use it:
+#   1. Copy it into another image:
+#        COPY --from=<registry>/rtpbridge/pcap2audio:main /usr/local/bin/pcap2audio /usr/local/bin/
+#   2. Run it directly (the static binary needs no runtime libs):
+#        docker run --rm -v "$PWD:/data" <registry>/rtpbridge/pcap2audio:main /data/rec.pcap /data/out.wav
+FROM scratch
+COPY pcap2audio /usr/local/bin/pcap2audio
+ENTRYPOINT ["/usr/local/bin/pcap2audio"]

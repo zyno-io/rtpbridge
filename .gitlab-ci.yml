@@ -208,6 +208,34 @@ build:pcap2audio:
       - pcap2audio
     expire_in: 30 days
 
+# Package the fully-static pcap2audio binary (artifact from build:pcap2audio)
+# into a minimal scratch image, published under the pcap2audio/ sub-repo of the
+# project registry. Lets downstream Dockerfiles pull the binary with
+# `COPY --from=.../rtpbridge/pcap2audio:main /usr/local/bin/pcap2audio ...`
+# (or run it directly — the binary is fully static, so scratch is enough).
+build:pcap2audio-image:
+  extends: .build-base
+  needs:
+    - build:pcap2audio
+  # Override .build-base's `dependencies: []` so the binary artifact is fetched.
+  dependencies:
+    - build:pcap2audio
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH == "main"
+  variables:
+    IMAGE: ${CI_REGISTRY_IMAGE}/pcap2audio
+  script: |
+    if [ -n "$CI_COMMIT_TAG" ]; then
+      TAGS="${CI_COMMIT_TAG} latest"
+    else
+      TAGS="main ${CI_COMMIT_SHA}"
+    fi
+    TAG_ARGS=""
+    for t in $TAGS; do TAG_ARGS="$TAG_ARGS -t ${IMAGE}:${t}"; done
+    buildah bud -f Dockerfile.pcap2audio $TAG_ARGS .
+    for t in $TAGS; do buildah push "${IMAGE}:${t}"; done
+
 build:release:
   extends: .build-base
   stage: release

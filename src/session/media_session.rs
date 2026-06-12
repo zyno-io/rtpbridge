@@ -873,23 +873,11 @@ impl SessionState {
                 let bind_ip = binding.ip;
                 let pool = Arc::clone(&binding.pool);
                 let pair = pool.allocate_pair().await?;
-                let all_codecs = vec![
-                    sdp::CODEC_PCMU,
-                    sdp::CODEC_G722,
-                    sdp::CODEC_OPUS,
-                    sdp::CODEC_TELEPHONE_EVENT,
-                ];
-                let offer_codecs = if let Some(ref names) = codecs {
-                    all_codecs
-                        .into_iter()
-                        .filter(|c| {
-                            c.name == "telephone-event"
-                                || names.iter().any(|n| n.eq_ignore_ascii_case(c.name))
-                        })
-                        .collect()
-                } else {
-                    all_codecs
-                };
+                // Advertise the caller's preferred codec order, or highest-
+                // quality-first (Opus > G.722 > PCMU) when unspecified, so the
+                // SIP answerer's default first-match selection stays as wideband
+                // as it can instead of dropping to PCMU. See `offer_codec_list`.
+                let offer_codecs = sdp::offer_codec_list(codecs.as_deref());
                 let (ep, offer) = RtpEndpoint::create_offer(
                     id,
                     direction,

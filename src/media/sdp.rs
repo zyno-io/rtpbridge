@@ -76,6 +76,42 @@ pub fn select_answer_codec(codecs: &[SdpCodec]) -> Option<&SdpCodec> {
         })
 }
 
+/// Codecs to advertise in a plain-RTP offer.
+///
+/// With no caller preference (`prefer` is `None`), codecs are advertised
+/// highest audio quality first (Opus > G.722 > PCMU) so an answerer doing the
+/// RFC 3264 default — take the offerer's first-listed mutually-supported codec —
+/// lands on the best codec both legs share. This is the offer-side mirror of
+/// [`select_answer_codec`]; a PCMU-first default would instead push SIP peers
+/// onto narrowband even when Opus or G.722 are available.
+///
+/// When `prefer` is `Some`, it carries the caller's preferred codec order (the
+/// control-plane `codecs` field, documented as "preferred codec order"): codecs
+/// are advertised in exactly that order, matched case-insensitively, with
+/// unknown and duplicate names skipped.
+///
+/// `telephone-event` is always advertised last for DTMF (RFC 4733), regardless
+/// of `prefer`.
+pub fn offer_codec_list(prefer: Option<&[String]>) -> Vec<SdpCodec> {
+    let known = [CODEC_OPUS, CODEC_G722, CODEC_PCMU];
+    let mut codecs: Vec<SdpCodec> = match prefer {
+        Some(names) => {
+            let mut ordered: Vec<SdpCodec> = Vec::with_capacity(names.len());
+            for name in names {
+                if let Some(c) = known.iter().find(|c| name.eq_ignore_ascii_case(c.name)) {
+                    if !ordered.iter().any(|e| e.pt == c.pt) {
+                        ordered.push(c.clone());
+                    }
+                }
+            }
+            ordered
+        }
+        None => known.to_vec(),
+    };
+    codecs.push(CODEC_TELEPHONE_EVENT);
+    codecs
+}
+
 /// Parsed SDP info relevant to plain RTP
 #[derive(Debug, Clone)]
 pub struct ParsedSdp {
@@ -450,6 +486,81 @@ mod tests {
         // Only telephone-event (or empty) yields no media codec.
         assert!(select_answer_codec(&[CODEC_TELEPHONE_EVENT]).is_none());
         assert!(select_answer_codec(&[]).is_none());
+    }
+
+    #[test]
+    fn test_offer_codec_list_is_quality_ordered() {
+        // Default offer advertises Opus first, then G.722, then PCMU, with
+        // telephone-event last — never PCMU-first.
+        let names: Vec<&str> = offer_codec_list(None).iter().map(|c| c.name).collect();
+        assert_eq!(names, vec!["opus", "G722", "PCMU", "telephone-event"]);
+
+        // The list is non-increasing in codec_quality (regression guard against
+        // a future PCMU-first reorder).
+        let list = offer_codec_list(None);
+        for pair in list.windows(2) {
+            assert!(
+                codec_quality(&pair[0]) >= codec_quality(&pair[1]),
+                "offer codec order must be quality-descending: {} before {}",
+                pair[0].name,
+                pair[1].name
+            );
+        }
+    }
+
+    #[test]
+    fn test_offer_codec_list_honors_caller_preference() {
+        // A caller-specified order is advertised verbatim (RFC 3264 "preferred
+        // codec order"), matched case-insensitively, with telephone-event last —
+        // the quality default does NOT override an explicit preference.
+        let prefer = vec!["pcmu".to_string(), "opus".to_string()];
+        let names: Vec<&str> = offer_codec_list(Some(&prefer))
+            .iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(names, vec!["PCMU", "opus", "telephone-event"]);
+
+        // Reversing the preference flips the advertised order.
+        let prefer = vec!["opus".to_string(), "pcmu".to_string()];
+        let names: Vec<&str> = offer_codec_list(Some(&prefer))
+            .iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(names, vec!["opus", "PCMU", "telephone-event"]);
+
+        // Unknown and duplicate names are skipped; a single codec keeps DTMF.
+        let prefer = vec!["g729".to_string(), "PCMU".to_string(), "pcmu".to_string()];
+        let names: Vec<&str> = offer_codec_list(Some(&prefer))
+            .iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(names, vec!["PCMU", "telephone-event"]);
+    }
+
+    #[test]
+    fn test_generated_offer_lists_opus_first() {
+        // End-to-end: the m= line advertises Opus's PT (111) ahead of the
+        // narrowband PTs so the answerer's first-match selection picks Opus.
+        let addr: SocketAddr = "192.168.1.1:5060".parse().unwrap();
+        let list = offer_codec_list(None);
+        let refs: Vec<&SdpCodec> = list.iter().collect();
+        let sdp = generate_sdp_offer(addr, 30000, &refs, None, 12345);
+
+        let m_line = sdp
+            .lines()
+            .find(|l| l.starts_with("m=audio"))
+            .expect("m=audio line present");
+        assert_eq!(m_line, "m=audio 30000 RTP/AVP 111 9 0 101");
+
+        // Opus leads (48 kHz) but telephone-event stays at the SIP-friendly
+        // 8 kHz; DTMF timing keys off the negotiated telephone-event clock, not
+        // the audio codec, so this no longer breaks DTMF for Opus.
+        assert!(sdp.contains("a=rtpmap:111 opus/48000/2"));
+        assert!(
+            sdp.contains("a=rtpmap:101 telephone-event/8000"),
+            "telephone-event must be advertised at 8000 even when Opus leads:\n{sdp}"
+        );
+        assert!(!sdp.contains("telephone-event/48000"));
     }
 
     #[test]

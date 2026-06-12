@@ -59,6 +59,10 @@ pub struct RtpEndpoint {
     recv_clock_rate: u32,
     /// Telephone-event payload type (for DTMF)
     pub telephone_event_pt: Option<u8>,
+    /// Negotiated telephone-event (RFC 4733) clock. DTMF event durations and
+    /// timestamps are expressed in this clock, independent of the audio codec
+    /// clock (`send_codec`). Defaults to the 8000 SIP convention.
+    pub telephone_event_clock_rate: u32,
 
     /// RTCP statistics
     pub rtcp_stats: RtcpStats,
@@ -162,6 +166,7 @@ impl RtpEndpoint {
             send_codec: None,
             recv_clock_rate: 8000,
             telephone_event_pt: None,
+            telephone_event_clock_rate: 8000,
             rtcp_stats: RtcpStats::new(),
             last_rtcp_sent: Instant::now(),
             seq_no: rand::random(),
@@ -393,6 +398,7 @@ impl RtpEndpoint {
         }
 
         endpoint.telephone_event_pt = parsed.telephone_event_pt;
+        endpoint.telephone_event_clock_rate = parsed.telephone_event_clock_rate.unwrap_or(8000);
 
         // Pick the highest-quality offered codec as our send codec (rather than
         // the offerer's first-listed preference), and learn the receive clock rate.
@@ -503,10 +509,11 @@ impl RtpEndpoint {
         let mut endpoint = Self::new(id, direction, socket_pair);
         endpoint.codecs = codecs.to_vec();
         endpoint.send_codec = codecs.iter().find(|c| c.name != "telephone-event").cloned();
-        endpoint.telephone_event_pt = codecs
-            .iter()
-            .find(|c| c.name == "telephone-event")
-            .map(|c| c.pt);
+        let te_codec = codecs.iter().find(|c| c.name == "telephone-event");
+        endpoint.telephone_event_pt = te_codec.map(|c| c.pt);
+        // Provisional until the answer; we advertise telephone-event at this
+        // clock (8000 for a default offer) and finalize in accept_answer.
+        endpoint.telephone_event_clock_rate = te_codec.map_or(8000, |c| c.clock_rate);
 
         // Generate crypto if SRTP requested
         let crypto = if srtp {
@@ -630,6 +637,9 @@ impl RtpEndpoint {
         }
 
         self.telephone_event_pt = parsed.telephone_event_pt;
+        // Finalize the negotiated DTMF clock from the answer (defaulting to the
+        // 8000 SIP convention if the peer answered without a telephone-event).
+        self.telephone_event_clock_rate = parsed.telephone_event_clock_rate.unwrap_or(8000);
         // Update receive clock rate from the answer's codec
         if let Some(ref sc) = self.send_codec {
             self.recv_clock_rate = sc.clock_rate;
@@ -1194,10 +1204,11 @@ impl RtpEndpoint {
         if !marker && let Some(ts) = self.dtmf_wire_ts {
             return ts;
         }
-        // Marker packet (or the first packet ever): (re-)anchor.
-        let bump = self
-            .learned_step
-            .unwrap_or_else(|| self.send_codec.as_ref().map_or(160, |c| c.clock_rate / 50));
+        // Marker packet (or the first packet ever): (re-)anchor. Advance by one
+        // 20ms frame in the *telephone-event* clock — DTMF timestamps live on the
+        // negotiated telephone-event timeline, not the audio codec clock (these
+        // coincide at 8000 for a typical SIP phone, but not when media is Opus).
+        let bump = self.telephone_event_clock_rate / 50;
         let anchor = self
             .last_outbound_ts
             .map_or(fallback_ts, |t| t.wrapping_add(bump));
@@ -2631,6 +2642,32 @@ mod tests {
             "audio advances from the DTMF-seeded anchor, not the source TS"
         );
         assert!(marker, "first audio after DTMF re-anchors with a marker");
+    }
+
+    /// DTMF timestamps advance on the telephone-event clock, not the audio codec
+    /// clock. With Opus media (48000) but telephone-event negotiated at 8000, the
+    /// per-event bump must be one 20ms frame at 8000 (160), not 48000 (960) —
+    /// otherwise digits sent to a SIP phone land on the wrong timeline.
+    #[tokio::test]
+    async fn test_dtmf_outbound_ts_uses_te_clock_not_media_clock() {
+        let mut ep = mk_ts_endpoint(53300, 53400).await;
+        ep.telephone_event_pt = Some(101);
+        ep.send_codec = Some(crate::media::sdp::CODEC_OPUS); // media @ 48000
+        ep.telephone_event_clock_rate = 8000; // DTMF negotiated @ 8000
+        let audio_src = EndpointId::new_v4();
+
+        // Two Opus-spaced audio packets (960 apart) would teach a media-clock
+        // bump; the DTMF bump must still be 160.
+        ep.advance_outbound_timeline(audio_src, 1000, false);
+        ep.advance_outbound_timeline(audio_src, 1960, false);
+        let anchor = ep.last_outbound_ts.unwrap();
+
+        let dtmf_ts = ep.dtmf_outbound_ts(true, 0x1234);
+        assert_eq!(
+            dtmf_ts,
+            anchor.wrapping_add(160),
+            "DTMF bump must use the te clock (8000/50=160), not media (48000/50=960)"
+        );
     }
 
     #[tokio::test]

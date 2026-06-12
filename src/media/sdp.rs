@@ -82,6 +82,11 @@ pub struct ParsedSdp {
     pub remote_addr: Option<SocketAddr>,
     pub codecs: Vec<SdpCodec>,
     pub telephone_event_pt: Option<u8>,
+    /// Negotiated telephone-event rtpmap clock (RFC 4733). `None` if no
+    /// telephone-event was advertised; consumers default to 8000. Tracked
+    /// independently of the media codec clock since DTMF event durations are
+    /// expressed in this clock, not the audio codec's.
+    pub telephone_event_clock_rate: Option<u32>,
     pub crypto: Option<SdpCrypto>,
     pub is_webrtc: bool,
     pub direction: Option<String>,
@@ -107,6 +112,7 @@ pub fn parse_sdp(sdp: &str) -> ParsedSdp {
         remote_addr: None,
         codecs: Vec::new(),
         telephone_event_pt: None,
+        telephone_event_clock_rate: None,
         crypto: None,
         is_webrtc: false,
         direction: None,
@@ -203,6 +209,10 @@ pub fn parse_sdp(sdp: &str) -> ParsedSdp {
                 }
                 if name.eq_ignore_ascii_case("telephone-event") {
                     result.telephone_event_pt = Some(pt);
+                    // Track the negotiated DTMF clock; default a malformed/zero
+                    // rate to the 8000 SIP convention.
+                    result.telephone_event_clock_rate =
+                        Some(if clock_rate > 0 { clock_rate } else { 8000 });
                 }
             }
         } else if let Some(rest) = line.strip_prefix("a=crypto:") {
@@ -309,7 +319,7 @@ pub fn generate_sdp_offer(
     crypto: Option<&SdpCrypto>,
     session_id: u64,
 ) -> String {
-    generate_sdp(local_addr, rtp_port, codecs, crypto, session_id, true)
+    generate_sdp(local_addr, rtp_port, codecs, crypto, session_id)
 }
 
 /// Generate an SDP answer for a plain RTP endpoint
@@ -320,7 +330,7 @@ pub fn generate_sdp_answer(
     crypto: Option<&SdpCrypto>,
     session_id: u64,
 ) -> String {
-    generate_sdp(local_addr, rtp_port, codecs, crypto, session_id, false)
+    generate_sdp(local_addr, rtp_port, codecs, crypto, session_id)
 }
 
 fn generate_sdp(
@@ -329,7 +339,6 @@ fn generate_sdp(
     codecs: &[&SdpCodec],
     crypto: Option<&SdpCrypto>,
     session_id: u64,
-    is_offer: bool,
 ) -> String {
     let ip = local_addr.ip();
     let ip_ver = if ip.is_ipv4() { "IP4" } else { "IP6" };
@@ -338,13 +347,6 @@ fn generate_sdp(
     } else {
         "RTP/AVP"
     };
-
-    // Determine the primary audio clock rate for telephone-event matching
-    let audio_clock_rate = codecs
-        .iter()
-        .find(|c| c.name != "telephone-event")
-        .map(|c| c.clock_rate)
-        .unwrap_or(8000);
 
     // Collect all PTs including telephone-event
     let mut all_codecs: Vec<&SdpCodec> = codecs.to_vec();
@@ -369,19 +371,13 @@ fn generate_sdp(
 
     // rtpmap for each codec
     for codec in &all_codecs {
-        // For offers, match the telephone-event clock to our chosen audio codec
-        // (RFC 4733). For answers, echo the offered telephone-event rate as-is —
-        // redefining the offered PT's clock (e.g. to 48000 when Opus is selected)
-        // can make peers reject or ignore DTMF (RFC 3264).
-        let rate = if codec.name == "telephone-event" {
-            if is_offer {
-                audio_clock_rate
-            } else {
-                codec.clock_rate
-            }
-        } else {
-            codec.clock_rate
-        };
+        // Advertise each codec at its own clock. telephone-event therefore stays
+        // at its narrowband 8000 in our offers (`CODEC_TELEPHONE_EVENT`) — the
+        // SIP convention — and echoes the offered rate on answers. DTMF timing
+        // is keyed off this negotiated telephone-event clock (tracked on the
+        // endpoint and used by the DTMF path), NOT the audio codec clock, so
+        // leading the offer with Opus no longer drags telephone-event to 48000.
+        let rate = codec.clock_rate;
         if let Some(ch) = codec.channels {
             sdp.push_str(&format!(
                 "a=rtpmap:{} {}/{}/{}\r\n",
@@ -454,6 +450,50 @@ mod tests {
         // Only telephone-event (or empty) yields no media codec.
         assert!(select_answer_codec(&[CODEC_TELEPHONE_EVENT]).is_none());
         assert!(select_answer_codec(&[]).is_none());
+    }
+
+    #[test]
+    fn test_parse_telephone_event_clock_rate() {
+        let sdp8 = "v=0\r\no=- 1 1 IN IP4 1.2.3.4\r\ns=-\r\nc=IN IP4 1.2.3.4\r\n\
+            t=0 0\r\nm=audio 5000 RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\n\
+            a=rtpmap:101 telephone-event/8000\r\n";
+        let parsed = parse_sdp(sdp8);
+        assert_eq!(parsed.telephone_event_pt, Some(101));
+        assert_eq!(parsed.telephone_event_clock_rate, Some(8000));
+
+        // A WebRTC-style offer advertises telephone-event at 48000.
+        let sdp48 = "v=0\r\no=- 1 1 IN IP4 1.2.3.4\r\ns=-\r\nc=IN IP4 1.2.3.4\r\n\
+            t=0 0\r\nm=audio 5000 RTP/AVP 111 101\r\na=rtpmap:111 opus/48000/2\r\n\
+            a=rtpmap:101 telephone-event/48000\r\n";
+        let parsed = parse_sdp(sdp48);
+        assert_eq!(parsed.telephone_event_clock_rate, Some(48000));
+
+        // No telephone-event advertised → None (consumers default to 8000).
+        let sdp_none = "v=0\r\no=- 1 1 IN IP4 1.2.3.4\r\ns=-\r\nc=IN IP4 1.2.3.4\r\n\
+            t=0 0\r\nm=audio 5000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+        assert_eq!(parse_sdp(sdp_none).telephone_event_clock_rate, None);
+    }
+
+    #[test]
+    fn test_answer_echoes_offered_telephone_event_clock() {
+        let addr: SocketAddr = "192.168.1.1:5060".parse().unwrap();
+
+        // Answering with Opus media but a telephone-event offered at 8000 keeps
+        // telephone-event at 8000 — the te clock is independent of the media
+        // codec (proves Approach B, not a media-coupled rate).
+        let codecs = vec![&CODEC_OPUS, &CODEC_TELEPHONE_EVENT];
+        let ans = generate_sdp_answer(addr, 30000, &codecs, None, 1);
+        assert!(ans.contains("opus/48000"));
+        assert!(ans.contains("a=rtpmap:101 telephone-event/8000"));
+        assert!(!ans.contains("telephone-event/48000"));
+
+        // When the remote actually offered telephone-event/48000, the answer
+        // echoes 48000 — proving this is B (echo negotiated), not hard-coded 8000.
+        let mut te48 = CODEC_TELEPHONE_EVENT;
+        te48.clock_rate = 48000;
+        let codecs = vec![&CODEC_OPUS, &te48];
+        let ans = generate_sdp_answer(addr, 30000, &codecs, None, 1);
+        assert!(ans.contains("a=rtpmap:101 telephone-event/48000"));
     }
 
     #[test]

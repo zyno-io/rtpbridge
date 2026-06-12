@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use super::endpoint::RoutedRtpPacket;
-use super::endpoint_enum::{Endpoint, endpoint_rtp_clock_rate};
+use super::endpoint_enum::Endpoint;
 use super::routing::RoutingTable;
 use crate::control::protocol::*;
 use crate::media::dtmf::{self, DtmfDetector, DtmfGenerator};
@@ -53,7 +53,7 @@ pub fn build_dtmf_injection(
         .telephone_event_pt()
         .ok_or_else(|| anyhow::anyhow!("No telephone-event PT negotiated"))?;
 
-    let clock_rate = endpoint_rtp_clock_rate(ep);
+    let clock_rate = ep.telephone_event_clock_rate();
     let dtmf_packets = DtmfGenerator::generate(digit, duration_ms, volume, clock_rate, 20)
         .ok_or_else(|| anyhow::anyhow!("Invalid DTMF digit: {digit}"))?;
 
@@ -126,7 +126,7 @@ pub async fn process_dtmf_packets(
         if let Some(ds) = dtmf_state.get_mut(&pkt.source_endpoint_id) {
             let clock_rate = endpoints
                 .get(&pkt.source_endpoint_id)
-                .map(endpoint_rtp_clock_rate)
+                .map(Endpoint::telephone_event_clock_rate)
                 .unwrap_or(8000);
             if let Some(evt) = ds.detector.process(&pkt.payload, pkt.timestamp, clock_rate) {
                 debug!(
@@ -150,13 +150,34 @@ pub async fn process_dtmf_packets(
             }
         }
 
-        // Forward DTMF to destinations (no transcoding, just PT remap if needed)
+        // Forward DTMF to destinations: remap to the destination's telephone-event
+        // PT and rescale the RFC 4733 duration when the destination's event clock
+        // differs from the source's (e.g. WebRTC 48000 → SIP 8000). Destinations
+        // that did not negotiate telephone-event can't carry RFC 4733 DTMF, so
+        // skip them rather than forwarding a packet under a foreign PT.
         if let Some(dests) = routing.destinations(&pkt.source_endpoint_id) {
+            let src_clock = endpoints
+                .get(&pkt.source_endpoint_id)
+                .map(Endpoint::telephone_event_clock_rate)
+                .unwrap_or(8000);
             for &dest_id in dests {
                 if let Some(dest_ep) = endpoints.get_mut(&dest_id) {
+                    let Some(te_pt) = dest_ep.telephone_event_pt() else {
+                        continue;
+                    };
+                    let dst_clock = dest_ep.telephone_event_clock_rate();
                     let mut forwarded = pkt.clone();
-                    if let Some(te_pt) = dest_ep.telephone_event_pt() {
-                        forwarded.payload_type = te_pt;
+                    forwarded.payload_type = te_pt;
+                    dtmf::rescale_event_duration(&mut forwarded.payload, src_clock, dst_clock);
+                    // Rescale the RTP timestamp the same way the audio path does
+                    // (see media_session forwarding) so DTMF shares the
+                    // destination's timeline. `RtpEndpoint::write_rtp` re-anchors
+                    // DTMF timestamps regardless; this is what keeps DTMF aligned
+                    // with rescaled audio on a WebRTC destination, whose writer
+                    // forwards the timestamp unchanged.
+                    if src_clock != dst_clock && src_clock > 0 {
+                        forwarded.timestamp =
+                            ((pkt.timestamp as u64 * dst_clock as u64) / src_clock as u64) as u32;
                     }
                     let result: anyhow::Result<Option<Vec<u8>>> = match dest_ep {
                         Endpoint::WebRtc(wep) => wep.write_rtp(&forwarded).map(|()| None),
@@ -187,7 +208,7 @@ pub fn check_dtmf_timeouts(
     for (eid, ds) in dtmf_state.iter_mut() {
         let clock_rate = endpoints
             .get(eid)
-            .map(endpoint_rtp_clock_rate)
+            .map(Endpoint::telephone_event_clock_rate)
             .unwrap_or(8000);
         if let Some(evt) = ds.detector.check_timeout(clock_rate) {
             debug!(

@@ -106,6 +106,22 @@ impl Endpoint {
         }
     }
 
+    /// Negotiated telephone-event (RFC 4733 DTMF) clock for this endpoint.
+    /// Distinct from [`endpoint_rtp_clock_rate`], which is the audio codec clock:
+    /// DTMF event durations/timestamps are expressed in this telephone-event
+    /// clock. Plain RTP carries the rate negotiated in SDP (8000 for a typical
+    /// SIP phone); WebRTC uses 48000 to match its Opus offer.
+    pub fn telephone_event_clock_rate(&self) -> u32 {
+        match self {
+            Endpoint::WebRtc(_) => 48000,
+            Endpoint::Rtp(ep) => ep.telephone_event_clock_rate,
+            Endpoint::File(_)
+            | Endpoint::Tone(_)
+            | Endpoint::Bridge(_)
+            | Endpoint::WebSocket(_) => 8000,
+        }
+    }
+
     /// Codec name for stats (e.g. "PCMU", "opus")
     pub fn codec_name(&self) -> String {
         match self {

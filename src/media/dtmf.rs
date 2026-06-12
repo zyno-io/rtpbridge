@@ -271,6 +271,24 @@ fn digit_to_event_id(digit: char) -> Option<u8> {
     }
 }
 
+/// Rescale the RFC 4733 duration field of a telephone-event payload from
+/// `src_clock` to `dst_clock`, in place. The duration is carried in clock
+/// ticks (bytes 2–3, big-endian), so forwarding DTMF between two legs whose
+/// telephone-event clocks differ (e.g. WebRTC 48000 ↔ SIP 8000) requires
+/// rescaling — otherwise the far end renders the wrong digit length. Event id,
+/// E/R bits, and volume are left untouched. No-op when the clocks match, either
+/// clock is zero, or the payload is shorter than 4 bytes.
+pub fn rescale_event_duration(payload: &mut [u8], src_clock: u32, dst_clock: u32) {
+    if payload.len() < 4 || src_clock == dst_clock || src_clock == 0 || dst_clock == 0 {
+        return;
+    }
+    let duration = u16::from_be_bytes([payload[2], payload[3]]) as u64;
+    let scaled = (duration * dst_clock as u64 / src_clock as u64).min(u16::MAX as u64) as u16;
+    let bytes = scaled.to_be_bytes();
+    payload[2] = bytes[0];
+    payload[3] = bytes[1];
+}
+
 /// Check if an RTP payload type is a telephone-event PT
 pub fn is_telephone_event_pt(pt: u8, negotiated_te_pt: Option<u8>) -> bool {
     if let Some(te_pt) = negotiated_te_pt {
@@ -394,6 +412,46 @@ mod tests {
         assert!(is_telephone_event_pt(96, None));
         assert!(is_telephone_event_pt(126, None));
         assert!(!is_telephone_event_pt(97, None));
+    }
+
+    #[test]
+    fn test_generate_duration_field_tracks_clock_rate() {
+        // The RFC 4733 duration field is in telephone-event clock ticks. 200ms
+        // at 8000 Hz → 1600 ticks in the final (end-bit) packet.
+        let pkts8 = DtmfGenerator::generate('1', 200, 10, 8000, 20).unwrap();
+        let last8 = &pkts8[pkts8.len() - 1].payload;
+        assert_eq!(u16::from_be_bytes([last8[2], last8[3]]), 1600);
+
+        // The same 200ms at 48000 Hz → 9600 ticks, proving the field follows the
+        // telephone-event clock. (The DTMF path must feed the negotiated te clock
+        // here — 8000 for a SIP phone — not the audio codec clock.)
+        let pkts48 = DtmfGenerator::generate('1', 200, 10, 48000, 20).unwrap();
+        let last48 = &pkts48[pkts48.len() - 1].payload;
+        assert_eq!(u16::from_be_bytes([last48[2], last48[3]]), 9600);
+    }
+
+    #[test]
+    fn test_rescale_event_duration() {
+        // 48000 → 8000: 4800 ticks (100ms) becomes 800 ticks (100ms).
+        let mut p = build_telephone_event(5, true, 10, 4800);
+        rescale_event_duration(&mut p, 48000, 8000);
+        assert_eq!(u16::from_be_bytes([p[2], p[3]]), 800);
+        assert_eq!(p[0], 5, "event id preserved");
+        assert_eq!(p[1], 0x80 | 10, "end bit + volume preserved");
+
+        // 8000 → 48000: the reverse direction.
+        let mut p = build_telephone_event(5, true, 10, 800);
+        rescale_event_duration(&mut p, 8000, 48000);
+        assert_eq!(u16::from_be_bytes([p[2], p[3]]), 4800);
+
+        // No-op when clocks match, a clock is zero, or the payload is too short.
+        let mut p = build_telephone_event(5, true, 10, 800);
+        rescale_event_duration(&mut p, 8000, 8000);
+        assert_eq!(u16::from_be_bytes([p[2], p[3]]), 800);
+        rescale_event_duration(&mut p, 0, 8000);
+        assert_eq!(u16::from_be_bytes([p[2], p[3]]), 800);
+        let mut short = vec![1u8, 2, 3];
+        rescale_event_duration(&mut short, 48000, 8000); // must not panic
     }
 
     #[test]

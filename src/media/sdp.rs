@@ -98,10 +98,10 @@ pub fn offer_codec_list(prefer: Option<&[String]>) -> Vec<SdpCodec> {
         Some(names) => {
             let mut ordered: Vec<SdpCodec> = Vec::with_capacity(names.len());
             for name in names {
-                if let Some(c) = known.iter().find(|c| name.eq_ignore_ascii_case(c.name)) {
-                    if !ordered.iter().any(|e| e.pt == c.pt) {
-                        ordered.push(c.clone());
-                    }
+                if let Some(c) = known.iter().find(|c| name.eq_ignore_ascii_case(c.name))
+                    && !ordered.iter().any(|e| e.pt == c.pt)
+                {
+                    ordered.push(c.clone());
                 }
             }
             ordered

@@ -15,6 +15,7 @@ allow = [
     "Unicode-DFS-2016",
     "Zlib",
     "OpenSSL",
+    "CDLA-Permissive-2.0",
     "LGPL-2.1-or-later",
 ]
 confidence-threshold = 0.8

@@ -139,6 +139,5 @@ jobs:
           image-ref: ghcr.io/${{ github.repository }}:main
           format: table
           exit-code: '1'
+          ignore-unfixed: true
           severity: CRITICAL,HIGH
-          # Ignore base image CVEs with no upstream fix
-          trivyignores: .trivyignore

@@ -50,8 +50,8 @@ jobs:
           image-ref: ghcr.io/${{ github.repository }}:${{ github.ref_name }}
           format: table
           exit-code: '1'
+          ignore-unfixed: true
           severity: CRITICAL,HIGH
-          trivyignores: .trivyignore
 
   release:
     runs-on: ubuntu-latest

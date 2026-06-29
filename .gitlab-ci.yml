@@ -128,9 +128,6 @@ bench:regression:
   image: quay.io/containers/buildah
   before_script:
     - |
-      export BUILDAH_ISOLATION=chroot
-      export STORAGE_DRIVER=vfs
-
       buildah login \
         --username=${CI_REGISTRY_USER} \
         --password=${CI_REGISTRY_PASSWORD} \

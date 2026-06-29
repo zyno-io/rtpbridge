@@ -221,12 +221,12 @@ impl AudioEncoder for G722Encoder {
 // ── Opus ────────────────────────────────────────────────────────────────
 
 pub struct OpusDecoder {
-    decoder: opus::Decoder,
+    decoder: opus2::Decoder,
 }
 
 impl OpusDecoder {
     pub fn new() -> Result<Self> {
-        let decoder = opus::Decoder::new(48000, opus::Channels::Mono)?;
+        let decoder = opus2::Decoder::new(48000, opus2::Channels::Mono)?;
         Ok(Self { decoder })
     }
 }
@@ -246,13 +246,14 @@ impl AudioDecoder for OpusDecoder {
 }
 
 pub struct OpusEncoder {
-    encoder: opus::Encoder,
+    encoder: opus2::Encoder,
 }
 
 impl OpusEncoder {
     pub fn new() -> Result<Self> {
-        let mut encoder = opus::Encoder::new(48000, opus::Channels::Mono, opus::Application::Voip)?;
-        encoder.set_bitrate(opus::Bitrate::Bits(24000))?;
+        let mut encoder =
+            opus2::Encoder::new(48000, opus2::Channels::Mono, opus2::Application::Voip)?;
+        encoder.set_bitrate(opus2::Bitrate::Bits(24000))?;
         Ok(Self { encoder })
     }
 }

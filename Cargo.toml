@@ -38,7 +38,7 @@ anyhow = "1"
 rand = "0.10"
 
 # WebRTC
-str0m = { version = "0.20", default-features = false, features = ["openssl", "vendored"] }
+str0m = { version = "0.21", default-features = false, features = ["openssl", "vendored"] }
 
 # Codecs
 xlaw = "0.0.3"

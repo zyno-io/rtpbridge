@@ -80,6 +80,15 @@ pub struct Metrics {
     /// channel from PARKING the UDP reader; sustained non-zero means the session
     /// task is behind, not that the datapath is wedged.
     pub webrtc_recv_overflow: Counter,
+    /// WebRTC UDP datagrams successfully handed to the OS socket.
+    ///
+    /// This is the send-result counterpart to endpoint outbound RTP counters,
+    /// which are incremented when media is written into str0m. A packet can be
+    /// counted as outbound RTP but still fail at the UDP send step.
+    pub webrtc_udp_send_ok: Counter,
+    /// WebRTC UDP datagrams dropped because `try_send_to` failed or str0m chose a
+    /// local candidate address that no bound endpoint socket owns.
+    pub webrtc_udp_send_dropped: Counter,
 
     /// The Prometheus registry.  Wrapped in a `Mutex` because
     /// `encode()` requires `&Registry` but we need interior mutability
@@ -124,6 +133,8 @@ impl Metrics {
         let webrtc_recv_task_dead = Counter::default();
         let webrtc_recv_task_start_timeout = Counter::default();
         let webrtc_recv_overflow = Counter::default();
+        let webrtc_udp_send_ok = Counter::default();
+        let webrtc_udp_send_dropped = Counter::default();
 
         // Note: prometheus-client automatically appends `_total` to counter
         // names in the encoded output, so we register without that suffix.
@@ -237,6 +248,16 @@ impl Metrics {
             "Inbound WebRTC packets dropped because the session packet channel was full",
             webrtc_recv_overflow.clone(),
         );
+        registry.register(
+            "rtpbridge_webrtc_udp_send_ok",
+            "WebRTC UDP datagrams successfully handed to the OS socket",
+            webrtc_udp_send_ok.clone(),
+        );
+        registry.register(
+            "rtpbridge_webrtc_udp_send_dropped",
+            "WebRTC UDP datagrams dropped at the socket send step",
+            webrtc_udp_send_dropped.clone(),
+        );
         Self {
             sessions_total,
             sessions_active,
@@ -260,6 +281,8 @@ impl Metrics {
             webrtc_recv_task_dead,
             webrtc_recv_task_start_timeout,
             webrtc_recv_overflow,
+            webrtc_udp_send_ok,
+            webrtc_udp_send_dropped,
             registry: Mutex::new(registry),
         }
     }
@@ -297,6 +320,8 @@ mod tests {
         assert!(output.contains("rtpbridge_webrtc_recv_task_dead_total"));
         assert!(output.contains("rtpbridge_webrtc_recv_task_start_timeout_total"));
         assert!(output.contains("rtpbridge_webrtc_recv_overflow_total"));
+        assert!(output.contains("rtpbridge_webrtc_udp_send_ok_total"));
+        assert!(output.contains("rtpbridge_webrtc_udp_send_dropped_total"));
     }
 
     #[test]

@@ -700,13 +700,18 @@ impl WebRtcEndpoint {
                             // Non-blocking send to avoid spawning a task per
                             // packet. UDP sends almost never block; if the socket
                             // isn't ready we drop (acceptable for real-time media).
-                            if let Err(e) =
-                                socket.try_send_to(&transmit.contents, transmit.destination)
-                            {
-                                trace!(error = %e, "UDP send dropped (would block)");
+                            match socket.try_send_to(&transmit.contents, transmit.destination) {
+                                Ok(_) => {
+                                    self.metrics.webrtc_udp_send_ok.inc();
+                                }
+                                Err(e) => {
+                                    self.metrics.webrtc_udp_send_dropped.inc();
+                                    trace!(error = %e, "UDP send dropped (would block)");
+                                }
                             }
                         }
                         None => {
+                            self.metrics.webrtc_udp_send_dropped.inc();
                             warn!(
                                 endpoint_id = %self.id,
                                 source = %transmit.source,

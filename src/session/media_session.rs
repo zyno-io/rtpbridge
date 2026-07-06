@@ -2067,10 +2067,13 @@ impl SessionState {
                 let mut local_rtcp_addr = None;
                 let mut remote_rtp_addr = None;
                 let mut remote_rtcp_addr = None;
+                let mut offer_generation = None;
                 let (ep_type, codec, shared_playback_id) = match ep {
                     Endpoint::WebRtc(w) => {
-                        local_rtp_addr = Some(w.local_addr.to_string());
-                        remote_rtp_addr = w.remote_addr.map(|a| a.to_string());
+                        let (local, remote) = w.recording_addrs();
+                        local_rtp_addr = local.map(|a| a.to_string());
+                        remote_rtp_addr = remote.map(|a| a.to_string());
+                        offer_generation = Some(w.offer_generation);
                         let codec = w
                             .negotiated_codec()
                             .map(|c| c.name.to_string())
@@ -2120,6 +2123,7 @@ impl SessionState {
                     local_rtcp_addr,
                     remote_rtp_addr,
                     remote_rtcp_addr,
+                    offer_generation,
                 }
             })
             .collect();
@@ -2366,6 +2370,22 @@ impl SessionState {
             .values()
             .map(|ep| {
                 let stats = ep.stats();
+                let (local_rtp_addr, remote_rtp_addr, offer_generation) = match ep {
+                    Endpoint::WebRtc(w) => {
+                        let (local, remote) = w.recording_addrs();
+                        (
+                            local.map(|a| a.to_string()),
+                            remote.map(|a| a.to_string()),
+                            Some(w.offer_generation),
+                        )
+                    }
+                    Endpoint::Rtp(r) => (
+                        Some(r.local_rtp_addr.to_string()),
+                        r.remote_rtp_addr.map(|a| a.to_string()),
+                        None,
+                    ),
+                    _ => (None, None, None),
+                };
                 crate::control::protocol::EndpointStats {
                     endpoint_id: ep.id(),
                     inbound: InboundStats {
@@ -2384,6 +2404,9 @@ impl SessionState {
                     rtt_ms: ep.rtt_ms(),
                     codec: ep.codec_name(),
                     state: format!("{:?}", ep.state()),
+                    local_rtp_addr,
+                    remote_rtp_addr,
+                    offer_generation,
                     ice_state: ep.ice_state().map(str::to_string),
                 }
             })

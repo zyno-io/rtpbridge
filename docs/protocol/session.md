@@ -91,6 +91,13 @@ Get details about the current session.
 }
 ```
 
+Endpoint objects include negotiated state such as `endpoint_id`,
+`endpoint_type`, `direction`, `state`, and `codec`. Socket-backed endpoints also
+surface `local_rtp_addr` / `remote_rtp_addr`; for WebRTC these are the
+selected/nominated local candidate base and peer address once known. WebRTC
+endpoints additionally include `offer_generation`, the monotonic ICE-restart
+generation also returned by `endpoint.webrtc.ice_restart`.
+
 ## session.list
 
 List all sessions on the server (not just this connection's session).

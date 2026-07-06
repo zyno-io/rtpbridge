@@ -49,6 +49,9 @@ Unsubscribe from periodic statistics for the currently bound session.
         "rtt_ms": null,
         "codec": "opus",
         "state": "connected",
+        "local_rtp_addr": "127.0.0.1:40000",
+        "remote_rtp_addr": "198.51.100.10:50000",
+        "offer_generation": 2,
         "ice_state": "connected"
       }
     ]
@@ -65,4 +68,6 @@ Unsubscribe from periodic statistics for the currently bound session.
 | `rtt_ms` | Round-trip time from RTCP for plain RTP/SRTP endpoints. `null` until an RTCP Receiver Report referencing the bridge's Sender Report has been received. Currently `null` for WebRTC and non-RTP endpoints. |
 | `codec` | Negotiated codec name (e.g., `"opus"`, `"PCMU"`). Empty string `""` means no codec has been negotiated yet. |
 | `state` | One of: `new`, `buffering`, `connecting`, `connected`, `playing`, `paused`, `disconnected`, `finished`. |
+| `local_rtp_addr` / `remote_rtp_addr` | Current socket addresses for socket-backed endpoints. For WebRTC, these identify the selected/nominated local candidate base and peer address once str0m has transmitted on the selected path. Use them to confirm an ICE restart actually moved media to the expected candidate path. |
+| `offer_generation` | WebRTC-only monotonic ICE-restart offer generation. `0` is the initial offer; each `endpoint.webrtc.ice_restart` increments it. Correlate this with bridge/client restart attempts and selected-path changes. |
 | `ice_state` | str0m ICE connection state for **WebRTC** endpoints: `new`, `checking`, `connected`, `completed`, `disconnected`. Omitted for non-WebRTC endpoints and before the first ICE transition. `disconnected` is ICE consent loss (RFC 7675) — a remote network-path failure. Also surfaced live via the [`endpoint.ice_state_changed`](./events.md) event. |

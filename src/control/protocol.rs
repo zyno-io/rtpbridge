@@ -490,6 +490,18 @@ pub struct EndpointStats {
     pub rtt_ms: Option<f64>,
     pub codec: String,
     pub state: String,
+    /// Local RTP/socket address currently associated with this endpoint. For
+    /// WebRTC this is the selected/nominated local candidate base when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_rtp_addr: Option<String>,
+    /// Remote RTP/socket address currently associated with this endpoint. For
+    /// WebRTC this is the selected/nominated peer address when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_rtp_addr: Option<String>,
+    /// Monotonic WebRTC ICE-restart offer generation. Present only for WebRTC
+    /// endpoints so controllers can correlate stats with restart attempts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offer_generation: Option<u64>,
     /// str0m ICE connection state for WebRTC endpoints (`"new"`, `"checking"`,
     /// `"connected"`, `"completed"`, `"disconnected"`); omitted for non-WebRTC
     /// endpoints or before the first ICE transition. `"disconnected"` is ICE
@@ -626,6 +638,10 @@ pub struct EndpointInfo {
     pub remote_rtp_addr: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_rtcp_addr: Option<String>,
+    /// Monotonic WebRTC ICE-restart offer generation. Present only for WebRTC
+    /// endpoints.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offer_generation: Option<u64>,
 }
 
 // ── Event Data Types ────────────────────────────────────────────────────

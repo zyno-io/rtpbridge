@@ -29,6 +29,8 @@ All metrics use the `rtpbridge_` prefix.
 | `rtpbridge_webrtc_recv_task_dead_total` | Live WebRTC endpoints whose receive task had finished |
 | `rtpbridge_webrtc_recv_task_start_timeout_total` | WebRTC receive tasks that did not start within the grace window |
 | `rtpbridge_webrtc_recv_overflow_total` | Inbound WebRTC packets dropped because the session channel was full |
+| `rtpbridge_webrtc_udp_send_ok_total` | WebRTC UDP datagrams successfully handed to the OS socket |
+| `rtpbridge_webrtc_udp_send_dropped_total` | WebRTC UDP datagrams dropped at the socket send step |
 
 ### Gauges
 
@@ -57,6 +59,13 @@ Scale linearly with active sessions to estimate expected throughput.
 **Events dropped** — `rate(rtpbridge_events_dropped_total[5m])` > 0 means clients aren't reading WebSocket events fast enough. This doesn't affect media flow but means your application is missing events (DTMF, VAD, stats).
 
 **WebRTC receive supervision** — `increase(rtpbridge_webrtc_recv_task_start_timeout_total[15m])` or `increase(rtpbridge_webrtc_recv_task_dead_total[15m])` > 0 means a live WebRTC endpoint lost, or never started, its UDP receive task. Treat this as a media-path incident.
+
+**WebRTC send results** — endpoint outbound RTP counters mean media was written
+into str0m. `rate(rtpbridge_webrtc_udp_send_ok_total[1m])` and
+`rate(rtpbridge_webrtc_udp_send_dropped_total[1m])` show what happened at the UDP
+socket send step. Any sustained non-zero drop rate means rtpbridge is failing to
+hand datagrams to the kernel or str0m selected a local candidate base that no
+bound endpoint socket owns.
 
 **Playout drops/fills** — `rate(rtpbridge_playout_late_drops_total[5m])`, `rate(rtpbridge_playout_overflow_drops_total[5m])`, and `rate(rtpbridge_playout_underflow_fills_total[5m])` show buffering pressure for paced sources. Occasional fills on bursty clockless sources can be normal; sustained drops indicate jitter, overload, or a producer running ahead.
 
@@ -159,6 +168,7 @@ groups:
 | `rate(rtpbridge_events_dropped_total[5m])` | 0 | > 0 | > 0 sustained 5m |
 | `increase(rtpbridge_webrtc_recv_task_dead_total[15m])` | 0 | > 0 | > 0 |
 | `increase(rtpbridge_webrtc_recv_task_start_timeout_total[15m])` | 0 | > 0 | > 0 |
+| `rate(rtpbridge_webrtc_udp_send_dropped_total[1m])` | 0 | > 0 | > 0 sustained 2m |
 | `rtpbridge_sessions_active` vs configured `max_sessions` | < 50% | > 70% | > 80% |
 | `rate(rtpbridge_packets_routed_total[5m])` with active sessions | > 0 | == 0 for 2m | == 0 for 5m |
 
@@ -187,6 +197,7 @@ Recommended panels for a Grafana dashboard:
 **Row 4 — WebRTC / Playout**
 - WebRTC receive task failures — `increase(rtpbridge_webrtc_recv_task_dead_total[15m])`, `increase(rtpbridge_webrtc_recv_task_start_timeout_total[15m])`
 - WebRTC receive overflow — `rate(rtpbridge_webrtc_recv_overflow_total[1m])`
+- WebRTC UDP send drops — `rate(rtpbridge_webrtc_udp_send_dropped_total[1m])`
 - Playout drops/fills — `rate(rtpbridge_playout_late_drops_total[1m])`, `rate(rtpbridge_playout_overflow_drops_total[1m])`, `rate(rtpbridge_playout_underflow_fills_total[1m])`
 
 ## Per-Session Observability

@@ -125,13 +125,13 @@ bench:regression:
 .build-base:
   stage: build
   dependencies: []
-  image: quay.io/containers/buildah
+  image: ghcr.io/zyno-io/container-tooling:latest
   before_script:
     - |
       buildah login \
-        --username=${CI_REGISTRY_USER} \
-        --password=${CI_REGISTRY_PASSWORD} \
-        ${CI_REGISTRY}
+        --username="${CI_REGISTRY_USER}" \
+        --password="${CI_REGISTRY_PASSWORD}" \
+        "${CI_REGISTRY}"
 
 build:canary:
   extends: .build-base

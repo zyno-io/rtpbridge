@@ -1,13 +1,13 @@
 mod helpers;
 
+use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::json;
 use str0m::change::{SdpAnswer, SdpOffer};
 use str0m::net::{Protocol, Receive};
-use str0m::{Candidate, Event, Input, Output, RtcConfig};
+use str0m::{Candidate, Event, IceConnectionState, Input, Output, RtcConfig};
 use tokio::net::UdpSocket;
 
 use helpers::control_client::TestControlClient;
@@ -635,9 +635,57 @@ async fn drive_and_count_rtp(
     peer_addr: std::net::SocketAddr,
     duration: Duration,
 ) -> u64 {
-    let counter = Arc::new(AtomicU64::new(0));
+    let (_connected, count) =
+        drive_rtc_on_sockets(rtc, &[(socket, peer_addr)], duration, false).await;
+    count
+}
+
+async fn recv_from_test_sockets(
+    sockets: &[(&UdpSocket, SocketAddr)],
+    wait: Duration,
+    buf0: &mut [u8],
+    buf1: &mut [u8],
+) -> Option<(Vec<u8>, SocketAddr, SocketAddr)> {
+    assert!(!sockets.is_empty());
+    assert!(sockets.len() <= 2);
+
+    if sockets.len() == 1 {
+        let (socket, local) = sockets[0];
+        return match tokio::time::timeout(wait, socket.recv_from(buf0)).await {
+            Ok(Ok((n, source))) => Some((buf0[..n].to_vec(), source, local)),
+            _ => None,
+        };
+    }
+
+    let (socket0, local0) = sockets[0];
+    let (socket1, local1) = sockets[1];
+    tokio::select! {
+        result = tokio::time::timeout(wait, socket0.recv_from(buf0)) => {
+            match result {
+                Ok(Ok((n, source))) => Some((buf0[..n].to_vec(), source, local0)),
+                _ => None,
+            }
+        }
+        result = tokio::time::timeout(wait, socket1.recv_from(buf1)) => {
+            match result {
+                Ok(Ok((n, source))) => Some((buf1[..n].to_vec(), source, local1)),
+                _ => None,
+            }
+        }
+    }
+}
+
+async fn drive_rtc_on_sockets(
+    rtc: &mut str0m::Rtc,
+    sockets: &[(&UdpSocket, SocketAddr)],
+    duration: Duration,
+    stop_on_ice_connected: bool,
+) -> (bool, u64) {
     let deadline = Instant::now() + duration;
     let mut buf = vec![0u8; 2048];
+    let mut buf_alt = vec![0u8; 2048];
+    let mut connected = false;
+    let mut rtp_count = 0;
 
     while Instant::now() < deadline {
         match rtc.poll_output() {
@@ -646,33 +694,48 @@ async fn drive_and_count_rtp(
                     .checked_duration_since(Instant::now())
                     .unwrap_or(Duration::ZERO)
                     .min(Duration::from_millis(10));
-                match tokio::time::timeout(wait, socket.recv_from(&mut buf)).await {
-                    Ok(Ok((n, source))) => {
-                        if let Ok(receive) =
-                            Receive::new(Protocol::Udp, source, peer_addr, &buf[..n])
-                        {
-                            let _ = rtc.handle_input(Input::Receive(Instant::now(), receive));
-                        }
+                if let Some((data, source, local)) =
+                    recv_from_test_sockets(sockets, wait, &mut buf, &mut buf_alt).await
+                {
+                    if let Ok(receive) = Receive::new(Protocol::Udp, source, local, &data) {
+                        let _ = rtc.handle_input(Input::Receive(Instant::now(), receive));
                     }
-                    _ => {
-                        let _ = rtc.handle_input(Input::Timeout(Instant::now()));
-                    }
+                } else {
+                    let _ = rtc.handle_input(Input::Timeout(Instant::now()));
                 }
             }
             Ok(Output::Transmit(transmit)) => {
-                let _ = socket
-                    .send_to(&transmit.contents, transmit.destination)
-                    .await;
+                if let Some((socket, _)) =
+                    sockets.iter().find(|(_, local)| *local == transmit.source)
+                {
+                    let _ = socket
+                        .send_to(&transmit.contents, transmit.destination)
+                        .await;
+                }
             }
             Ok(Output::Event(Event::RtpPacket(_))) => {
-                counter.fetch_add(1, Ordering::Relaxed);
+                rtp_count += 1;
+            }
+            Ok(Output::Event(Event::Connected)) => {
+                connected = true;
+                if stop_on_ice_connected {
+                    break;
+                }
+            }
+            Ok(Output::Event(Event::IceConnectionStateChange(
+                IceConnectionState::Connected | IceConnectionState::Completed,
+            ))) => {
+                connected = true;
+                if stop_on_ice_connected {
+                    break;
+                }
             }
             Ok(Output::Event(_)) => {}
             Err(_) => break,
         }
     }
 
-    counter.load(Ordering::Relaxed)
+    (connected, rtp_count)
 }
 
 /// Test: WebRTC ↔ Plain RTP bidirectional media flow.
@@ -868,6 +931,122 @@ async fn test_ice_restart_media_continuity() {
     assert!(
         after_restart > 0,
         "should continue receiving media after ICE restart, got {after_restart}"
+    );
+
+    client.request_ok("session.destroy", json!({})).await;
+}
+
+/// Test: an ICE restart can recover onto a different remote candidate path.
+///
+/// This simulates the production shape where the original direct path stops
+/// being serviced, the peer answers the restart with another host candidate,
+/// ICE reaches a healthy state, and media must flow on the new path. The test
+/// intentionally does not drive the old socket after the restart.
+#[tokio::test]
+async fn test_ice_restart_media_continuity_after_remote_path_change() {
+    let server = TestServer::start().await;
+    let mut client = TestControlClient::connect(&server.addr).await;
+    client.request_ok("session.create", json!({})).await;
+
+    let mut rtp_peer = TestRtpPeer::new().await;
+    let offer_rtp = rtp_peer.make_sdp_offer();
+    let result = client
+        .request_ok(
+            "endpoint.create_from_offer",
+            json!({"sdp": offer_rtp, "direction": "sendrecv"}),
+        )
+        .await;
+    let answer_rtp = result["sdp_answer"].as_str().unwrap();
+    rtp_peer.set_remote(parse_rtp_addr_from_sdp(answer_rtp).expect("parse server addr"));
+
+    let (mut rtc, old_socket, old_addr, webrtc_ep_id) =
+        setup_connected_webrtc_endpoint(&mut client).await;
+
+    rtp_peer.send_tone_for(timing::scaled_ms(300)).await;
+    let before_restart =
+        drive_and_count_rtp(&mut rtc, &old_socket, old_addr, timing::scaled_ms(2000)).await;
+    assert!(
+        before_restart > 0,
+        "should receive media before ICE restart, got {before_restart}"
+    );
+
+    let new_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let new_addr = new_socket.local_addr().unwrap();
+    assert_ne!(
+        old_addr, new_addr,
+        "test must use a different client UDP path"
+    );
+    rtc.add_local_candidate(Candidate::host(new_addr, "udp").unwrap());
+
+    let result = client
+        .request_ok("endpoint.ice_restart", json!({"endpoint_id": webrtc_ep_id}))
+        .await;
+    let new_offer = result["sdp_offer"].as_str().unwrap();
+    let generation = result["offer_generation"]
+        .as_u64()
+        .expect("ice_restart should return offer_generation");
+
+    let new_sdp_offer = SdpOffer::from_sdp_string(new_offer).unwrap();
+    let new_answer = rtc.sdp_api().accept_offer(new_sdp_offer).unwrap();
+    client
+        .request_ok(
+            "endpoint.webrtc.accept_answer",
+            json!({
+                "endpoint_id": webrtc_ep_id,
+                "sdp": new_answer.to_sdp_string(),
+                "offer_generation": generation
+            }),
+        )
+        .await;
+
+    let (ice_reconnected, _) = drive_rtc_on_sockets(
+        &mut rtc,
+        &[(&new_socket, new_addr)],
+        timing::scaled_ms(3000),
+        true,
+    )
+    .await;
+    assert!(
+        ice_reconnected,
+        "ICE restart should reconnect on the replacement path"
+    );
+
+    rtp_peer.send_tone_for(timing::scaled_ms(500)).await;
+    let (_, after_restart) = drive_rtc_on_sockets(
+        &mut rtc,
+        &[(&new_socket, new_addr)],
+        timing::scaled_ms(2000),
+        false,
+    )
+    .await;
+    assert!(
+        after_restart > 0,
+        "should continue receiving media after ICE restart on new path, got {after_restart}"
+    );
+
+    let info = client.request_ok("session.info", json!({})).await;
+    let endpoints = info["endpoints"].as_array().unwrap();
+    let webrtc = endpoints
+        .iter()
+        .find(|ep| ep["endpoint_id"].as_str() == Some(webrtc_ep_id.as_str()))
+        .expect("webrtc endpoint should appear in session.info");
+    let selected_remote = webrtc["remote_rtp_addr"]
+        .as_str()
+        .expect("WebRTC endpoint should expose selected remote address");
+    assert_eq!(
+        selected_remote,
+        new_addr.to_string(),
+        "rtpbridge should report the replacement client path as selected"
+    );
+    assert_ne!(
+        selected_remote,
+        old_addr.to_string(),
+        "rtpbridge must not remain latched to the old client path"
+    );
+    assert_eq!(
+        webrtc["offer_generation"].as_u64(),
+        Some(generation),
+        "session.info should expose the ICE restart generation"
     );
 
     client.request_ok("session.destroy", json!({})).await;

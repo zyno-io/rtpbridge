@@ -37,17 +37,6 @@ struct CachedTranscode {
     last_used: Instant,
 }
 
-fn endpoint_type_label(endpoint: &Endpoint) -> &'static str {
-    match endpoint {
-        Endpoint::WebRtc(_) => "webrtc",
-        Endpoint::Rtp(_) => "rtp",
-        Endpoint::File(_) => "file",
-        Endpoint::Tone(_) => "tone",
-        Endpoint::Bridge(_) => "bridge",
-        Endpoint::WebSocket(_) => "websocket",
-    }
-}
-
 use crate::net::socket_pool::{MediaBinding, MediaBindings};
 use crate::recording::recorder::RecordingManager;
 
@@ -1038,7 +1027,7 @@ impl SessionState {
         let endpoint_type = self
             .endpoints
             .get(&endpoint_id)
-            .map(endpoint_type_label)
+            .map(Endpoint::kind_label)
             .unwrap_or("unknown");
         info!(
             session_id = %self.session_id,
@@ -2690,7 +2679,8 @@ pub async fn run_media_session(
 
         // Drain pending DTMF injection one packet at a time (non-blocking)
         if let Some(ref mut inj) = state.dtmf_injection
-            && super::session_dtmf::drain_dtmf_injection(inj, &mut state.endpoints).await
+            && super::session_dtmf::drain_dtmf_injection(inj, &mut state.endpoints, &state.metrics)
+                .await
         {
             state.dtmf_injection = None;
         }
@@ -2724,6 +2714,7 @@ pub async fn run_media_session(
         }
         if state.last_timeout_check.elapsed() >= Duration::from_secs(1) {
             check_media_timeouts(
+                state.session_id,
                 &state.endpoints,
                 &state.event_tx,
                 media_timeout,
@@ -2829,7 +2820,7 @@ pub async fn run_media_session(
 
         for ep in state.endpoints.values_mut() {
             if let Endpoint::Rtp(rep) = ep {
-                match rep.maybe_send_rtcp().await {
+                match rep.maybe_send_rtcp(&state.metrics).await {
                     // `maybe_send_rtcp` already transmits on the wire; we no longer
                     // record what we send (outbound recording dropped). Inbound RTCP
                     // is still captured at arrival above.
@@ -3478,7 +3469,7 @@ async fn poll_and_route(
                 if let Some(dest_ep) = endpoints.get_mut(&dest_id) {
                     let result: anyhow::Result<Option<Vec<u8>>> = match dest_ep {
                         Endpoint::WebRtc(wep) => wep.write_rtp(&routed).map(|()| None),
-                        Endpoint::Rtp(rep) => rep.write_rtp(&routed).await,
+                        Endpoint::Rtp(rep) => rep.write_rtp(&routed, metrics).await,
                         Endpoint::File(_) | Endpoint::Tone(_) => Ok(None),
                         Endpoint::Bridge(bep) => bep.write_rtp(&routed).await.map(|()| None),
                         Endpoint::WebSocket(wsep) => wsep.write_rtp(&routed),
@@ -3516,7 +3507,7 @@ async fn poll_and_route(
             if let Some(dest_ep) = endpoints.get_mut(&dest_id) {
                 let result: anyhow::Result<Option<Vec<u8>>> = match dest_ep {
                     Endpoint::WebRtc(wep) => wep.write_rtp(&routed).map(|()| None),
-                    Endpoint::Rtp(rep) => rep.write_rtp(&routed).await,
+                    Endpoint::Rtp(rep) => rep.write_rtp(&routed, metrics).await,
                     Endpoint::File(_) | Endpoint::Tone(_) => Ok(None),
                     Endpoint::Bridge(bep) => bep.write_rtp(&routed).await.map(|()| None),
                     Endpoint::WebSocket(wsep) => wsep.write_rtp(&routed),
@@ -3536,6 +3527,7 @@ async fn poll_and_route(
 }
 
 fn check_media_timeouts(
+    session_id: SessionId,
     endpoints: &HashMap<EndpointId, Endpoint>,
     event_tx: &Option<mpsc::Sender<Event>>,
     threshold: Duration,
@@ -3578,7 +3570,30 @@ fn check_media_timeouts(
         if ms > threshold.as_millis() as u64 {
             // Only emit once per timeout period; cleared when packet received
             if emitted.insert(eid) {
-                warn!(endpoint_id = %eid, duration_ms = ms, "endpoint media timeout");
+                let endpoint_type = ep.kind_label();
+                metrics.record_endpoint_media_timeout(endpoint_type);
+                warn!(
+                    session_id = %session_id,
+                    endpoint_id = %eid,
+                    endpoint_type,
+                    duration_ms = ms,
+                    threshold_ms = threshold.as_millis() as u64,
+                    state = ?ep.state(),
+                    inbound_packets = stats.inbound_packets,
+                    inbound_bytes = stats.inbound_bytes,
+                    outbound_packets = stats.outbound_packets,
+                    outbound_bytes = stats.outbound_bytes,
+                    raw_packets = ?ep.raw_recv_packets(),
+                    raw_bytes = ?ep.raw_recv_bytes(),
+                    packets_lost = ep.packets_lost(),
+                    jitter_ms = ep.jitter_ms(),
+                    rtt_ms = ?ep.rtt_ms(),
+                    local_rtp_addr = ?ep.local_rtp_addr(),
+                    remote_rtp_addr = ?ep.remote_rtp_addr(),
+                    offer_generation = ?ep.offer_generation(),
+                    ice_state = ?ep.ice_state(),
+                    "endpoint media timeout"
+                );
                 emit_event(
                     event_tx,
                     "endpoint.media_timeout",

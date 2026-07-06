@@ -1,9 +1,24 @@
+use std::net::SocketAddr;
 use std::sync::Mutex;
 
+use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::encoding::text::encode;
 use prometheus_client::metrics::counter::Counter;
+use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct EndpointTypeLabels {
+    pub endpoint_type: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct UdpSendLabels {
+    pub endpoint_type: &'static str,
+    pub packet_type: &'static str,
+    pub family: &'static str,
+}
 
 /// Prometheus metrics for rtpbridge.
 ///
@@ -89,6 +104,12 @@ pub struct Metrics {
     /// WebRTC UDP datagrams dropped because `try_send_to` failed or str0m chose a
     /// local candidate address that no bound endpoint socket owns.
     pub webrtc_udp_send_dropped: Counter,
+    /// Endpoint media timeouts, labeled only by endpoint type.
+    pub endpoint_media_timeouts: Family<EndpointTypeLabels, Counter>,
+    /// UDP datagrams successfully handed to OS sockets by socket-backed endpoints.
+    pub udp_send_ok: Family<UdpSendLabels, Counter>,
+    /// UDP datagrams that failed at the socket send step.
+    pub udp_send_errors: Family<UdpSendLabels, Counter>,
 
     /// The Prometheus registry.  Wrapped in a `Mutex` because
     /// `encode()` requires `&Registry` but we need interior mutability
@@ -135,6 +156,9 @@ impl Metrics {
         let webrtc_recv_overflow = Counter::default();
         let webrtc_udp_send_ok = Counter::default();
         let webrtc_udp_send_dropped = Counter::default();
+        let endpoint_media_timeouts = Family::<EndpointTypeLabels, Counter>::default();
+        let udp_send_ok = Family::<UdpSendLabels, Counter>::default();
+        let udp_send_errors = Family::<UdpSendLabels, Counter>::default();
 
         // Note: prometheus-client automatically appends `_total` to counter
         // names in the encoded output, so we register without that suffix.
@@ -258,6 +282,21 @@ impl Metrics {
             "WebRTC UDP datagrams dropped at the socket send step",
             webrtc_udp_send_dropped.clone(),
         );
+        registry.register(
+            "rtpbridge_endpoint_media_timeouts",
+            "Endpoint media timeouts by endpoint type",
+            endpoint_media_timeouts.clone(),
+        );
+        registry.register(
+            "rtpbridge_udp_send_ok",
+            "UDP datagrams successfully handed to OS sockets by endpoint type, packet type, and IP family",
+            udp_send_ok.clone(),
+        );
+        registry.register(
+            "rtpbridge_udp_send_errors",
+            "UDP datagrams that failed at the socket send step by endpoint type, packet type, and IP family",
+            udp_send_errors.clone(),
+        );
         Self {
             sessions_total,
             sessions_active,
@@ -283,8 +322,47 @@ impl Metrics {
             webrtc_recv_overflow,
             webrtc_udp_send_ok,
             webrtc_udp_send_dropped,
+            endpoint_media_timeouts,
+            udp_send_ok,
+            udp_send_errors,
             registry: Mutex::new(registry),
         }
+    }
+
+    pub fn record_endpoint_media_timeout(&self, endpoint_type: &'static str) {
+        self.endpoint_media_timeouts
+            .get_or_create(&EndpointTypeLabels { endpoint_type })
+            .inc();
+    }
+
+    pub fn record_udp_send_ok(
+        &self,
+        endpoint_type: &'static str,
+        packet_type: &'static str,
+        remote: SocketAddr,
+    ) {
+        self.udp_send_ok
+            .get_or_create(&UdpSendLabels {
+                endpoint_type,
+                packet_type,
+                family: socket_addr_family(remote),
+            })
+            .inc();
+    }
+
+    pub fn record_udp_send_error(
+        &self,
+        endpoint_type: &'static str,
+        packet_type: &'static str,
+        remote: SocketAddr,
+    ) {
+        self.udp_send_errors
+            .get_or_create(&UdpSendLabels {
+                endpoint_type,
+                packet_type,
+                family: socket_addr_family(remote),
+            })
+            .inc();
     }
 
     /// Encode all registered metrics in Prometheus text exposition format.
@@ -296,6 +374,10 @@ impl Metrics {
         encode(&mut buf, &registry).map_err(|e| anyhow::anyhow!("metrics encoding failed: {e}"))?;
         Ok(buf)
     }
+}
+
+fn socket_addr_family(addr: SocketAddr) -> &'static str {
+    if addr.is_ipv4() { "ipv4" } else { "ipv6" }
 }
 
 #[cfg(test)]
@@ -322,6 +404,25 @@ mod tests {
         assert!(output.contains("rtpbridge_webrtc_recv_overflow_total"));
         assert!(output.contains("rtpbridge_webrtc_udp_send_ok_total"));
         assert!(output.contains("rtpbridge_webrtc_udp_send_dropped_total"));
+    }
+
+    #[test]
+    fn test_labeled_diagnostic_metrics() {
+        let m = Metrics::new();
+        m.record_endpoint_media_timeout("webrtc");
+        m.record_udp_send_ok("rtp", "rtp", "127.0.0.1:4000".parse().unwrap());
+        m.record_udp_send_error("rtp", "rtcp", "[::1]:4001".parse().unwrap());
+
+        let output = m.encode().unwrap();
+        assert!(output.contains("rtpbridge_endpoint_media_timeouts_total"));
+        assert!(output.contains("endpoint_type=\"webrtc\""));
+        assert!(output.contains("rtpbridge_udp_send_ok_total"));
+        assert!(output.contains("endpoint_type=\"rtp\""));
+        assert!(output.contains("packet_type=\"rtp\""));
+        assert!(output.contains("family=\"ipv4\""));
+        assert!(output.contains("rtpbridge_udp_send_errors_total"));
+        assert!(output.contains("packet_type=\"rtcp\""));
+        assert!(output.contains("family=\"ipv6\""));
     }
 
     #[test]

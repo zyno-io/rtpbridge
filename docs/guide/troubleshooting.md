@@ -100,10 +100,20 @@ Subscribe to per-endpoint statistics over the WebSocket:
 
 Key fields to watch:
 - `inbound.packets` / `outbound.packets` — Are packets flowing?
+- `inbound.raw_packets` — Are socket-level datagrams arriving? If raw packets
+  keep rising while `inbound.packets` is flat, the path is alive but no media is
+  being decoded. If both are flat, the remote path is likely dead.
 - `inbound.packets_lost` — Network-level loss
 - `inbound.jitter_ms` — Network jitter
 - `inbound.last_received_ms_ago` — Time since last packet (high values indicate stalled media)
 - `rtt_ms` — Round-trip time from RTCP for plain RTP/SRTP endpoints
+
+Prometheus also exposes send-result counters for socket-backed endpoints:
+`rtpbridge_udp_send_ok_total{endpoint_type,packet_type,family}` and
+`rtpbridge_udp_send_errors_total{endpoint_type,packet_type,family}`. A rising
+error counter means packets reached the endpoint writer but failed at the UDP
+socket send step; compare it with endpoint `outbound.packets` to separate media
+routing from OS/network egress problems.
 
 ### Check resource limits
 

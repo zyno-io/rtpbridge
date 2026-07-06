@@ -74,6 +74,14 @@ No RTP packets received from a remote endpoint for 5 seconds. This threshold def
 {"event":"endpoint.media_timeout","data":{"endpoint_id":"...","duration_ms":5000}}
 ```
 
+Each emitted event also increments
+`rtpbridge_endpoint_media_timeouts_total{endpoint_type}` and writes a structured
+`endpoint media timeout` warning. The warning includes `session_id`,
+`endpoint_id`, endpoint type, media-plane counters, raw socket counters,
+selected local/remote RTP addresses, ICE state and offer generation for WebRTC,
+and RTCP-derived loss/jitter/RTT. Use it as the rtpbridge-side snapshot to join
+with bridge `Softphone call lost` logs.
+
 ## endpoint.rtcp_bye
 
 RTCP BYE packet received from a remote endpoint, indicating graceful departure. This is informational — the endpoint remains in its current state. The application should decide whether to tear down the endpoint.

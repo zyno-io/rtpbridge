@@ -88,6 +88,7 @@ pub fn build_dtmf_injection(
 pub async fn drain_dtmf_injection(
     injection: &mut PendingDtmfInjection,
     endpoints: &mut HashMap<EndpointId, Endpoint>,
+    metrics: &crate::metrics::Metrics,
 ) -> bool {
     let now = Instant::now();
     while injection.next_index < injection.packets.len() && now >= injection.next_send {
@@ -95,7 +96,7 @@ pub async fn drain_dtmf_injection(
         if let Some(ep) = endpoints.get_mut(&injection.endpoint_id) {
             let result: anyhow::Result<Option<Vec<u8>>> = match ep {
                 Endpoint::WebRtc(wep) => wep.write_rtp(pkt).map(|()| None),
-                Endpoint::Rtp(rep) => rep.write_rtp(pkt).await,
+                Endpoint::Rtp(rep) => rep.write_rtp(pkt, metrics).await,
                 Endpoint::File(_)
                 | Endpoint::Tone(_)
                 | Endpoint::Bridge(_)
@@ -181,7 +182,7 @@ pub async fn process_dtmf_packets(
                     }
                     let result: anyhow::Result<Option<Vec<u8>>> = match dest_ep {
                         Endpoint::WebRtc(wep) => wep.write_rtp(&forwarded).map(|()| None),
-                        Endpoint::Rtp(rep) => rep.write_rtp(&forwarded).await,
+                        Endpoint::Rtp(rep) => rep.write_rtp(&forwarded, metrics).await,
                         Endpoint::File(_)
                         | Endpoint::Tone(_)
                         | Endpoint::Bridge(_)

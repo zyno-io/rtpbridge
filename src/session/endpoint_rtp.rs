@@ -25,6 +25,7 @@ use crate::media::rtcp::{self, RtcpStats};
 use crate::media::rtp::RtpHeader;
 use crate::media::sdp::{self, SdpCodec, SdpCrypto};
 use crate::media::srtp::{SrtcpContext, SrtpContext};
+use crate::metrics::Metrics;
 use crate::net::socket_pool::SocketPair;
 
 /// A plain RTP (optionally SRTP) endpoint
@@ -1223,7 +1224,11 @@ impl RtpEndpoint {
     /// was sent (pre-SRTP-encryption) so the caller can feed it to a recording
     /// tap. Returns `Ok(None)` when the packet was skipped (no remote SSRC yet).
     /// Errors out only on hard send failures.
-    pub async fn write_rtp(&mut self, packet: &RoutedRtpPacket) -> anyhow::Result<Option<Vec<u8>>> {
+    pub async fn write_rtp(
+        &mut self,
+        packet: &RoutedRtpPacket,
+        metrics: &Metrics,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
         let remote = self
             .remote_rtp_addr
             .ok_or_else(|| anyhow::anyhow!("No remote RTP address"))?;
@@ -1278,11 +1283,18 @@ impl RtpEndpoint {
         // for the wire and return the unencrypted bytes for the recording tap.
         // (No clone in the SRTP-off path: we send `&unencrypted` and then move it
         // into the return value.)
-        if let Some(ref mut ctx) = self.srtp_tx {
+        let send_result = if let Some(ref mut ctx) = self.srtp_tx {
             let encrypted = ctx.protect(&unencrypted)?;
-            self.rtp_socket.send_to(&encrypted, remote).await?;
+            self.rtp_socket.send_to(&encrypted, remote).await
         } else {
-            self.rtp_socket.send_to(&unencrypted, remote).await?;
+            self.rtp_socket.send_to(&unencrypted, remote).await
+        };
+        match send_result {
+            Ok(_) => metrics.record_udp_send_ok("rtp", "rtp", remote),
+            Err(e) => {
+                metrics.record_udp_send_error("rtp", "rtp", remote);
+                return Err(e.into());
+            }
         }
         Ok(Some(unencrypted))
     }
@@ -1290,7 +1302,7 @@ impl RtpEndpoint {
     /// Send RTCP SR+RR if enough time has elapsed (every 5 seconds)
     /// Send RTCP SR+RR if enough time has elapsed. Returns the raw RTCP bytes
     /// if a packet was sent (for recording tap), or None if skipped.
-    pub async fn maybe_send_rtcp(&mut self) -> anyhow::Result<Option<Vec<u8>>> {
+    pub async fn maybe_send_rtcp(&mut self, metrics: &Metrics) -> anyhow::Result<Option<Vec<u8>>> {
         if self.last_rtcp_sent.elapsed() < Duration::from_secs(5) {
             return Ok(None);
         }
@@ -1324,7 +1336,13 @@ impl RtpEndpoint {
             rtcp_data.clone()
         };
 
-        self.rtcp_socket.send_to(&send_data, remote_rtcp).await?;
+        match self.rtcp_socket.send_to(&send_data, remote_rtcp).await {
+            Ok(_) => metrics.record_udp_send_ok("rtp", "rtcp", remote_rtcp),
+            Err(e) => {
+                metrics.record_udp_send_error("rtp", "rtcp", remote_rtcp);
+                return Err(e.into());
+            }
+        }
         self.last_rtcp_sent = Instant::now();
 
         // Return plain RTCP for recording tap (post-decryption)

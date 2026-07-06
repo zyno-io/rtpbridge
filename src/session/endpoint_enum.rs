@@ -57,6 +57,17 @@ impl Endpoint {
         }
     }
 
+    pub fn kind_label(&self) -> &'static str {
+        match self {
+            Endpoint::WebRtc(_) => "webrtc",
+            Endpoint::Rtp(_) => "rtp",
+            Endpoint::File(_) => "file",
+            Endpoint::Tone(_) => "tone",
+            Endpoint::Bridge(_) => "bridge",
+            Endpoint::WebSocket(_) => "websocket",
+        }
+    }
+
     pub fn stats(&self) -> &EndpointStats {
         match self {
             Endpoint::WebRtc(ep) => &ep.stats,
@@ -65,6 +76,29 @@ impl Endpoint {
             Endpoint::Tone(ep) => &ep.stats,
             Endpoint::Bridge(ep) => &ep.stats,
             Endpoint::WebSocket(ep) => &ep.stats,
+        }
+    }
+
+    pub fn local_rtp_addr(&self) -> Option<SocketAddr> {
+        match self {
+            Endpoint::WebRtc(ep) => ep.recording_addrs().0,
+            Endpoint::Rtp(ep) => Some(ep.local_rtp_addr),
+            _ => None,
+        }
+    }
+
+    pub fn remote_rtp_addr(&self) -> Option<SocketAddr> {
+        match self {
+            Endpoint::WebRtc(ep) => ep.recording_addrs().1,
+            Endpoint::Rtp(ep) => ep.remote_rtp_addr,
+            _ => None,
+        }
+    }
+
+    pub fn offer_generation(&self) -> Option<u64> {
+        match self {
+            Endpoint::WebRtc(ep) => Some(ep.offer_generation),
+            _ => None,
         }
     }
 

@@ -742,15 +742,30 @@ impl WebRtcEndpoint {
                             match socket.try_send_to(&transmit.contents, transmit.destination) {
                                 Ok(_) => {
                                     self.metrics.webrtc_udp_send_ok.inc();
+                                    self.metrics.record_udp_send_ok(
+                                        "webrtc",
+                                        "datagram",
+                                        transmit.destination,
+                                    );
                                 }
                                 Err(e) => {
                                     self.metrics.webrtc_udp_send_dropped.inc();
+                                    self.metrics.record_udp_send_error(
+                                        "webrtc",
+                                        "datagram",
+                                        transmit.destination,
+                                    );
                                     trace!(error = %e, "UDP send dropped (would block)");
                                 }
                             }
                         }
                         None => {
                             self.metrics.webrtc_udp_send_dropped.inc();
+                            self.metrics.record_udp_send_error(
+                                "webrtc",
+                                "datagram",
+                                transmit.destination,
+                            );
                             warn!(
                                 endpoint_id = %self.id,
                                 source = %transmit.source,

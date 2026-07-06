@@ -555,10 +555,16 @@ async fn test_webrtc_ice_connectivity_with_str0m_peer() {
 }
 
 /// Helper: create a WebRTC endpoint, drive ICE to connected, return
-/// (rtc, socket, peer_addr, endpoint_id).
+/// (rtc, socket, peer_addr, local_candidate, endpoint_id).
 async fn setup_connected_webrtc_endpoint(
     client: &mut TestControlClient,
-) -> (str0m::Rtc, Arc<UdpSocket>, std::net::SocketAddr, String) {
+) -> (
+    str0m::Rtc,
+    Arc<UdpSocket>,
+    std::net::SocketAddr,
+    Candidate,
+    String,
+) {
     let result = client
         .request_ok(
             "endpoint.create_offer",
@@ -573,7 +579,10 @@ async fn setup_connected_webrtc_endpoint(
 
     let mut rtc = RtcConfig::new().set_rtp_mode(true).build(Instant::now());
     let candidate = Candidate::host(peer_addr, "udp").unwrap();
-    rtc.add_local_candidate(candidate);
+    let local_candidate = rtc
+        .add_local_candidate(candidate)
+        .expect("peer local candidate should be accepted")
+        .clone();
 
     let offer = SdpOffer::from_sdp_string(server_offer).unwrap();
     let answer = rtc.sdp_api().accept_offer(offer).unwrap();
@@ -625,7 +634,7 @@ async fn setup_connected_webrtc_endpoint(
     }
     assert!(connected, "ICE should reach Connected state");
 
-    (rtc, peer_socket, peer_addr, ep_id)
+    (rtc, peer_socket, peer_addr, local_candidate, ep_id)
 }
 
 /// Drive str0m event loop for `duration`, counting received RTP packets.
@@ -764,7 +773,7 @@ async fn test_webrtc_rtp_bidirectional_media() {
     tokio::time::sleep(timing::scaled_ms(50)).await;
     rtp_peer.start_recv();
 
-    let (mut rtc, peer_socket, peer_addr, _webrtc_ep_id) =
+    let (mut rtc, peer_socket, peer_addr, _peer_candidate, _webrtc_ep_id) =
         setup_connected_webrtc_endpoint(&mut client).await;
 
     // RTP → WebRTC
@@ -863,7 +872,7 @@ async fn test_ice_restart_media_continuity() {
     let answer_rtp = result["sdp_answer"].as_str().unwrap();
     rtp_peer.set_remote(parse_rtp_addr_from_sdp(answer_rtp).expect("parse server addr"));
 
-    let (mut rtc, peer_socket, peer_addr, webrtc_ep_id) =
+    let (mut rtc, peer_socket, peer_addr, _peer_candidate, webrtc_ep_id) =
         setup_connected_webrtc_endpoint(&mut client).await;
 
     // Phase 1: media flows before restart
@@ -959,7 +968,7 @@ async fn test_ice_restart_media_continuity_after_remote_path_change() {
     let answer_rtp = result["sdp_answer"].as_str().unwrap();
     rtp_peer.set_remote(parse_rtp_addr_from_sdp(answer_rtp).expect("parse server addr"));
 
-    let (mut rtc, old_socket, old_addr, webrtc_ep_id) =
+    let (mut rtc, old_socket, old_addr, old_candidate, webrtc_ep_id) =
         setup_connected_webrtc_endpoint(&mut client).await;
 
     rtp_peer.send_tone_for(timing::scaled_ms(300)).await;
@@ -975,6 +984,10 @@ async fn test_ice_restart_media_continuity_after_remote_path_change() {
     assert_ne!(
         old_addr, new_addr,
         "test must use a different client UDP path"
+    );
+    assert!(
+        rtc.direct_api().invalidate_candidate(&old_candidate),
+        "test peer should invalidate the old client UDP path"
     );
     rtc.add_local_candidate(Candidate::host(new_addr, "udp").unwrap());
 
@@ -999,16 +1012,38 @@ async fn test_ice_restart_media_continuity_after_remote_path_change() {
         )
         .await;
 
-    let (ice_reconnected, _) = drive_rtc_on_sockets(
-        &mut rtc,
-        &[(&new_socket, new_addr)],
-        timing::scaled_ms(3000),
-        true,
-    )
-    .await;
+    let expected_remote = new_addr.to_string();
+    let reconnect_deadline = Instant::now() + timing::scaled_ms(3000);
+    let mut ice_reconnected = false;
+    let mut selected_replacement = false;
+    while Instant::now() < reconnect_deadline {
+        let (connected, _) = drive_rtc_on_sockets(
+            &mut rtc,
+            &[(&new_socket, new_addr)],
+            timing::scaled_ms(100),
+            false,
+        )
+        .await;
+        ice_reconnected |= connected;
+
+        let info = client.request_ok("session.info", json!({})).await;
+        let endpoints = info["endpoints"].as_array().unwrap();
+        let selected_remote = endpoints
+            .iter()
+            .find(|ep| ep["endpoint_id"].as_str() == Some(webrtc_ep_id.as_str()))
+            .and_then(|ep| ep["remote_rtp_addr"].as_str());
+        if selected_remote == Some(expected_remote.as_str()) {
+            selected_replacement = true;
+            break;
+        }
+    }
     assert!(
         ice_reconnected,
         "ICE restart should reconnect on the replacement path"
+    );
+    assert!(
+        selected_replacement,
+        "rtpbridge should select the replacement client path before media resumes"
     );
 
     rtp_peer.send_tone_for(timing::scaled_ms(500)).await;
@@ -1251,7 +1286,7 @@ async fn test_remote_ice_restart_via_accept_offer() {
     let mut client = TestControlClient::connect(&server.addr).await;
     client.request_ok("session.create", json!({})).await;
 
-    let (mut rtc, _peer_socket, _peer_addr, ep_id) =
+    let (mut rtc, _peer_socket, _peer_addr, _peer_candidate, ep_id) =
         setup_connected_webrtc_endpoint(&mut client).await;
 
     // Peer initiates ICE restart.
@@ -1372,7 +1407,7 @@ async fn test_multi_party_webrtc_rtp_bridging() {
     rtp_peer_b.start_recv();
 
     // Create WebRTC endpoint C (receiver)
-    let (mut rtc, peer_socket, peer_addr, _webrtc_ep_id) =
+    let (mut rtc, peer_socket, peer_addr, _peer_candidate, _webrtc_ep_id) =
         setup_connected_webrtc_endpoint(&mut client).await;
 
     // Verify session has 3 endpoints

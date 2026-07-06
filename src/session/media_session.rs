@@ -2736,7 +2736,7 @@ pub async fn run_media_session(
             // never started or died (the media-datapath wedge). Runs on this
             // reliable 1 Hz elapsed gate — not the `sleep` select arm — so
             // co-session media load cannot starve it. See
-            // docs/WEBRTC_RECV_TASK_WEDGE.md.
+            // docs/incident-research/webrtc-recv-task-wedge.md.
             for ep in state.endpoints.values_mut() {
                 if let Endpoint::WebRtc(wep) = ep {
                     wep.supervise_recv();

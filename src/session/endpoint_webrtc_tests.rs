@@ -1,8 +1,99 @@
 use super::*;
 
+async fn mk_webrtc_ts_endpoint() -> WebRtcEndpoint {
+    let id = uuid::Uuid::new_v4();
+    let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    WebRtcEndpoint::new_with_socket(
+        id,
+        EndpointConfig {
+            direction: EndpointDirection::SendRecv,
+        },
+        &[bind_addr],
+        Arc::new(Metrics::new()),
+    )
+    .await
+    .expect("new_with_socket should succeed")
+}
+
+#[tokio::test]
+async fn test_outbound_timeline_source_change_preserves_continuity() {
+    let mut ep = mk_webrtc_ts_endpoint().await;
+    let real_src = EndpointId::new_v4();
+    let hold_src = EndpointId::new_v4();
+
+    ep.advance_outbound_timeline(real_src, 5_000, false);
+    ep.advance_outbound_timeline(real_src, 5_960, false);
+    let before_hold = ep.last_outbound_ts.unwrap();
+
+    let (hold_ts, hold_marker) = ep.advance_outbound_timeline(hold_src, 9_000_000, false);
+    assert_eq!(
+        hold_ts,
+        before_hold + 960,
+        "source change must advance one WebRTC audio frame, not jump domains"
+    );
+    assert!(
+        hold_marker,
+        "source change must mark a new talk-spurt for the receiver"
+    );
+
+    let (hold_next, marker_next) = ep.advance_outbound_timeline(hold_src, 9_000_960, false);
+    assert_eq!(
+        hold_next,
+        hold_ts + 960,
+        "steady hold source should advance by source delta"
+    );
+    assert!(
+        !marker_next,
+        "steady same-source flow should not force marker"
+    );
+
+    let (resume_ts, resume_marker) = ep.advance_outbound_timeline(real_src, 6_920, false);
+    assert_eq!(
+        resume_ts,
+        hold_next + 960,
+        "resuming the original source must keep the destination timeline monotonic"
+    );
+    assert!(resume_marker, "resume source switch should force marker");
+}
+
+#[tokio::test]
+async fn test_outbound_timeline_clamps_same_source_discontinuity() {
+    let mut ep = mk_webrtc_ts_endpoint().await;
+    let src = EndpointId::new_v4();
+
+    ep.advance_outbound_timeline(src, 1_000, false);
+    ep.advance_outbound_timeline(src, 1_960, false);
+    let last_out = ep.last_outbound_ts.unwrap();
+
+    let (ts, marker) = ep.advance_outbound_timeline(src, 1_960 + 100_000, false);
+    assert_eq!(
+        ts,
+        last_out + 960,
+        "huge same-source timestamp gaps should collapse to one frame"
+    );
+    assert!(marker, "same-source discontinuity should force marker");
+}
+
+#[tokio::test]
+async fn test_outbound_timeline_reset_clears_source_state() {
+    let mut ep = mk_webrtc_ts_endpoint().await;
+    let src = EndpointId::new_v4();
+
+    ep.advance_outbound_timeline(src, 1_000, false);
+    ep.advance_outbound_timeline(src, 1_960, false);
+    assert_eq!(ep.learned_step, Some(960));
+
+    ep.reset_outbound_rtp_timeline();
+
+    assert!(ep.last_outbound_ts.is_none());
+    assert!(ep.last_source_id.is_none());
+    assert!(ep.last_source_ts.is_none());
+    assert!(ep.learned_step.is_none());
+}
+
 /// The recv task starts promptly after creation, signals liveness, and a
 /// healthy task within the grace window is NOT flagged by the liveness sweep.
-/// See docs/WEBRTC_RECV_TASK_WEDGE.md.
+/// See docs/incident-research/webrtc-recv-task-wedge.md.
 #[tokio::test]
 async fn test_recv_task_starts_and_is_not_flagged() {
     let id = uuid::Uuid::new_v4();
@@ -42,7 +133,8 @@ async fn test_recv_task_starts_and_is_not_flagged() {
 
 /// The liveness sweep flags (and counts, once) a recv task that was spawned
 /// but never reached its loop past the grace deadline — the receive-task
-/// wedge, including the transfer-restart path. See docs/WEBRTC_RECV_TASK_WEDGE.md.
+/// wedge, including the transfer-restart path. See
+/// docs/incident-research/webrtc-recv-task-wedge.md.
 #[tokio::test]
 async fn test_supervise_recv_detects_never_started() {
     let id = uuid::Uuid::new_v4();

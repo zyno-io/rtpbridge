@@ -7,6 +7,7 @@ use futures_util::FutureExt;
 use str0m::change::{SdpAnswer, SdpOffer, SdpPendingOffer};
 use str0m::media::{Direction, MediaKind, Mid};
 use str0m::net::{Protocol, Receive};
+use str0m::rtp::SeqNo;
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -31,7 +32,7 @@ const WEBRTC_OPUS_RTP_CLOCK_HZ: u32 = 48_000;
 /// flags the never-started variant (the runtime did not schedule/register the
 /// socket reader) and increments `webrtc_recv_task_start_timeout`. Checked off
 /// the hot path (in the 1 Hz sweep), so it never blocks endpoint creation or the
-/// session task. See docs/WEBRTC_RECV_TASK_WEDGE.md.
+/// session task. See docs/incident-research/webrtc-recv-task-wedge.md.
 const RECV_TASK_START_GRACE: Duration = Duration::from_secs(2);
 
 /// The negotiated audio codec on a WebRTC endpoint, derived from str0m's media
@@ -85,6 +86,27 @@ pub struct WebRtcEndpoint {
     pub remote_addr: Option<SocketAddr>,
     /// Mid for the audio media line (set after SDP negotiation)
     pub audio_mid: Option<Mid>,
+    /// Destination-owned outbound RTP sequence number. str0m owns the outgoing
+    /// SSRC, but in RTP mode it uses the seq/timestamp values we pass to
+    /// `write_rtp`; forwarding source seq numbers verbatim would make Chrome see
+    /// discontinuities on hold music, mixer, file, or endpoint replacement
+    /// source switches.
+    outbound_seq_no: SeqNo,
+    /// Destination-owned outbound RTP timestamp timeline. Set after the first
+    /// successful write_rtp so subsequent packets can advance from a known
+    /// reference instead of inheriting whatever the source last sent.
+    last_outbound_ts: Option<u32>,
+    /// Source endpoint of the last packet we wrote. Used to detect source
+    /// changes (mixer<->passthrough, file<->normal, source A<->source B) so we
+    /// can preserve the destination's RTP timeline across the switch.
+    last_source_id: Option<EndpointId>,
+    /// Source's RTP timestamp at the last packet we wrote, matched to
+    /// `last_source_id`. Lets us compute a delta within the same source.
+    last_source_ts: Option<u32>,
+    /// Smoothed packet-duration estimate in RTP timestamp units, learned from
+    /// recent same-source deltas. Used as the bump on source changes or
+    /// discontinuity clamps. Falls back to 20ms at the WebRTC audio RTP clock.
+    learned_step: Option<u32>,
     /// Pending offer (when we created an offer, waiting for answer)
     pub pending_offer: Option<SdpPendingOffer>,
     /// Monotonic generation of the most recently minted server offer.
@@ -244,6 +266,11 @@ impl WebRtcEndpoint {
             local_addr,
             remote_addr: None,
             audio_mid: None,
+            outbound_seq_no: (rand::random::<u16>() as u64).into(),
+            last_outbound_ts: None,
+            last_source_id: None,
+            last_source_ts: None,
+            learned_step: None,
             pending_offer: None,
             offer_generation: 0,
             auto_direction: config.direction,
@@ -286,6 +313,14 @@ impl WebRtcEndpoint {
         self.packet_error_warned = false;
     }
 
+    fn reset_outbound_rtp_timeline(&mut self) {
+        self.outbound_seq_no = (rand::random::<u16>() as u64).into();
+        self.last_outbound_ts = None;
+        self.last_source_id = None;
+        self.last_source_ts = None;
+        self.learned_step = None;
+    }
+
     pub fn set_direction_override(&mut self, update: EndpointDirectionUpdate) {
         if let Some(dir) = update.as_direction() {
             self.config.direction = dir;
@@ -302,10 +337,12 @@ impl WebRtcEndpoint {
     /// "too late" because the server's RTP timeline is real-time-continuous
     /// while the local audio clock paused for the duration of the hold.
     ///
-    /// `reset_stream_tx` rotates the SSRC, restarts the seq number, clears the
-    /// RTP↔wallclock anchor, and forces a prompt SR/SDES emission for the new
-    /// SSRC. CNAME is preserved (lives on the m-section, not the SSRC) so the
-    /// receiver ties the new SSRC back to the same logical source.
+    /// `reset_stream_tx` rotates the SSRC, clears str0m's RTP↔wallclock anchor,
+    /// and forces a prompt SR/SDES emission for the new SSRC. We also restart
+    /// our own seq/timestamp state because in RTP mode str0m uses the values we
+    /// pass into `write_rtp`. CNAME is preserved (lives on the m-section, not
+    /// the SSRC) so the receiver ties the new SSRC back to the same logical
+    /// source.
     pub fn bump_outbound_ssrc(&mut self) -> anyhow::Result<()> {
         let mid = self
             .audio_mid
@@ -324,14 +361,16 @@ impl WebRtcEndpoint {
             new_ssrc = *new_ssrc,
             "WebRTC outbound SSRC rotated"
         );
+        self.reset_outbound_rtp_timeline();
         Ok(())
     }
 
     /// Start (or restart) the recv task that reads UDP packets and forwards them
     /// to the session. The receive path is otherwise fire-and-forget: a task the
     /// runtime never schedules silently blackholes all media for the endpoint
-    /// (see docs/WEBRTC_RECV_TASK_WEDGE.md). To make that observable, the task
-    /// flips `recv_started` the instant it reaches its loop and this arms
+    /// (see docs/incident-research/webrtc-recv-task-wedge.md). To make that
+    /// observable, the task flips `recv_started` the instant it reaches its loop
+    /// and this arms
     /// `recv_start_deadline`; the session liveness sweep (`supervise_recv`) then
     /// flags a task that never starts or later dies — off the hot path, so
     /// nothing here blocks creation or the session task.
@@ -433,7 +472,7 @@ impl WebRtcEndpoint {
     /// once — a recv task that is wedged while its endpoint is still active, the
     /// "task gone/never-started, endpoint live = guaranteed media blackhole"
     /// condition. Covers BOTH failure modes and all (re)start paths off the hot
-    /// path. See docs/WEBRTC_RECV_TASK_WEDGE.md.
+    /// path. See docs/incident-research/webrtc-recv-task-wedge.md.
     pub fn supervise_recv(&mut self) {
         if self.recv_dead_reported {
             return;
@@ -449,7 +488,7 @@ impl WebRtcEndpoint {
                 local_addr = %self.local_addr,
                 state = ?self.state,
                 "WebRTC recv task is gone but endpoint is still active — media will \
-                 blackhole (see docs/WEBRTC_RECV_TASK_WEDGE.md)"
+                 blackhole (see docs/incident-research/webrtc-recv-task-wedge.md)"
             );
             return;
         }
@@ -466,7 +505,7 @@ impl WebRtcEndpoint {
                 local_addr = %self.local_addr,
                 grace_ms = RECV_TASK_START_GRACE.as_millis() as u64,
                 "WebRTC recv task never started within the grace window — media \
-                 datapath wedge (see docs/WEBRTC_RECV_TASK_WEDGE.md)"
+                 datapath wedge (see docs/incident-research/webrtc-recv-task-wedge.md)"
             );
         }
     }
@@ -872,7 +911,12 @@ impl WebRtcEndpoint {
             .ok_or_else(|| anyhow::anyhow!("No audio mid negotiated"))?;
 
         let pt = packet.payload_type.into();
-        let seq_no: str0m::rtp::SeqNo = (packet.sequence_number as u64).into();
+        let seq_no = self.outbound_seq_no.inc();
+        let (outbound_ts, marker) = self.advance_outbound_timeline(
+            packet.source_endpoint_id,
+            packet.timestamp,
+            packet.marker,
+        );
 
         let mut api = self.rtc.direct_api();
         let stream_tx = api
@@ -883,15 +927,61 @@ impl WebRtcEndpoint {
         let rtp = str0m::rtp::RtpWrite::new(
             pt,
             seq_no,
-            packet.timestamp,
+            outbound_ts,
             Instant::now(),
             packet.payload.clone(),
         )
-        .marker(packet.marker);
+        .marker(marker);
         stream_tx.write_rtp(rtp);
 
         self.stats.record_outbound(packet.payload.len());
         Ok(())
+    }
+
+    /// Advance the destination-owned outbound RTP timestamp timeline.
+    ///
+    /// WebRTC TX uses one SSRC per endpoint. When the routed source changes
+    /// under that SSRC (hold music/file insertion, mixer<->passthrough,
+    /// endpoint replacement), the source packet timestamp can jump into an
+    /// unrelated domain. Collapse those jumps to one packet duration and set
+    /// marker so the receiver re-anchors instead of treating the stream as a
+    /// massive loss/jitter event.
+    fn advance_outbound_timeline(
+        &mut self,
+        source_id: EndpointId,
+        source_ts: u32,
+        source_marker: bool,
+    ) -> (u32, bool) {
+        let nominal_step = WEBRTC_OPUS_RTP_CLOCK_HZ / 50;
+        let bump = self.learned_step.unwrap_or(nominal_step);
+
+        let (outbound_ts, marker_override) = match (
+            self.last_outbound_ts,
+            self.last_source_id,
+            self.last_source_ts,
+        ) {
+            (Some(last_out), Some(last_src), Some(last_src_ts)) if last_src == source_id => {
+                let delta = source_ts.wrapping_sub(last_src_ts);
+                let max_safe = bump.saturating_mul(10);
+                if delta == 0 {
+                    (last_out, false)
+                } else if delta > max_safe {
+                    (last_out.wrapping_add(bump), true)
+                } else {
+                    if delta <= bump.saturating_mul(2) {
+                        self.learned_step = Some(delta);
+                    }
+                    (last_out.wrapping_add(delta), false)
+                }
+            }
+            (Some(last_out), _, _) => (last_out.wrapping_add(bump), true),
+            _ => (source_ts, source_marker),
+        };
+
+        self.last_outbound_ts = Some(outbound_ts);
+        self.last_source_id = Some(source_id);
+        self.last_source_ts = Some(source_ts);
+        (outbound_ts, source_marker || marker_override)
     }
 
     /// The negotiated primary audio codec, read from str0m's media line after the

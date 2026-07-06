@@ -48,6 +48,15 @@ export default defineConfig({
           { text: 'Codecs', link: '/reference/codecs' },
           { text: 'SRTP', link: '/reference/srtp' }
         ]
+      },
+      {
+        text: 'Incident Research',
+        items: [
+          {
+            text: 'WebRTC Receive-Task Wedge',
+            link: '/incident-research/webrtc-recv-task-wedge'
+          }
+        ]
       }
     ],
     socialLinks: [

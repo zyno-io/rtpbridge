@@ -1,0 +1,17 @@
+services:
+  coturn:
+    image: coturn/coturn:4.6
+    command:
+      - --listening-port=3478
+      - --min-port=49160
+      - --max-port=49200
+      - --realm=rtpbridge-soak
+      - --user=soak:soakpass
+      - --no-cli
+      - --no-tls
+      - --no-dtls
+      - --log-file=stdout
+      - --verbose
+    ports:
+      - "3478:3478/udp"
+      - "49160-49200:49160-49200/udp"

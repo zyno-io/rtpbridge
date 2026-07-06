@@ -1,4 +1,4 @@
-# WebRTC receive-task wedge — runbook
+# WebRTC receive-task wedge — incident research / runbook
 
 **One-line:** On an affected pod, *every* new WebRTC endpoint silently fails to
 establish media — signaling succeeds, the endpoint's UDP socket is bound, but
@@ -11,6 +11,39 @@ investigation"* (`11e41e8`) was chasing. First fully diagnosed 2026-06-02.
 Root-cause theories re-ranked 2026-06-09 from retained logs/metrics — see §3;
 the datapath branch is now the front-runner, and the §4 supervision counters
 are expected to stay silent during a recurrence (§4 expectation note).
+
+## Current status (2026-07-06)
+
+Status: **not root-cause closed, but no recurrence observed in recent production
+Grafana data**.
+
+Production Mimir/Loki review on 2026-07-06:
+
+- `2026-06-22T21:33Z` → `2026-07-06T21:33Z`: no
+  `rtpbridge_webrtc_recv_task_start_timeout_total`,
+  `rtpbridge_webrtc_recv_task_dead_total`, or
+  `rtpbridge_webrtc_recv_overflow_total` increases on `rtpbridge-0/1/2`.
+  `rtpbridge_webrtc_recv_task_started_total` continued climbing normally on all
+  pods (~30k per pod), and packet routing remained healthy.
+- Same window had one `WebRTC negotiation stuck past watchdog threshold` log on
+  `rtpbridge-0` at `2026-07-03T14:10:20Z`. Zoom-in showed a single-session
+  failure, not this pod-wide wedge: the WebRTC endpoint reached `Connected`
+  twice, that session routed packets around 100 pps, the pod returned to zero
+  active sessions, and the same pod created new WebRTC endpoints and routed
+  ~40k packets in the following hour.
+- `2026-06-08T21:33Z` → `2026-06-22T21:33Z`: no recv-task supervision counter
+  increases, no recv overflow, no `webrtc_connecting_stuck` increments, and no
+  matching watchdog or recv-task liveness logs. Media timeouts existed but were
+  distributed across pods and did not match the pod-wide blackhole signature.
+- Exact 14 days before the July 3 warning
+  (`2026-06-19T14:10:20Z` → `2026-07-03T14:10:20Z`) also showed zero
+  recv-task supervision counter increases, zero recv overflow, zero
+  `webrtc_connecting_stuck` increases, and no matching Loki warning logs.
+
+Interpretation: keep this as an active incident-research/runbook document. The
+recent evidence supports "quiet since the supervision work," not "fixed." A true
+closure still needs either a captured recurrence that pins the trigger or a
+follow-up that gives the readiness probe a direct media-path/self-probe signal.
 
 ---
 

@@ -73,7 +73,7 @@ pub struct Metrics {
     /// does not block/abort creation). A non-zero value proves the never-started
     /// receive-task variant; a media blackhole where the task starts but never
     /// gets socket readiness must be diagnosed with the live probe/runbook.
-    /// See docs/WEBRTC_RECV_TASK_WEDGE.md.
+    /// See docs/incident-research/webrtc-recv-task-wedge.md.
     pub webrtc_recv_task_start_timeout: Counter,
     /// Inbound WebRTC packets dropped because the session packet channel was
     /// full (would have blocked `send`). Switching to `try_send` keeps a full

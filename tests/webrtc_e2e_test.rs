@@ -242,31 +242,27 @@ async fn test_ice_restart_answer_rejected_on_stale_generation() {
     let mut client = TestControlClient::connect(&server.addr).await;
     client.request_ok("session.create", json!({})).await;
 
-    // create_from_offer: rtpbridge is the answerer, so there is no pending
-    // offer and we can ICE-restart immediately.
-    let webrtc_offer = "\
-        v=0\r\n\
-        o=- 5555 1 IN IP4 127.0.0.1\r\n\
-        s=-\r\n\
-        t=0 0\r\n\
-        a=group:BUNDLE 0\r\n\
-        m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
-        c=IN IP4 0.0.0.0\r\n\
-        a=mid:0\r\n\
-        a=sendrecv\r\n\
-        a=rtpmap:111 opus/48000/2\r\n\
-        a=ice-ufrag:origufrag1234\r\n\
-        a=ice-pwd:origpassword1234567890123\r\n\
-        a=fingerprint:sha-256 AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99\r\n\
-        a=setup:actpass\r\n\
-        a=rtcp-mux\r\n";
     let result = client
         .request_ok(
-            "endpoint.create_from_offer",
-            json!({"sdp": webrtc_offer, "direction": "sendrecv"}),
+            "endpoint.create_offer",
+            json!({"type": "webrtc", "direction": "sendrecv"}),
         )
         .await;
     let ep_id = result["endpoint_id"].as_str().unwrap().to_string();
+    let original_offer = result["sdp_offer"].as_str().unwrap().to_string();
+
+    let peer_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let peer_addr = peer_socket.local_addr().unwrap();
+    let mut rtc = RtcConfig::new().set_rtp_mode(true).build(Instant::now());
+    rtc.add_local_candidate(Candidate::host(peer_addr, "udp").unwrap());
+    let offer = SdpOffer::from_sdp_string(&original_offer).unwrap();
+    let answer = rtc.sdp_api().accept_offer(offer).unwrap().to_sdp_string();
+    client
+        .request_ok(
+            "endpoint.webrtc.accept_answer",
+            json!({"endpoint_id": ep_id, "sdp": answer}),
+        )
+        .await;
 
     // ICE restart returns a monotonic generation.
     let result = client
@@ -298,11 +294,8 @@ async fn test_ice_restart_answer_rejected_on_stale_generation() {
         "rejection should cite the generation mismatch: {stale}"
     );
 
-    // The matching generation is accepted (str0m peer answers the restart offer).
-    let peer_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let peer_addr = peer_socket.local_addr().unwrap();
-    let mut rtc = RtcConfig::new().set_rtp_mode(true).build(Instant::now());
-    rtc.add_local_candidate(Candidate::host(peer_addr, "udp").unwrap());
+    // The matching generation is accepted by the same peer identity that
+    // answered the initial offer.
     let offer = SdpOffer::from_sdp_string(&restart_offer).unwrap();
     let answer = rtc.sdp_api().accept_offer(offer).unwrap().to_sdp_string();
     client

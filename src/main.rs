@@ -7,6 +7,7 @@ mod playback;
 mod recording;
 mod session;
 mod shutdown;
+mod version;
 
 use clap::Parser;
 use tracing::{error, info, warn};
@@ -34,7 +35,12 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(filter)
         .with_target(true)
         .init();
-    info!(listen = ?config.listen, media_ip = ?config.media_ip, "rtpbridge starting");
+    info!(
+        version = version::BUILD_VERSION,
+        listen = ?config.listen,
+        media_ip = ?config.media_ip,
+        "rtpbridge starting"
+    );
 
     if config.max_sessions == 0 {
         warn!(

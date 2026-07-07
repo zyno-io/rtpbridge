@@ -1,0 +1,1 @@
+pub const BUILD_VERSION: &str = env!("RTPBRIDGE_BUILD_VERSION");

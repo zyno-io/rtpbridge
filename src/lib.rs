@@ -10,3 +10,4 @@ pub mod playback;
 pub mod recording;
 pub mod session;
 pub mod shutdown;
+pub mod version;

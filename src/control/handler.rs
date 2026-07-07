@@ -381,6 +381,7 @@ fn handle_server_info(id: String, manager: &Arc<SessionManager>) -> Response {
         id,
         ServerInfoResult {
             hostname: server_hostname(),
+            version: crate::version::BUILD_VERSION,
             media_ip: manager.media_ips(),
         },
     )

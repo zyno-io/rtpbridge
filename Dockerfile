@@ -1,10 +1,13 @@
 # Pin Rust version to match rust-version in Cargo.toml
+ARG BUILD_VERSION=canary-unknown
 FROM rust:1.94-trixie AS builder
+ARG BUILD_VERSION
+ENV BUILD_VERSION=${BUILD_VERSION}
 
 RUN apt-get update && apt-get install -y --no-install-recommends libopus-dev && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock build.rs ./
 # Create stubs so Cargo.toml parses (benches/ excluded by .dockerignore)
 RUN mkdir -p src benches \
     && echo 'fn main() {}' > src/main.rs \
@@ -19,6 +22,8 @@ COPY . .
 RUN touch src/main.rs && cargo build --release
 
 FROM debian:trixie-slim
+ARG BUILD_VERSION
+LABEL org.opencontainers.image.version="${BUILD_VERSION}"
 RUN apt-get update && apt-get install -y --no-install-recommends libopus0 libssl3t64 ca-certificates && rm -rf /var/lib/apt/lists/* \
     && useradd -r -s /sbin/nologin rtpbridge \
     && mkdir -p /var/lib/rtpbridge/recordings /var/lib/rtpbridge/media /var/lib/rtpbridge/cache \

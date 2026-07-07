@@ -124,6 +124,11 @@ async fn test_server_info() {
         .as_str()
         .expect("hostname should be a string");
     assert!(!hostname.is_empty(), "hostname must be non-empty: {resp}");
+    assert_eq!(
+        resp["result"]["version"].as_str(),
+        Some(rtpbridge::version::BUILD_VERSION),
+        "server.info should expose the build version: {resp}"
+    );
     // media_ip is an array (dual-stack support): at most one IPv4 + one IPv6.
     let media_ips = resp["result"]["media_ip"]
         .as_array()

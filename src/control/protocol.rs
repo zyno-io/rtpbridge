@@ -141,6 +141,7 @@ pub struct ServerInfoParams {}
 #[derive(Debug, Serialize)]
 pub struct ServerInfoResult {
     pub hostname: String,
+    pub version: &'static str,
     /// All configured media-plane bind IPs (≤1 per family). This is an array to
     /// support dual-stack (IPv4 + IPv6); it was a scalar `IpAddr` before
     /// dual-stack support.

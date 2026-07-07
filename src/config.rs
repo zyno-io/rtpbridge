@@ -48,7 +48,12 @@ where
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "rtpbridge", about = "RTP media routing server")]
+#[command(
+    name = "rtpbridge",
+    about = "RTP media routing server",
+    version = crate::version::BUILD_VERSION,
+    help_template = "{about-with-newline}\nVersion: {version}\n\n{usage-heading} {usage}\n\n{all-args}{after-help}"
+)]
 pub struct Cli {
     /// WebSocket control plane listen addresses (comma-separated ip:port)
     #[arg(short, long, default_value = "0.0.0.0:9100", value_delimiter = ',')]
@@ -456,6 +461,17 @@ fn is_dir_writable(path: &std::path::Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_cli_help_includes_build_version() {
+        let mut help = Vec::new();
+        Cli::command().write_help(&mut help).unwrap();
+        let help = String::from_utf8(help).unwrap();
+        assert!(
+            help.contains(crate::version::BUILD_VERSION),
+            "help should include build version: {help}"
+        );
+    }
 
     #[test]
     fn test_default_config() {

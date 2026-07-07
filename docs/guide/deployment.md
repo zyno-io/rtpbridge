@@ -309,12 +309,15 @@ This means:
 
 ```dockerfile
 # Pin Rust version to match rust-version in Cargo.toml
+ARG BUILD_VERSION=canary-unknown
 FROM rust:1.94-trixie AS builder
+ARG BUILD_VERSION
+ENV BUILD_VERSION=${BUILD_VERSION}
 
 RUN apt-get update && apt-get install -y --no-install-recommends libopus-dev && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock build.rs ./
 # Create stubs so Cargo.toml parses (benches/ excluded by .dockerignore)
 RUN mkdir -p src benches \
     && echo 'fn main() {}' > src/main.rs \
@@ -329,6 +332,8 @@ COPY . .
 RUN touch src/main.rs && cargo build --release
 
 FROM debian:trixie-slim
+ARG BUILD_VERSION
+LABEL org.opencontainers.image.version="${BUILD_VERSION}"
 RUN apt-get update && apt-get install -y --no-install-recommends libopus0 libssl3t64 ca-certificates && rm -rf /var/lib/apt/lists/* \
     && useradd -r -s /sbin/nologin rtpbridge \
     && mkdir -p /var/lib/rtpbridge/recordings /var/lib/rtpbridge/media /var/lib/rtpbridge/cache \
@@ -345,6 +350,17 @@ USER rtpbridge
 #       drop: [ALL]
 #       add: [NET_BIND_SERVICE]  # only if binding to ports < 1024
 ENTRYPOINT ["rtpbridge"]
+```
+
+Pass the same version into Docker that Cargo uses locally:
+
+```bash
+if TAG=$(git describe --tags --exact-match HEAD 2>/dev/null); then
+  BUILD_VERSION="v${TAG#v}"
+else
+  BUILD_VERSION="canary-$(TZ=UTC0 git show -s --format=%cd --date=format-local:'%y.%-m%d.%-H%M' HEAD)"
+fi
+docker build --build-arg BUILD_VERSION="$BUILD_VERSION" -t rtpbridge:"$BUILD_VERSION" .
 ```
 
 For container health checks, use your orchestrator's native mechanism (e.g., Kubernetes `livenessProbe`) pointed at `GET /health` on the control port.

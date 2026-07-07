@@ -75,13 +75,13 @@ fn emit_rerun_hints() {
         git_dir.join("refs/tags").display()
     );
 
-    if let Ok(head) = fs::read_to_string(git_dir.join("HEAD")) {
-        if let Some(head_ref) = head.trim().strip_prefix("ref: ") {
-            println!(
-                "cargo:rerun-if-changed={}",
-                git_dir.join(head_ref).display()
-            );
-        }
+    if let Ok(head) = fs::read_to_string(git_dir.join("HEAD"))
+        && let Some(head_ref) = head.trim().strip_prefix("ref: ")
+    {
+        println!(
+            "cargo:rerun-if-changed={}",
+            git_dir.join(head_ref).display()
+        );
     }
 }
 

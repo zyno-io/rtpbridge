@@ -132,11 +132,17 @@ bench:regression:
         --username="${CI_REGISTRY_USER}" \
         --password="${CI_REGISTRY_PASSWORD}" \
         "${CI_REGISTRY}"
+    - git config --global --add safe.directory "$CI_PROJECT_DIR"
     - |
       if [ -n "${CI_COMMIT_TAG:-}" ]; then
         export BUILD_VERSION="v${CI_COMMIT_TAG#v}"
       else
-        export BUILD_VERSION="canary-$(TZ=UTC0 git show -s --format=%cd --date=format-local:'%y.%-m%d.%-H%M' "${CI_COMMIT_SHA}")"
+        build_date="$(TZ=UTC0 git show -s --format=%cd --date=format-local:'%y.%-m%d.%-H%M' "${CI_COMMIT_SHA}")"
+        if [ -z "$build_date" ]; then
+          echo "ERROR: failed to compute BUILD_VERSION from ${CI_COMMIT_SHA}"
+          exit 1
+        fi
+        export BUILD_VERSION="canary-${build_date}"
       fi
       echo "BUILD_VERSION=${BUILD_VERSION}"
 

@@ -80,6 +80,12 @@ Accept a remote SDP answer for an endpoint created with `endpoint.webrtc.create_
 
 `offer_generation` (optional) is the generation returned by the `ice_restart` whose offer this answer responds to. When present, the answer is **rejected** unless it matches the endpoint's current pending offer generation — this prevents an answer for a superseded offer from being applied to a newer one (which would diverge ICE credentials and silently kill media). Omit it for the initial answer (no overlap risk). The generation is checked before the SDP is parsed, so a mismatch leaves the pending offer untouched and a correct retry can still be applied.
 
+The remote DTLS fingerprint is the WebRTC peer identity for an endpoint. After
+the first accepted SDP, later answers for the same endpoint must advertise the
+same fingerprint. A changed fingerprint means the caller is trying to attach a
+different PeerConnection; rtpbridge rejects that answer. Create/replace the
+WebRTC endpoint instead of using ICE restart for that case.
+
 **Response:**
 ```json
 {"id":"3w","result":{}}
@@ -89,6 +95,8 @@ Accept a remote SDP answer for an endpoint created with `endpoint.webrtc.create_
 
 Accept a remote SDP offer for an existing WebRTC endpoint and return an SDP answer.
 Use this for remote-initiated re-negotiation, including remote ICE restarts.
+The remote DTLS fingerprint must match the endpoint's existing peer identity; a
+changed fingerprint requires a new/replacement endpoint.
 
 ```json
 {
@@ -109,6 +117,9 @@ Use this for remote-initiated re-negotiation, including remote ICE restarts.
 ### endpoint.webrtc.ice_restart
 
 Perform an ICE restart on a WebRTC endpoint. Returns a new SDP offer with fresh ICE credentials. Deliver this to the remote peer and feed back their answer via `endpoint.webrtc.accept_answer`.
+This is an ICE/path recovery operation on the existing WebRTC endpoint; it is
+not a PeerConnection replacement. The peer must answer with the same DTLS
+fingerprint it used when the endpoint was established.
 
 ```json
 {"id":"5","method":"endpoint.webrtc.ice_restart","params":{"endpoint_id":"..."}}

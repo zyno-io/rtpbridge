@@ -734,6 +734,93 @@ async fn test_ice_restart_increments_and_returns_offer_generation() {
 }
 
 #[test]
+fn test_remote_dtls_fingerprint_from_sdp() {
+    let sdp = "\
+        v=0\r\n\
+        o=- 1 1 IN IP4 127.0.0.1\r\n\
+        s=-\r\n\
+        t=0 0\r\n\
+        a=fingerprint:sha-256 00:01:02:03:04:05:06:07:08:09:0A:0B:0C:0D:0E:0F:10:11:12:13:14:15:16:17:18:19:1A:1B:1C:1D:1E:1F\r\n";
+
+    let fingerprint = remote_dtls_fingerprint_from_sdp(sdp).expect("fingerprint should parse");
+    assert_eq!(
+        fingerprint.to_string(),
+        "sha-256 00:01:02:03:04:05:06:07:08:09:0A:0B:0C:0D:0E:0F:10:11:12:13:14:15:16:17:18:19:1A:1B:1C:1D:1E:1F"
+    );
+
+    let missing = remote_dtls_fingerprint_from_sdp("v=0\r\n").unwrap_err();
+    assert!(
+        missing
+            .to_string()
+            .contains("missing remote DTLS fingerprint"),
+        "missing fingerprint should be explicit: {missing}"
+    );
+}
+
+#[tokio::test]
+async fn test_accept_answer_rejects_changed_remote_dtls_fingerprint() {
+    let id = uuid::Uuid::new_v4();
+    let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let (tx, _rx) = mpsc::channel(16);
+
+    let (mut ep, offer_sdp) = WebRtcEndpoint::create_offer(
+        id,
+        EndpointDirection::SendRecv,
+        &[bind_addr],
+        tx,
+        Arc::new(Metrics::new()),
+    )
+    .await
+    .expect("create_offer should succeed");
+
+    let first_addr: std::net::SocketAddr = "127.0.0.1:41051".parse().unwrap();
+    let mut first_peer = RtcConfig::new().set_rtp_mode(true).build(Instant::now());
+    first_peer.add_local_candidate(Candidate::host(first_addr, "udp").unwrap());
+    let first_answer = first_peer
+        .sdp_api()
+        .accept_offer(SdpOffer::from_sdp_string(&offer_sdp).unwrap())
+        .unwrap()
+        .to_sdp_string();
+    let first_fingerprint =
+        remote_dtls_fingerprint_from_sdp(&first_answer).expect("first fingerprint should parse");
+
+    ep.accept_answer(&first_answer)
+        .expect("initial answer should be accepted");
+    assert_eq!(
+        ep.remote_dtls_fingerprint.as_ref(),
+        Some(&first_fingerprint)
+    );
+
+    let (restart_offer, _generation) = ep.ice_restart().expect("ice restart should start");
+
+    let second_addr: std::net::SocketAddr = "127.0.0.1:41052".parse().unwrap();
+    let mut fresh_peer = RtcConfig::new().set_rtp_mode(true).build(Instant::now());
+    fresh_peer.add_local_candidate(Candidate::host(second_addr, "udp").unwrap());
+    let fresh_answer = fresh_peer
+        .sdp_api()
+        .accept_offer(SdpOffer::from_sdp_string(&restart_offer).unwrap())
+        .unwrap()
+        .to_sdp_string();
+    let fresh_fingerprint =
+        remote_dtls_fingerprint_from_sdp(&fresh_answer).expect("fresh fingerprint should parse");
+    assert_ne!(
+        first_fingerprint, fresh_fingerprint,
+        "a fresh peer connection should advertise a new DTLS identity"
+    );
+
+    let err = ep.accept_answer(&fresh_answer).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("remote DTLS fingerprint changed on existing WebRTC endpoint"),
+        "changed fingerprint should be rejected clearly: {err}"
+    );
+    assert!(
+        ep.pending_offer.is_some(),
+        "rejection must happen before consuming the pending restart offer"
+    );
+}
+
+#[test]
 fn ice_state_str_maps_all_variants() {
     assert_eq!(ice_state_str(IceConnectionState::New), "new");
     assert_eq!(ice_state_str(IceConnectionState::Checking), "checking");

@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::FutureExt;
 use str0m::change::{SdpAnswer, SdpOffer, SdpPendingOffer};
+use str0m::crypto::Fingerprint;
 use str0m::media::{Direction, MediaKind, Mid};
 use str0m::net::{Protocol, Receive};
 use str0m::rtp::SeqNo;
@@ -109,6 +110,11 @@ pub struct WebRtcEndpoint {
     learned_step: Option<u32>,
     /// Pending offer (when we created an offer, waiting for answer)
     pub pending_offer: Option<SdpPendingOffer>,
+    /// Remote DTLS fingerprint advertised in the first accepted SDP. This is
+    /// the WebRTC peer identity for the endpoint; it must stay stable across
+    /// ICE restarts. A different fingerprint means the caller is trying to
+    /// attach a different PeerConnection and must create/replace the endpoint.
+    remote_dtls_fingerprint: Option<Fingerprint>,
     /// Monotonic generation of the most recently minted server offer.
     /// Incremented on each `ice_restart`. Returned to the caller so a later
     /// `accept_answer` can be tagged with the generation it answers; the
@@ -162,6 +168,18 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
     } else {
         "non-string panic payload"
     }
+}
+
+fn remote_dtls_fingerprint_from_sdp(sdp: &str) -> anyhow::Result<Fingerprint> {
+    for line in sdp.lines().map(str::trim) {
+        if let Some(value) = line.strip_prefix("a=fingerprint:") {
+            return value
+                .parse::<Fingerprint>()
+                .map_err(|e| anyhow::anyhow!("failed to parse remote DTLS fingerprint: {e}"));
+        }
+    }
+
+    anyhow::bail!("missing remote DTLS fingerprint in WebRTC SDP");
 }
 
 /// What the recv task should do after handling one datagram.
@@ -281,6 +299,7 @@ impl WebRtcEndpoint {
             last_source_ts: None,
             learned_step: None,
             pending_offer: None,
+            remote_dtls_fingerprint: None,
             offer_generation: 0,
             auto_direction: config.direction,
             connecting_since: None,
@@ -328,6 +347,34 @@ impl WebRtcEndpoint {
         self.last_source_id = None;
         self.last_source_ts = None;
         self.learned_step = None;
+    }
+
+    fn remember_or_validate_remote_dtls_fingerprint(
+        &self,
+        fingerprint: &Fingerprint,
+        negotiation: &'static str,
+    ) -> anyhow::Result<()> {
+        if let Some(existing) = &self.remote_dtls_fingerprint
+            && existing != fingerprint
+        {
+            warn!(
+                endpoint_id = %self.id,
+                negotiation,
+                existing_remote_dtls_fingerprint = %existing,
+                new_remote_dtls_fingerprint = %fingerprint,
+                "rejecting WebRTC SDP with changed remote DTLS fingerprint; use endpoint replacement for a fresh peer connection"
+            );
+            anyhow::bail!(
+                "remote DTLS fingerprint changed on existing WebRTC endpoint; use endpoint replacement instead of ICE restart"
+            );
+        }
+        Ok(())
+    }
+
+    fn store_remote_dtls_fingerprint(&mut self, fingerprint: Fingerprint) {
+        if self.remote_dtls_fingerprint.is_none() {
+            self.remote_dtls_fingerprint = Some(fingerprint);
+        }
     }
 
     pub fn set_direction_override(&mut self, update: EndpointDirectionUpdate) {
@@ -540,9 +587,12 @@ impl WebRtcEndpoint {
             serde_json::from_str::<SdpOffer>(offer_sdp)
                 .map_err(|e| anyhow::anyhow!("Failed to parse SDP offer: {e}"))
         })?;
+        let remote_fingerprint = remote_dtls_fingerprint_from_sdp(&offer.to_sdp_string())?;
+        endpoint.remember_or_validate_remote_dtls_fingerprint(&remote_fingerprint, "from_offer")?;
 
         let answer = endpoint.rtc.sdp_api().accept_offer(offer)?;
         let answer_str = answer.to_sdp_string();
+        endpoint.store_remote_dtls_fingerprint(remote_fingerprint);
 
         endpoint.state = EndpointState::Connecting;
         endpoint.mark_negotiation_started();
@@ -600,6 +650,8 @@ impl WebRtcEndpoint {
             serde_json::from_str::<SdpAnswer>(answer_sdp)
                 .map_err(|e| anyhow::anyhow!("Failed to parse SDP answer: {e}"))
         })?;
+        let remote_fingerprint = remote_dtls_fingerprint_from_sdp(&answer.to_sdp_string())?;
+        self.remember_or_validate_remote_dtls_fingerprint(&remote_fingerprint, "accept_answer")?;
 
         let pending = self
             .pending_offer
@@ -607,6 +659,7 @@ impl WebRtcEndpoint {
             .ok_or_else(|| anyhow::anyhow!("No pending offer to accept answer for"))?;
 
         self.rtc.sdp_api().accept_answer(pending, answer)?;
+        self.store_remote_dtls_fingerprint(remote_fingerprint);
 
         // Restart the watchdog so a stall after the answer is applied is
         // measured from now, not from the original offer.
@@ -621,8 +674,11 @@ impl WebRtcEndpoint {
             serde_json::from_str::<SdpOffer>(offer_sdp)
                 .map_err(|e| anyhow::anyhow!("Failed to parse SDP offer: {e}"))
         })?;
+        let remote_fingerprint = remote_dtls_fingerprint_from_sdp(&offer.to_sdp_string())?;
+        self.remember_or_validate_remote_dtls_fingerprint(&remote_fingerprint, "accept_offer")?;
 
         let answer = self.rtc.sdp_api().accept_offer(offer)?;
+        self.store_remote_dtls_fingerprint(remote_fingerprint);
 
         // If we had a local offer in flight, a remote offer supersedes it.
         // Dropping pending_offer is equivalent to rolling back the local offer.

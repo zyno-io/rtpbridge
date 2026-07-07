@@ -197,6 +197,7 @@ pub enum SessionCommand {
     StatsSubscribe {
         reply: oneshot::Sender<anyhow::Result<()>>,
         interval_ms: u32,
+        include_diagnostics: bool,
     },
     StatsUnsubscribe {
         reply: oneshot::Sender<anyhow::Result<()>>,
@@ -277,6 +278,7 @@ struct SessionState {
     recording_mgr: RecordingManager,
     vad_monitors: HashMap<EndpointId, VadMonitor>,
     stats_interval: Option<Duration>,
+    stats_include_diagnostics: bool,
     last_stats_emit: Instant,
     file_rtp_states: HashMap<EndpointId, FileRtpState>,
     tone_rtp_states: HashMap<EndpointId, super::tone_poll::ToneRtpState>,
@@ -618,7 +620,11 @@ impl SessionState {
             } => {
                 let _ = reply.send(self.handle_update_remote_sdp(endpoint_id, &sdp));
             }
-            SessionCommand::StatsSubscribe { reply, interval_ms } => {
+            SessionCommand::StatsSubscribe {
+                reply,
+                interval_ms,
+                include_diagnostics,
+            } => {
                 // First subscribe anchors the emit timeline to now, so the first
                 // `stats` event lands one full interval out. A re-subscribe
                 // (changing the interval) keeps the existing anchor: the new
@@ -630,10 +636,12 @@ impl SessionState {
                     self.last_stats_emit = Instant::now();
                 }
                 self.stats_interval = Some(Duration::from_millis(interval_ms as u64));
+                self.stats_include_diagnostics = include_diagnostics;
                 let _ = reply.send(Ok(()));
             }
             SessionCommand::StatsUnsubscribe { reply } => {
                 self.stats_interval = None;
+                self.stats_include_diagnostics = false;
                 let _ = reply.send(Ok(()));
             }
             SessionCommand::GetInfo { reply } => {
@@ -2359,6 +2367,7 @@ impl SessionState {
             .values()
             .map(|ep| {
                 let stats = ep.stats();
+                let include_diagnostics = self.stats_include_diagnostics;
                 let (local_rtp_addr, remote_rtp_addr, offer_generation) = match ep {
                     Endpoint::WebRtc(w) => {
                         let (local, remote) = w.recording_addrs();
@@ -2383,8 +2392,65 @@ impl SessionState {
                         packets_lost: ep.packets_lost(),
                         jitter_ms: ep.jitter_ms(),
                         last_received_ms_ago: stats.ms_since_last_received().unwrap_or(0),
-                        raw_packets: ep.raw_recv_packets(),
-                        raw_bytes: ep.raw_recv_bytes(),
+                        raw_packets: include_diagnostics.then(|| ep.raw_recv_packets()).flatten(),
+                        raw_bytes: include_diagnostics.then(|| ep.raw_recv_bytes()).flatten(),
+                        raw_rtp_packets: include_diagnostics
+                            .then(|| ep.raw_recv_rtp_packets())
+                            .flatten(),
+                        raw_rtp_bytes: include_diagnostics
+                            .then(|| ep.raw_recv_rtp_bytes())
+                            .flatten(),
+                        raw_rtp_packets_lost: include_diagnostics
+                            .then(|| ep.raw_recv_rtp_packets_lost())
+                            .flatten(),
+                        raw_rtp_sequence_gaps: include_diagnostics
+                            .then(|| ep.raw_recv_rtp_sequence_gaps())
+                            .flatten(),
+                        raw_rtp_max_sequence_gap: include_diagnostics
+                            .then(|| ep.raw_recv_rtp_max_sequence_gap())
+                            .flatten(),
+                        raw_rtp_duplicate_packets: include_diagnostics
+                            .then(|| ep.raw_recv_rtp_duplicate_packets())
+                            .flatten(),
+                        raw_rtp_out_of_order_packets: include_diagnostics
+                            .then(|| ep.raw_recv_rtp_out_of_order_packets())
+                            .flatten(),
+                        raw_rtp_sequence_resets: include_diagnostics
+                            .then(|| ep.raw_recv_rtp_sequence_resets())
+                            .flatten(),
+                        raw_rtp_last_sequence: include_diagnostics
+                            .then(|| ep.raw_recv_rtp_last_sequence())
+                            .flatten(),
+                        raw_rtp_last_ssrc: include_diagnostics
+                            .then(|| ep.raw_recv_rtp_last_ssrc())
+                            .flatten(),
+                        recv_loop_gap_ms: include_diagnostics
+                            .then(|| ep.raw_recv_loop_gap_ms())
+                            .flatten(),
+                        max_recv_loop_gap_ms: include_diagnostics
+                            .then(|| ep.raw_recv_max_loop_gap_ms())
+                            .flatten(),
+                        enqueue_wait_ms: include_diagnostics
+                            .then(|| ep.raw_recv_enqueue_wait_ms())
+                            .flatten(),
+                        max_enqueue_wait_ms: include_diagnostics
+                            .then(|| ep.raw_recv_max_enqueue_wait_ms())
+                            .flatten(),
+                        dequeue_delay_ms: include_diagnostics
+                            .then(|| ep.raw_recv_dequeue_delay_ms())
+                            .flatten(),
+                        max_dequeue_delay_ms: include_diagnostics
+                            .then(|| ep.raw_recv_max_dequeue_delay_ms())
+                            .flatten(),
+                        channel_capacity: include_diagnostics
+                            .then(|| ep.raw_recv_channel_capacity())
+                            .flatten(),
+                        min_channel_capacity: include_diagnostics
+                            .then(|| ep.raw_recv_min_channel_capacity())
+                            .flatten(),
+                        channel_overflows: include_diagnostics
+                            .then(|| ep.raw_recv_channel_overflows())
+                            .flatten(),
                     },
                     outbound: OutboundStats {
                         packets: stats.outbound_packets,
@@ -2472,6 +2538,7 @@ pub async fn run_media_session(
         ),
         vad_monitors: HashMap::new(),
         stats_interval: None,
+        stats_include_diagnostics: false,
         last_stats_emit: Instant::now(),
         file_rtp_states: HashMap::new(),
         tone_rtp_states: HashMap::new(),
@@ -2540,10 +2607,14 @@ pub async fn run_media_session(
         };
 
         let mut inbound_rtp = Vec::new();
+        let mut immediate_state_events: Vec<(EndpointId, EndpointState, EndpointState)> =
+            Vec::new();
+        let mut immediate_ice_state_events: Vec<(EndpointId, &'static str)> = Vec::new();
 
         tokio::select! {
             Some(pkt) = packet_rx.recv() => {
                 last_activity = Instant::now();
+                record_packet_dequeue_delay(&state.endpoints, &pkt);
                 let (routed, rtcp_data, bye_info) = handle_inbound_packet(&mut state.endpoints, &pkt, &state.metrics);
                 if let Some(routed) = routed {
                     // Record at arrival, before the playout buffer, framed with the
@@ -2569,6 +2640,18 @@ pub async fn run_media_session(
                     );
                     inbound_rtp.push(routed);
                 }
+                drain_webrtc_output_into_inbound(
+                    pkt.endpoint_id,
+                    &mut state.endpoints,
+                    &mut state.recording_mgr,
+                    &state.event_tx,
+                    &state.critical_event_tx,
+                    &state.dropped_events,
+                    &state.metrics,
+                    &mut inbound_rtp,
+                    &mut immediate_state_events,
+                    &mut immediate_ice_state_events,
+                );
                 if let Some((eid, rtcp_bytes)) = rtcp_data {
                     // RTCP arrives on its own socket (non-mux) from the peer's RTCP
                     // port: frame remote = the datagram's real source, local = our
@@ -2617,6 +2700,7 @@ pub async fn run_media_session(
             match packet_rx.try_recv() {
                 Ok(pkt) => {
                     last_activity = Instant::now();
+                    record_packet_dequeue_delay(&state.endpoints, &pkt);
                     let (routed, rtcp_data, bye_info) =
                         handle_inbound_packet(&mut state.endpoints, &pkt, &state.metrics);
                     if let Some(routed) = routed {
@@ -2644,6 +2728,18 @@ pub async fn run_media_session(
                         );
                         inbound_rtp.push(routed);
                     }
+                    drain_webrtc_output_into_inbound(
+                        pkt.endpoint_id,
+                        &mut state.endpoints,
+                        &mut state.recording_mgr,
+                        &state.event_tx,
+                        &state.critical_event_tx,
+                        &state.dropped_events,
+                        &state.metrics,
+                        &mut inbound_rtp,
+                        &mut immediate_state_events,
+                        &mut immediate_ice_state_events,
+                    );
                     if let Some((eid, rtcp_bytes)) = rtcp_data {
                         // Real RTCP source (the datagram's source) + our RTCP-side
                         // local addr (the dedicated RTCP socket).
@@ -2675,6 +2771,17 @@ pub async fn run_media_session(
                 }
                 Err(_) => break,
             }
+        }
+
+        if emit_webrtc_events(
+            &state.event_tx,
+            &state.critical_event_tx,
+            &state.dropped_events,
+            &state.metrics,
+            immediate_state_events,
+            immediate_ice_state_events,
+        ) {
+            state.rebuild_routing();
         }
 
         // Drain pending DTMF injection one packet at a time (non-blocking)
@@ -2895,7 +3002,7 @@ fn handle_inbound_packet(
     Option<(EndpointId, Vec<u8>)>,
     Option<(EndpointId, crate::media::rtcp::ByePacket)>,
 ) {
-    let now = Instant::now();
+    let now = pkt.recv_at;
 
     if let Some(ep) = endpoints.get_mut(&pkt.endpoint_id) {
         match ep {
@@ -2964,6 +3071,12 @@ fn handle_inbound_packet(
         }
     }
     (None, None, None)
+}
+
+fn record_packet_dequeue_delay(endpoints: &HashMap<EndpointId, Endpoint>, pkt: &InboundPacket) {
+    if let Some(ep) = endpoints.get(&pkt.endpoint_id) {
+        ep.record_raw_recv_dequeue_delay(Instant::now().saturating_duration_since(pkt.recv_at));
+    }
 }
 
 /// Returns (min WebRTC timeout, whether routing table needs rebuild due to state changes).
@@ -3103,6 +3216,107 @@ fn record_inbound(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn drain_webrtc_output_into_inbound(
+    endpoint_id: EndpointId,
+    endpoints: &mut HashMap<EndpointId, Endpoint>,
+    recording_mgr: &mut RecordingManager,
+    event_tx: &Option<mpsc::Sender<Event>>,
+    critical_event_tx: &Option<mpsc::Sender<Event>>,
+    dropped_events: &AtomicU64,
+    metrics: &crate::metrics::Metrics,
+    inbound_rtp: &mut Vec<RoutedRtpPacket>,
+    state_events: &mut Vec<(EndpointId, EndpointState, EndpointState)>,
+    ice_state_events: &mut Vec<(EndpointId, &'static str)>,
+) -> Option<Instant> {
+    let Some(Endpoint::WebRtc(wep)) = endpoints.get_mut(&endpoint_id) else {
+        return None;
+    };
+
+    match wep.poll_output() {
+        Ok((events, timeout)) => {
+            for event in events {
+                match event {
+                    WebRtcEvent::RtpPacket(pkt) => {
+                        // str0m 0.21 RTP mode stores a single pending RTP packet.
+                        // Drain after each handle_receive() so a later datagram
+                        // cannot replace it before the session-level poll.
+                        let (local, remote) = wep.recording_addrs();
+                        let desc = wep.stream_descriptor(local, remote);
+                        record_inbound(
+                            recording_mgr,
+                            &pkt,
+                            desc.as_ref(),
+                            local,
+                            remote,
+                            event_tx,
+                            critical_event_tx,
+                            dropped_events,
+                            metrics,
+                        );
+                        inbound_rtp.push(pkt);
+                    }
+                    WebRtcEvent::StateChanged { old, new } => {
+                        state_events.push((wep.id, old, new));
+                    }
+                    WebRtcEvent::IceStateChanged { state } => {
+                        ice_state_events.push((wep.id, ice_state_str(state)));
+                    }
+                }
+            }
+            Some(timeout)
+        }
+        Err(e) => {
+            warn!(endpoint_id = %wep.id, error = %e, "poll_output error");
+            None
+        }
+    }
+}
+
+fn emit_webrtc_events(
+    event_tx: &Option<mpsc::Sender<Event>>,
+    critical_event_tx: &Option<mpsc::Sender<Event>>,
+    dropped_events: &AtomicU64,
+    metrics: &crate::metrics::Metrics,
+    state_events: Vec<(EndpointId, EndpointState, EndpointState)>,
+    ice_state_events: Vec<(EndpointId, &'static str)>,
+) -> bool {
+    let mut needs_routing_rebuild = false;
+    for (eid, old, new) in state_events {
+        if new == EndpointState::Connected && old != EndpointState::Connected {
+            needs_routing_rebuild = true;
+        }
+        emit_event_with_priority(
+            event_tx,
+            critical_event_tx,
+            "endpoint.state_changed",
+            EndpointStateChangedData {
+                endpoint_id: eid,
+                old_state: old,
+                new_state: new,
+            },
+            dropped_events,
+            metrics,
+        );
+    }
+
+    for (eid, ice_state) in ice_state_events {
+        emit_event_with_priority(
+            event_tx,
+            critical_event_tx,
+            "endpoint.ice_state_changed",
+            IceStateChangedData {
+                endpoint_id: eid,
+                ice_state: ice_state.to_string(),
+            },
+            dropped_events,
+            metrics,
+        );
+    }
+
+    needs_routing_rebuild
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn poll_and_route(
     endpoints: &mut HashMap<EndpointId, Endpoint>,
     dtmf_state: &mut HashMap<EndpointId, EndpointDtmf>,
@@ -3131,9 +3345,38 @@ async fn poll_and_route(
     let mut state_events: Vec<(EndpointId, EndpointState, EndpointState)> = Vec::new();
     let mut ice_state_events: Vec<(EndpointId, &'static str)> = Vec::new();
     let mut min_webrtc_timeout: Option<Instant> = None;
+    let mut inbound_rtp = inbound_rtp;
 
-    // Inbound RTP (plain RTP / WS / Bridge). Telephone-event splits off out-of-band first;
-    // audio is ingested into its playout buffer (engaged) or routed directly (bypass).
+    // Poll WebRTC endpoints for output and track their next timeouts. RTP emitted
+    // here is folded into the common inbound path, same as packets drained
+    // immediately after handle_receive().
+    let webrtc_endpoint_ids: Vec<EndpointId> = endpoints
+        .iter()
+        .filter_map(|(id, ep)| matches!(ep, Endpoint::WebRtc(_)).then_some(*id))
+        .collect();
+    for endpoint_id in webrtc_endpoint_ids {
+        if let Some(timeout) = drain_webrtc_output_into_inbound(
+            endpoint_id,
+            endpoints,
+            recording_mgr,
+            event_tx,
+            critical_event_tx,
+            dropped_events,
+            metrics,
+            &mut inbound_rtp,
+            &mut state_events,
+            &mut ice_state_events,
+        ) {
+            min_webrtc_timeout = Some(match min_webrtc_timeout {
+                Some(prev) => prev.min(timeout),
+                None => timeout,
+            });
+        }
+    }
+
+    // Inbound RTP (plain RTP / WS / Bridge / WebRTC). Telephone-event splits
+    // off out-of-band first; audio is ingested into its playout buffer
+    // (engaged) or routed directly (bypass).
     // (Recording happens at the recv sites — see `record_inbound` calls in the run
     // loop — so the PCAP captures the true datagram source before the buffer.)
     for pkt in inbound_rtp {
@@ -3203,101 +3446,18 @@ async fn poll_and_route(
         }
     }
 
-    // Poll WebRTC endpoints for output and track their next timeouts
-    for ep in endpoints.values_mut() {
-        if let Endpoint::WebRtc(wep) = ep {
-            match wep.poll_output() {
-                Ok((events, timeout)) => {
-                    min_webrtc_timeout = Some(match min_webrtc_timeout {
-                        Some(prev) => prev.min(timeout),
-                        None => timeout,
-                    });
-                    for event in events {
-                        match event {
-                            WebRtcEvent::RtpPacket(pkt) => {
-                                // Record at arrival (post-str0m-decrypt, pre-buffer)
-                                // with the nominated peer / matching-family local addr.
-                                let (local, remote) = wep.recording_addrs();
-                                let desc = wep.stream_descriptor(local, remote);
-                                record_inbound(
-                                    recording_mgr,
-                                    &pkt,
-                                    desc.as_ref(),
-                                    local,
-                                    remote,
-                                    event_tx,
-                                    critical_event_tx,
-                                    dropped_events,
-                                    metrics,
-                                );
-                                if super::session_dtmf::classify_dtmf(&pkt, dtmf_state) {
-                                    dtmf_packets.push(pkt);
-                                } else {
-                                    ingest_audio(
-                                        pkt,
-                                        playout_policy,
-                                        playout_buffers,
-                                        &mut packets_to_route,
-                                        now,
-                                    );
-                                }
-                            }
-                            WebRtcEvent::StateChanged { old, new } => {
-                                state_events.push((wep.id, old, new));
-                            }
-                            WebRtcEvent::IceStateChanged { state } => {
-                                ice_state_events.push((wep.id, ice_state_str(state)));
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(endpoint_id = %wep.id, error = %e, "poll_output error");
-                }
-            }
-        }
-    }
-
     // Shared 20 ms grid: drain each engaged buffer's due frame into the route set. All buffers
     // are evaluated against the same instant so a mixer's sources stay frame-aligned.
     let grid_fired = drive_grid(mix_grid, playout_buffers, &mut packets_to_route, now);
 
-    // Emit state change events (critical priority)
-    let mut needs_routing_rebuild = false;
-    for (eid, old, new) in state_events {
-        if new == EndpointState::Connected && old != EndpointState::Connected {
-            needs_routing_rebuild = true;
-        }
-        emit_event_with_priority(
-            event_tx,
-            critical_event_tx,
-            "endpoint.state_changed",
-            EndpointStateChangedData {
-                endpoint_id: eid,
-                old_state: old,
-                new_state: new,
-            },
-            dropped_events,
-            metrics,
-        );
-    }
-
-    // Emit ICE connection-state transitions (critical priority): the
-    // finer-grained signal for remote-path failure, where `disconnected` is
-    // str0m's ICE consent loss.
-    for (eid, ice_state) in ice_state_events {
-        emit_event_with_priority(
-            event_tx,
-            critical_event_tx,
-            "endpoint.ice_state_changed",
-            IceStateChangedData {
-                endpoint_id: eid,
-                ice_state: ice_state.to_string(),
-            },
-            dropped_events,
-            metrics,
-        );
-    }
+    let needs_routing_rebuild = emit_webrtc_events(
+        event_tx,
+        critical_event_tx,
+        dropped_events,
+        metrics,
+        state_events,
+        ice_state_events,
+    );
 
     // Process DTMF packets: detect events, forward without transcoding
     super::session_dtmf::process_dtmf_packets(

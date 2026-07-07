@@ -183,17 +183,25 @@ fn forward_datagram(
     raw_recv: &RawRecvCounters,
     metrics: &Metrics,
     packet_tx: &mpsc::Sender<InboundPacket>,
+    last_recv_at: &mut Option<Instant>,
 ) -> RecvAction {
     match result {
         Ok((n, source)) => {
+            let recv_at = Instant::now();
+            let recv_gap = last_recv_at.map(|last| recv_at.saturating_duration_since(last));
+            *last_recv_at = Some(recv_at);
             // Wire-level count: every datagram, BEFORE str0m demuxes
             // ICE/DTLS/RTCP from media. A dropped (overflow) packet still
             // arrived on the path, so count before the try_send.
             raw_recv.record(n);
+            raw_recv.record_raw_rtp_datagram(&buf[..n]);
+            raw_recv.record_recv_diagnostics(recv_gap, packet_tx.capacity());
+            raw_recv.record_enqueue_wait(Duration::ZERO);
             let packet = InboundPacket {
                 endpoint_id,
                 source,
                 data: buf[..n].to_vec(),
+                recv_at,
                 is_rtcp: false,
                 local: Some(local),
             };
@@ -208,6 +216,7 @@ fn forward_datagram(
                 Ok(()) => RecvAction::Continue,
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     metrics.webrtc_recv_overflow.inc();
+                    raw_recv.record_channel_overflow();
                     RecvAction::Continue
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => RecvAction::Stop("session_dropped"),
@@ -408,11 +417,12 @@ impl WebRtcEndpoint {
 
                 let mut buf0 = vec![0u8; 4096];
                 let mut buf1 = vec![0u8; 4096];
+                let mut last_recv_at: Option<Instant> = None;
                 let mut exit_reason = "cancelled";
                 loop {
                     tokio::select! {
                         result = s0.recv_from(&mut buf0) => {
-                            match forward_datagram(result, &buf0, la0, endpoint_id, &raw_recv, &metrics, &packet_tx) {
+                            match forward_datagram(result, &buf0, la0, endpoint_id, &raw_recv, &metrics, &packet_tx, &mut last_recv_at) {
                                 RecvAction::Continue => {}
                                 RecvAction::Stop(reason) => { exit_reason = reason; break; }
                             }
@@ -422,7 +432,7 @@ impl WebRtcEndpoint {
                         // runs when `s1` is Some.
                         result = async { s1.as_ref().unwrap().1.recv_from(&mut buf1).await }, if s1.is_some() => {
                             let la1 = s1.as_ref().unwrap().0;
-                            match forward_datagram(result, &buf1, la1, endpoint_id, &raw_recv, &metrics, &packet_tx) {
+                            match forward_datagram(result, &buf1, la1, endpoint_id, &raw_recv, &metrics, &packet_tx, &mut last_recv_at) {
                                 RecvAction::Continue => {}
                                 RecvAction::Stop(reason) => { exit_reason = reason; break; }
                             }

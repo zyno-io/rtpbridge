@@ -124,6 +124,14 @@ async fn test_stats_event_content() {
                     ep["inbound"]["bytes"].is_number(),
                     "inbound should have 'bytes' field: {ep}"
                 );
+                assert!(
+                    ep["inbound"].get("raw_packets").is_none(),
+                    "default stats should omit diagnostic raw counters: {ep}"
+                );
+                assert!(
+                    ep["inbound"].get("raw_rtp_packets").is_none(),
+                    "default stats should omit diagnostic raw RTP counters: {ep}"
+                );
 
                 // Verify outbound stats structure
                 assert!(
@@ -234,7 +242,10 @@ async fn test_stats_includes_wire_level_raw_counters() {
     tokio::time::sleep(timing::scaled_ms(50)).await;
 
     client
-        .request_ok("stats.subscribe", json!({"interval_ms": 500}))
+        .request_ok(
+            "stats.subscribe",
+            json!({"interval_ms": 500, "include_diagnostics": true}),
+        )
         .await;
 
     // Drive real RTP media at the server's socket.

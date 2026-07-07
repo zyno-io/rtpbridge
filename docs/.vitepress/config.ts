@@ -55,6 +55,10 @@ export default defineConfig({
           {
             text: 'WebRTC Receive-Task Wedge',
             link: '/incident-research/webrtc-recv-task-wedge'
+          },
+          {
+            text: 'WebRTC RTP-Mode Pending Packet Loss',
+            link: '/incident-research/webrtc-rtp-mode-pending-packet-loss'
           }
         ]
       }

@@ -233,6 +233,156 @@ impl Endpoint {
         }
     }
 
+    pub fn raw_recv_rtp_packets(&self) -> Option<u64> {
+        match self {
+            Endpoint::WebRtc(ep) => Some(ep.raw_recv.raw_rtp_packets()),
+            _ => None,
+        }
+    }
+
+    pub fn raw_recv_rtp_bytes(&self) -> Option<u64> {
+        match self {
+            Endpoint::WebRtc(ep) => Some(ep.raw_recv.raw_rtp_bytes()),
+            _ => None,
+        }
+    }
+
+    pub fn raw_recv_rtp_packets_lost(&self) -> Option<u64> {
+        match self {
+            Endpoint::WebRtc(ep) => Some(ep.raw_recv.raw_rtp_packets_lost()),
+            _ => None,
+        }
+    }
+
+    pub fn raw_recv_rtp_sequence_gaps(&self) -> Option<u64> {
+        match self {
+            Endpoint::WebRtc(ep) => Some(ep.raw_recv.raw_rtp_sequence_gaps()),
+            _ => None,
+        }
+    }
+
+    pub fn raw_recv_rtp_max_sequence_gap(&self) -> Option<u64> {
+        match self {
+            Endpoint::WebRtc(ep) => Some(ep.raw_recv.raw_rtp_max_sequence_gap()),
+            _ => None,
+        }
+    }
+
+    pub fn raw_recv_rtp_duplicate_packets(&self) -> Option<u64> {
+        match self {
+            Endpoint::WebRtc(ep) => Some(ep.raw_recv.raw_rtp_duplicate_packets()),
+            _ => None,
+        }
+    }
+
+    pub fn raw_recv_rtp_out_of_order_packets(&self) -> Option<u64> {
+        match self {
+            Endpoint::WebRtc(ep) => Some(ep.raw_recv.raw_rtp_out_of_order_packets()),
+            _ => None,
+        }
+    }
+
+    pub fn raw_recv_rtp_sequence_resets(&self) -> Option<u64> {
+        match self {
+            Endpoint::WebRtc(ep) => Some(ep.raw_recv.raw_rtp_sequence_resets()),
+            _ => None,
+        }
+    }
+
+    pub fn raw_recv_rtp_last_sequence(&self) -> Option<u64> {
+        match self {
+            Endpoint::WebRtc(ep) => ep.raw_recv.raw_rtp_last_sequence(),
+            _ => None,
+        }
+    }
+
+    pub fn raw_recv_rtp_last_ssrc(&self) -> Option<u64> {
+        match self {
+            Endpoint::WebRtc(ep) => ep.raw_recv.raw_rtp_last_ssrc(),
+            _ => None,
+        }
+    }
+
+    pub fn raw_recv_loop_gap_ms(&self) -> Option<u64> {
+        match self {
+            Endpoint::WebRtc(ep) => Some(ep.raw_recv.recv_loop_gap_ms()),
+            Endpoint::Rtp(ep) => Some(ep.raw_recv.recv_loop_gap_ms()),
+            _ => None,
+        }
+    }
+
+    pub fn raw_recv_max_loop_gap_ms(&self) -> Option<u64> {
+        match self {
+            Endpoint::WebRtc(ep) => Some(ep.raw_recv.max_recv_loop_gap_ms()),
+            Endpoint::Rtp(ep) => Some(ep.raw_recv.max_recv_loop_gap_ms()),
+            _ => None,
+        }
+    }
+
+    pub fn raw_recv_enqueue_wait_ms(&self) -> Option<u64> {
+        match self {
+            Endpoint::WebRtc(ep) => Some(ep.raw_recv.enqueue_wait_ms()),
+            Endpoint::Rtp(ep) => Some(ep.raw_recv.enqueue_wait_ms()),
+            _ => None,
+        }
+    }
+
+    pub fn raw_recv_max_enqueue_wait_ms(&self) -> Option<u64> {
+        match self {
+            Endpoint::WebRtc(ep) => Some(ep.raw_recv.max_enqueue_wait_ms()),
+            Endpoint::Rtp(ep) => Some(ep.raw_recv.max_enqueue_wait_ms()),
+            _ => None,
+        }
+    }
+
+    pub fn raw_recv_dequeue_delay_ms(&self) -> Option<u64> {
+        match self {
+            Endpoint::WebRtc(ep) => Some(ep.raw_recv.dequeue_delay_ms()),
+            Endpoint::Rtp(ep) => Some(ep.raw_recv.dequeue_delay_ms()),
+            _ => None,
+        }
+    }
+
+    pub fn raw_recv_max_dequeue_delay_ms(&self) -> Option<u64> {
+        match self {
+            Endpoint::WebRtc(ep) => Some(ep.raw_recv.max_dequeue_delay_ms()),
+            Endpoint::Rtp(ep) => Some(ep.raw_recv.max_dequeue_delay_ms()),
+            _ => None,
+        }
+    }
+
+    pub fn raw_recv_channel_capacity(&self) -> Option<u64> {
+        match self {
+            Endpoint::WebRtc(ep) => Some(ep.raw_recv.channel_capacity()),
+            Endpoint::Rtp(ep) => Some(ep.raw_recv.channel_capacity()),
+            _ => None,
+        }
+    }
+
+    pub fn raw_recv_min_channel_capacity(&self) -> Option<u64> {
+        match self {
+            Endpoint::WebRtc(ep) => ep.raw_recv.min_channel_capacity(),
+            Endpoint::Rtp(ep) => ep.raw_recv.min_channel_capacity(),
+            _ => None,
+        }
+    }
+
+    pub fn raw_recv_channel_overflows(&self) -> Option<u64> {
+        match self {
+            Endpoint::WebRtc(ep) => Some(ep.raw_recv.channel_overflows()),
+            Endpoint::Rtp(ep) => Some(ep.raw_recv.channel_overflows()),
+            _ => None,
+        }
+    }
+
+    pub fn record_raw_recv_dequeue_delay(&self, delay: std::time::Duration) {
+        match self {
+            Endpoint::WebRtc(ep) => ep.raw_recv.record_dequeue_delay(delay),
+            Endpoint::Rtp(ep) => ep.raw_recv.record_dequeue_delay(delay),
+            _ => {}
+        }
+    }
+
     /// str0m ICE connection state (WebRTC only), lowercased: `"new"`,
     /// `"checking"`, `"connected"`, `"completed"`, `"disconnected"`. `None` for
     /// non-WebRTC endpoints or before the first ICE transition. `"disconnected"`

@@ -79,6 +79,7 @@ export async function createRunDir(root: string, seed: number): Promise<string> 
   await ensureDir(path.join(dir, "sdp"));
   await ensureDir(path.join(dir, "browser-stats"));
   await ensureDir(path.join(dir, "bridge-stats"));
+  await ensureDir(path.join(dir, "load-stats"));
   await ensureDir(path.join(dir, "rtp-peer-stats"));
   return dir;
 }
@@ -200,4 +201,3 @@ export async function ensureHoldMusicWav(file: string): Promise<void> {
 export function scaleDuration(ms: number, scale: number): number {
   return Math.max(1000, Math.round(ms * scale));
 }
-

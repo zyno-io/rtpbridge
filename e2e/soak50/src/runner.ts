@@ -1,8 +1,10 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { createWriteStream } from "node:fs";
 import fs from "node:fs/promises";
 import { createServer, type Server } from "node:http";
+import os from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 import { chromium, type Browser } from "playwright";
 
 import { connectControl, ControlClient } from "./control-client.js";
@@ -15,6 +17,8 @@ import type {
   CallRuntime,
   EndpointRuntime,
   Failure,
+  LoadProcessSample,
+  LoadSample,
   MediaImpairmentPlan,
   MutationPlan,
   RunnerOptions,
@@ -34,6 +38,8 @@ import {
   writeRtpbridgeConfig,
 } from "./utils.js";
 import { WebRtcPeer } from "./webrtc-peer.js";
+
+const execFileAsync = promisify(execFile);
 
 interface BrowserOrigin {
   server: Server;
@@ -89,6 +95,7 @@ async function main(): Promise<void> {
   const monitor = new MediaMonitor(options.sampleIntervalMs);
   let shuttingDown = false;
   let callsDone = false;
+  let loadMonitorTask: Promise<void> | undefined;
 
   const fail = async (reason: string, detail?: unknown, callId?: string) => {
     const failure = { ts: nowIso(), reason, detail, callId };
@@ -129,6 +136,12 @@ async function main(): Promise<void> {
     }
 
     await waitForControl(controlUrl, options.startupTimeoutMs);
+    loadMonitorTask = runLoadMonitor({
+      reporter,
+      options,
+      rtpbridgePid: () => child?.pid,
+      shouldStop: () => shuttingDown || callsDone,
+    });
     await writeMetrics(controlUrl, path.join(runDir, "metrics-before.prom"));
 
     browserOrigin = await startBrowserOrigin();
@@ -180,11 +193,12 @@ async function main(): Promise<void> {
       }
     }
     shuttingDown = true;
-    await monitorTask;
+    await Promise.all([monitorTask, loadMonitorTask]);
 
     await writeMetrics(controlUrl, path.join(runDir, "metrics-after.prom"));
   } finally {
     shuttingDown = true;
+    await loadMonitorTask?.catch(() => undefined);
     await cleanupRuntimes(runtimes, reporter);
     if (browser) {
       await browser.close().catch(() => undefined);
@@ -261,7 +275,10 @@ async function runCall(params: {
     session_id: runtime.sessionId,
     kind: params.call.kind,
   });
-  await control.requestOk("stats.subscribe", { interval_ms: params.options.sampleIntervalMs });
+  await control.requestOk("stats.subscribe", {
+    interval_ms: params.options.sampleIntervalMs,
+    include_diagnostics: true,
+  });
 
   try {
     if (params.call.kind === "rtp-rtp") {
@@ -704,7 +721,10 @@ async function parkTransfer(
   }
   const parking = await connectControl(options.controlUrl ?? runtime.controlUrl, `${runtime.plan.id}-park`);
   const parkingSession = await parking.requestOk<{ session_id: string }>("session.create", {});
-  await parking.requestOk("stats.subscribe", { interval_ms: options.sampleIntervalMs });
+  await parking.requestOk("stats.subscribe", {
+    interval_ms: options.sampleIntervalMs,
+    include_diagnostics: true,
+  });
   const file = await parking.requestOk<{ endpoint_id: string }>("endpoint.create_with_file", {
     source: holdMusicPath,
     shared: false,
@@ -807,6 +827,154 @@ async function runMonitor(params: {
     }
     await sleep(params.options.sampleIntervalMs);
   }
+}
+
+async function runLoadMonitor(params: {
+  reporter: RunReporter;
+  options: RunnerOptions;
+  rtpbridgePid: () => number | undefined;
+  shouldStop: () => boolean;
+}): Promise<void> {
+  while (!params.shouldStop()) {
+    try {
+      await params.reporter.appendLoadSample(await sampleLoad(params.rtpbridgePid(), params.options.loadPids));
+    } catch (error) {
+      await params.reporter.event("load.sample_failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+    await sleep(params.options.loadSampleIntervalMs);
+  }
+}
+
+async function sampleLoad(rtpbridgePid: number | undefined, extraPids: number[]): Promise<LoadSample> {
+  const roots = uniqueProcessRoots([
+    { pid: process.pid, label: "soak-runner" },
+    ...(rtpbridgePid ? [{ pid: rtpbridgePid, label: "rtpbridge" }] : []),
+    ...extraPids.map((pid) => ({ pid, label: `pid-${pid}` })),
+  ]);
+  const processes = await sampleProcessTree(roots);
+  return {
+    ts: nowIso(),
+    mono_ms: monotonicMs(),
+    loadavg: os.loadavg(),
+    cpu_count: os.cpus().length,
+    total_mem_bytes: os.totalmem(),
+    free_mem_bytes: os.freemem(),
+    process_count: processes.length,
+    process_groups: summarizeProcessGroups(processes),
+    processes,
+  };
+}
+
+async function sampleProcessTree(
+  roots: Array<{ pid: number; label: string }>,
+): Promise<LoadProcessSample[]> {
+  if (roots.length === 0) {
+    return [];
+  }
+
+  const { stdout } = await execFileAsync(
+    "ps",
+    [
+      "-axo",
+      "pid=,ppid=,pcpu=,pmem=,rss=,vsz=,stat=,command=",
+    ],
+    { maxBuffer: 4 * 1024 * 1024 },
+  );
+  const allProcesses = parsePsOutput(stdout);
+  const byPid = new Map(allProcesses.map((sample) => [sample.pid, sample]));
+  const children = new Map<number, LoadProcessSample[]>();
+  for (const sample of allProcesses) {
+    const existing = children.get(sample.ppid);
+    if (existing) {
+      existing.push(sample);
+    } else {
+      children.set(sample.ppid, [sample]);
+    }
+  }
+
+  const selected = new Map<number, LoadProcessSample>();
+  for (const root of roots) {
+    const rootProcess = byPid.get(root.pid);
+    if (!rootProcess) {
+      continue;
+    }
+    const queue = [rootProcess];
+    while (queue.length > 0) {
+      const processSample = queue.shift()!;
+      selected.set(processSample.pid, {
+        ...processSample,
+        label: processSample.pid === root.pid ? root.label : `${root.label}:child`,
+      });
+      for (const child of children.get(processSample.pid) ?? []) {
+        queue.push(child);
+      }
+    }
+  }
+
+  return [...selected.values()].sort((left, right) => left.pid - right.pid);
+}
+
+function parsePsOutput(output: string): LoadProcessSample[] {
+  const samples: LoadProcessSample[] = [];
+  for (const line of output.split("\n")) {
+    const match = line
+      .trim()
+      .match(/^(\d+)\s+(\d+)\s+([\d.]+)\s+([\d.]+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.+)$/);
+    if (!match) {
+      continue;
+    }
+    samples.push({
+      label: "unlabeled",
+      pid: Number(match[1]),
+      ppid: Number(match[2]),
+      cpu_pct: Number(match[3]),
+      mem_pct: Number(match[4]),
+      rss_kb: Number(match[5]),
+      vsz_kb: Number(match[6]),
+      state: match[7]!,
+      command: match[8]!,
+    });
+  }
+  return samples;
+}
+
+function summarizeProcessGroups(processes: LoadProcessSample[]): Array<{
+  label: string;
+  process_count: number;
+  cpu_pct: number;
+  rss_kb: number;
+}> {
+  const byLabel = new Map<string, { label: string; process_count: number; cpu_pct: number; rss_kb: number }>();
+  for (const sample of processes) {
+    const existing =
+      byLabel.get(sample.label) ??
+      {
+        label: sample.label,
+        process_count: 0,
+        cpu_pct: 0,
+        rss_kb: 0,
+      };
+    existing.process_count += 1;
+    existing.cpu_pct += sample.cpu_pct;
+    existing.rss_kb += sample.rss_kb;
+    byLabel.set(sample.label, existing);
+  }
+  return [...byLabel.values()].sort((left, right) => left.label.localeCompare(right.label));
+}
+
+function uniqueProcessRoots(roots: Array<{ pid: number; label: string }>): Array<{ pid: number; label: string }> {
+  const seen = new Set<number>();
+  const unique: Array<{ pid: number; label: string }> = [];
+  for (const root of roots) {
+    if (!Number.isInteger(root.pid) || root.pid <= 0 || seen.has(root.pid)) {
+      continue;
+    }
+    unique.push(root);
+    seen.add(root.pid);
+  }
+  return unique;
 }
 
 async function destroyCall(runtime: CallRuntime, reporter: RunReporter): Promise<void> {
@@ -991,6 +1159,10 @@ function parseArgs(argv: string[]): RunnerOptions {
     }
     return value === "true" || value === "1";
   };
+  const loadSampleIntervalMs = num("load-sample-interval-ms", 2000);
+  if (loadSampleIntervalMs <= 0) {
+    throw new Error(`invalid numeric --load-sample-interval-ms: ${loadSampleIntervalMs}`);
+  }
 
   return {
     calls: num("calls", 50),
@@ -1006,6 +1178,8 @@ function parseArgs(argv: string[]): RunnerOptions {
     rtpPortStart: num("rtp-port-start", 30000),
     rtpPortEnd: num("rtp-port-end", 39999),
     sampleIntervalMs: num("sample-interval-ms", 2000),
+    loadSampleIntervalMs,
+    loadPids: parsePidList(str("load-pids", "")!),
     startSpreadMs: num("start-spread-ms", 90_000),
     webRtcImpairments: num("webrtc-impairments", -1),
     rtpImpairments: num("rtp-impairments", -1),
@@ -1015,6 +1189,23 @@ function parseArgs(argv: string[]): RunnerOptions {
     turnUser: str("turn-user", process.env.TURN_USER),
     turnPass: str("turn-pass", process.env.TURN_PASS),
   };
+}
+
+function parsePidList(value: string): number[] {
+  if (!value.trim()) {
+    return [];
+  }
+  return value
+    .split(",")
+    .map((pid) => pid.trim())
+    .filter(Boolean)
+    .map((pid) => {
+      const parsed = Number(pid);
+      if (!Number.isInteger(parsed) || parsed <= 0) {
+        throw new Error(`invalid --load-pids entry: ${pid}`);
+      }
+      return parsed;
+    });
 }
 
 main().catch((error) => {

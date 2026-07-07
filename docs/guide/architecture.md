@@ -35,6 +35,14 @@ rtpbridge is an async media server built on [tokio](https://tokio.rs). It uses a
 
 WebRTC endpoints use [str0m](https://github.com/algesten/str0m) in Sans-I/O mode. str0m has no internal threads or async runtime — all state is driven by our event loop via `handle_input()` and `poll_output()`. This gives us full control over packet routing and timing.
 
+For WebRTC RTP mode, rtpbridge polls str0m output immediately after each inbound
+RTP datagram is passed to `handle_input()`. This ordering is intentional: str0m
+0.21 stores only one pending RTP packet for the next `poll_output()`, so feeding
+multiple RTP datagrams before polling can replace an earlier pending packet.
+The session task may batch-drain its packet channel, but each WebRTC datagram is
+followed by an endpoint-local output drain before the next WebRTC datagram can
+be handled.
+
 ### Per-Endpoint Sockets
 
 Each socket-backed endpoint binds its own UDP socket(s) rather than sharing a mux. WebRTC endpoints use one OS-assigned UDP socket, with ICE multiplexing RTP/RTCP and DTLS/SRTP on that port. Plain RTP/SRTP endpoints allocate an even/odd pair from `rtp_port_range` for RTP and RTCP sockets; if `rtcp-mux` is negotiated, RTCP traffic is demuxed on the RTP socket but the local pair is still allocated. For WebRTC, the OS-assigned port becomes the ICE host candidate.
@@ -53,6 +61,11 @@ The session task runs `tokio::select!` over:
 - Inbound UDP packets (from all endpoint recv tasks)
 - Control commands (from the WebSocket handler)
 - Timers (str0m timeouts, RTCP intervals, file playback ptime)
+
+The UDP recv tasks do not parse or route media. They stamp receive time, update
+wire-level counters, and forward datagrams to the owning session task over a
+bounded channel. The session task owns all endpoint state and is the only place
+that drives str0m, RTP parsing/decryption, playout, mixing, and routing.
 
 ### DTMF Never Transcoded
 

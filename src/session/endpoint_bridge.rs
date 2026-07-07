@@ -1,3 +1,4 @@
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::trace;
 
@@ -66,6 +67,7 @@ impl BridgeEndpoint {
             endpoint_id: self.paired_endpoint_id,
             source: "0.0.0.0:0".parse().unwrap(), // bridge packets have no real source addr
             data: packet.payload.clone(),
+            recv_at: Instant::now(),
             is_rtcp: false,
             local: None,
         };

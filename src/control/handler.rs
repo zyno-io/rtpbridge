@@ -1416,6 +1416,7 @@ async fn handle_stats_subscribe(
         SessionCommand::StatsSubscribe {
             reply: reply_tx,
             interval_ms: params.interval_ms,
+            include_diagnostics: params.include_diagnostics,
         },
         reply_rx,
         &id,

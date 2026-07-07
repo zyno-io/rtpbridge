@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 /// Wire-level inbound datagram counters for endpoints backed by a UDP socket
 /// (WebRTC, plain RTP). Counts EVERY datagram the socket delivers — STUN/ICE
@@ -15,10 +15,59 @@ use std::time::Instant;
 ///
 /// Incremented from the per-endpoint recv task and read from the session task,
 /// so the fields are atomic and the struct is shared via `Arc`.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct RawRecvCounters {
     packets: AtomicU64,
     bytes: AtomicU64,
+    recv_loop_gap_ms: AtomicU64,
+    max_recv_loop_gap_ms: AtomicU64,
+    enqueue_wait_ms: AtomicU64,
+    max_enqueue_wait_ms: AtomicU64,
+    dequeue_delay_ms: AtomicU64,
+    max_dequeue_delay_ms: AtomicU64,
+    channel_capacity: AtomicU64,
+    min_channel_capacity: AtomicU64,
+    channel_overflows: AtomicU64,
+    raw_rtp_packets: AtomicU64,
+    raw_rtp_bytes: AtomicU64,
+    raw_rtp_packets_lost: AtomicU64,
+    raw_rtp_sequence_gaps: AtomicU64,
+    raw_rtp_max_sequence_gap: AtomicU64,
+    raw_rtp_duplicate_packets: AtomicU64,
+    raw_rtp_out_of_order_packets: AtomicU64,
+    raw_rtp_sequence_resets: AtomicU64,
+    raw_rtp_last_sequence: AtomicU64,
+    raw_rtp_last_ssrc: AtomicU64,
+    raw_rtp_initialized: AtomicBool,
+}
+
+impl Default for RawRecvCounters {
+    fn default() -> Self {
+        Self {
+            packets: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+            recv_loop_gap_ms: AtomicU64::new(0),
+            max_recv_loop_gap_ms: AtomicU64::new(0),
+            enqueue_wait_ms: AtomicU64::new(0),
+            max_enqueue_wait_ms: AtomicU64::new(0),
+            dequeue_delay_ms: AtomicU64::new(0),
+            max_dequeue_delay_ms: AtomicU64::new(0),
+            channel_capacity: AtomicU64::new(0),
+            min_channel_capacity: AtomicU64::new(u64::MAX),
+            channel_overflows: AtomicU64::new(0),
+            raw_rtp_packets: AtomicU64::new(0),
+            raw_rtp_bytes: AtomicU64::new(0),
+            raw_rtp_packets_lost: AtomicU64::new(0),
+            raw_rtp_sequence_gaps: AtomicU64::new(0),
+            raw_rtp_max_sequence_gap: AtomicU64::new(0),
+            raw_rtp_duplicate_packets: AtomicU64::new(0),
+            raw_rtp_out_of_order_packets: AtomicU64::new(0),
+            raw_rtp_sequence_resets: AtomicU64::new(0),
+            raw_rtp_last_sequence: AtomicU64::new(0),
+            raw_rtp_last_ssrc: AtomicU64::new(0),
+            raw_rtp_initialized: AtomicBool::new(false),
+        }
+    }
 }
 
 impl RawRecvCounters {
@@ -29,12 +78,233 @@ impl RawRecvCounters {
         self.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
+    /// Record receive-loop diagnostics for a socket-backed endpoint.
+    ///
+    /// `recv_gap` is the time since this recv task last pulled a datagram from
+    /// the OS socket. `channel_capacity` is the session packet channel's
+    /// remaining capacity just before enqueue/drop.
+    pub fn record_recv_diagnostics(&self, recv_gap: Option<Duration>, channel_capacity: usize) {
+        if let Some(gap) = recv_gap {
+            let gap_ms = duration_ms(gap);
+            self.recv_loop_gap_ms.store(gap_ms, Ordering::Relaxed);
+            update_max(&self.max_recv_loop_gap_ms, gap_ms);
+        }
+        let capacity = channel_capacity as u64;
+        self.channel_capacity.store(capacity, Ordering::Relaxed);
+        update_min(&self.min_channel_capacity, capacity);
+    }
+
+    /// Record how long the recv task waited for capacity in the session packet
+    /// channel. For non-blocking paths this is recorded as zero.
+    pub fn record_enqueue_wait(&self, wait: Duration) {
+        let wait_ms = duration_ms(wait);
+        self.enqueue_wait_ms.store(wait_ms, Ordering::Relaxed);
+        update_max(&self.max_enqueue_wait_ms, wait_ms);
+    }
+
+    /// Record how long a packet sat in the session packet channel before the
+    /// media session task dequeued it.
+    pub fn record_dequeue_delay(&self, delay: Duration) {
+        let delay_ms = duration_ms(delay);
+        self.dequeue_delay_ms.store(delay_ms, Ordering::Relaxed);
+        update_max(&self.max_dequeue_delay_ms, delay_ms);
+    }
+
+    pub fn record_channel_overflow(&self) {
+        self.channel_overflows.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record an RTP-looking datagram before WebRTC demux/decrypt.
+    ///
+    /// SRTP leaves the RTP fixed header in clear text, so this lets the recv task
+    /// distinguish "the packet was absent at bridge ingress" from "the packet
+    /// reached the bridge socket but did not emerge as a str0m RTP event".
+    pub fn record_raw_rtp_datagram(&self, data: &[u8]) {
+        let Some((seq, ssrc)) = parse_raw_rtp_header(data) else {
+            return;
+        };
+
+        self.raw_rtp_packets.fetch_add(1, Ordering::Relaxed);
+        self.raw_rtp_bytes
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
+
+        let seq = u64::from(seq);
+        let ssrc = u64::from(ssrc);
+        if !self.raw_rtp_initialized.swap(true, Ordering::Relaxed) {
+            self.raw_rtp_last_sequence.store(seq, Ordering::Relaxed);
+            self.raw_rtp_last_ssrc.store(ssrc, Ordering::Relaxed);
+            return;
+        }
+
+        let last_ssrc = self.raw_rtp_last_ssrc.load(Ordering::Relaxed);
+        if last_ssrc != ssrc {
+            self.raw_rtp_sequence_resets.fetch_add(1, Ordering::Relaxed);
+            self.raw_rtp_last_sequence.store(seq, Ordering::Relaxed);
+            self.raw_rtp_last_ssrc.store(ssrc, Ordering::Relaxed);
+            return;
+        }
+
+        let last_seq = self.raw_rtp_last_sequence.load(Ordering::Relaxed) as u16;
+        let seq16 = seq as u16;
+        let delta = seq16.wrapping_sub(last_seq);
+        match delta {
+            0 => {
+                self.raw_rtp_duplicate_packets
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            1 => {
+                self.raw_rtp_last_sequence.store(seq, Ordering::Relaxed);
+            }
+            2..=0x7fff => {
+                let missing = u64::from(delta - 1);
+                self.raw_rtp_packets_lost
+                    .fetch_add(missing, Ordering::Relaxed);
+                self.raw_rtp_sequence_gaps.fetch_add(1, Ordering::Relaxed);
+                update_max(&self.raw_rtp_max_sequence_gap, missing);
+                self.raw_rtp_last_sequence.store(seq, Ordering::Relaxed);
+            }
+            _ => {
+                self.raw_rtp_out_of_order_packets
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
     pub fn packets(&self) -> u64 {
         self.packets.load(Ordering::Relaxed)
     }
 
     pub fn bytes(&self) -> u64 {
         self.bytes.load(Ordering::Relaxed)
+    }
+
+    pub fn recv_loop_gap_ms(&self) -> u64 {
+        self.recv_loop_gap_ms.load(Ordering::Relaxed)
+    }
+
+    pub fn max_recv_loop_gap_ms(&self) -> u64 {
+        self.max_recv_loop_gap_ms.load(Ordering::Relaxed)
+    }
+
+    pub fn enqueue_wait_ms(&self) -> u64 {
+        self.enqueue_wait_ms.load(Ordering::Relaxed)
+    }
+
+    pub fn max_enqueue_wait_ms(&self) -> u64 {
+        self.max_enqueue_wait_ms.load(Ordering::Relaxed)
+    }
+
+    pub fn dequeue_delay_ms(&self) -> u64 {
+        self.dequeue_delay_ms.load(Ordering::Relaxed)
+    }
+
+    pub fn max_dequeue_delay_ms(&self) -> u64 {
+        self.max_dequeue_delay_ms.load(Ordering::Relaxed)
+    }
+
+    pub fn channel_capacity(&self) -> u64 {
+        self.channel_capacity.load(Ordering::Relaxed)
+    }
+
+    pub fn min_channel_capacity(&self) -> Option<u64> {
+        let value = self.min_channel_capacity.load(Ordering::Relaxed);
+        if value == u64::MAX { None } else { Some(value) }
+    }
+
+    pub fn channel_overflows(&self) -> u64 {
+        self.channel_overflows.load(Ordering::Relaxed)
+    }
+
+    pub fn raw_rtp_packets(&self) -> u64 {
+        self.raw_rtp_packets.load(Ordering::Relaxed)
+    }
+
+    pub fn raw_rtp_bytes(&self) -> u64 {
+        self.raw_rtp_bytes.load(Ordering::Relaxed)
+    }
+
+    pub fn raw_rtp_packets_lost(&self) -> u64 {
+        self.raw_rtp_packets_lost.load(Ordering::Relaxed)
+    }
+
+    pub fn raw_rtp_sequence_gaps(&self) -> u64 {
+        self.raw_rtp_sequence_gaps.load(Ordering::Relaxed)
+    }
+
+    pub fn raw_rtp_max_sequence_gap(&self) -> u64 {
+        self.raw_rtp_max_sequence_gap.load(Ordering::Relaxed)
+    }
+
+    pub fn raw_rtp_duplicate_packets(&self) -> u64 {
+        self.raw_rtp_duplicate_packets.load(Ordering::Relaxed)
+    }
+
+    pub fn raw_rtp_out_of_order_packets(&self) -> u64 {
+        self.raw_rtp_out_of_order_packets.load(Ordering::Relaxed)
+    }
+
+    pub fn raw_rtp_sequence_resets(&self) -> u64 {
+        self.raw_rtp_sequence_resets.load(Ordering::Relaxed)
+    }
+
+    pub fn raw_rtp_last_sequence(&self) -> Option<u64> {
+        self.raw_rtp_initialized
+            .load(Ordering::Relaxed)
+            .then(|| self.raw_rtp_last_sequence.load(Ordering::Relaxed))
+    }
+
+    pub fn raw_rtp_last_ssrc(&self) -> Option<u64> {
+        self.raw_rtp_initialized
+            .load(Ordering::Relaxed)
+            .then(|| self.raw_rtp_last_ssrc.load(Ordering::Relaxed))
+    }
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn parse_raw_rtp_header(data: &[u8]) -> Option<(u16, u32)> {
+    if data.len() < 12 || (data[0] & 0xc0) != 0x80 {
+        return None;
+    }
+
+    // RTCP packet types occupy the second byte in the 192..=223 range. RTP's
+    // marker bit can set the high bit, so values above 223 are still valid RTP.
+    if (192..=223).contains(&data[1]) {
+        return None;
+    }
+
+    let csrc_count = usize::from(data[0] & 0x0f);
+    if data.len() < 12 + csrc_count * 4 {
+        return None;
+    }
+
+    Some((
+        u16::from_be_bytes([data[2], data[3]]),
+        u32::from_be_bytes([data[8], data[9], data[10], data[11]]),
+    ))
+}
+
+fn update_max(value: &AtomicU64, candidate: u64) {
+    let mut current = value.load(Ordering::Relaxed);
+    while candidate > current {
+        match value.compare_exchange_weak(current, candidate, Ordering::Relaxed, Ordering::Relaxed)
+        {
+            Ok(_) => break,
+            Err(next) => current = next,
+        }
+    }
+}
+
+fn update_min(value: &AtomicU64, candidate: u64) {
+    let mut current = value.load(Ordering::Relaxed);
+    while candidate < current {
+        match value.compare_exchange_weak(current, candidate, Ordering::Relaxed, Ordering::Relaxed)
+        {
+            Ok(_) => break,
+            Err(next) => current = next,
+        }
     }
 }
 
@@ -324,6 +594,69 @@ mod tests {
     }
 
     #[test]
+    fn raw_recv_diagnostics_track_latest_and_extremes() {
+        let raw = RawRecvCounters::default();
+        assert_eq!(raw.min_channel_capacity(), None);
+
+        raw.record_recv_diagnostics(Some(Duration::from_millis(25)), 128);
+        raw.record_recv_diagnostics(Some(Duration::from_millis(10)), 64);
+        raw.record_enqueue_wait(Duration::from_millis(3));
+        raw.record_enqueue_wait(Duration::from_millis(12));
+        raw.record_dequeue_delay(Duration::from_millis(30));
+        raw.record_dequeue_delay(Duration::from_millis(5));
+        raw.record_channel_overflow();
+
+        assert_eq!(raw.recv_loop_gap_ms(), 10);
+        assert_eq!(raw.max_recv_loop_gap_ms(), 25);
+        assert_eq!(raw.enqueue_wait_ms(), 12);
+        assert_eq!(raw.max_enqueue_wait_ms(), 12);
+        assert_eq!(raw.dequeue_delay_ms(), 5);
+        assert_eq!(raw.max_dequeue_delay_ms(), 30);
+        assert_eq!(raw.channel_capacity(), 64);
+        assert_eq!(raw.min_channel_capacity(), Some(64));
+        assert_eq!(raw.channel_overflows(), 1);
+    }
+
+    #[test]
+    fn raw_recv_rtp_sequence_tracking_classifies_gaps_and_reordering() {
+        let raw = RawRecvCounters::default();
+        raw.record_raw_rtp_datagram(&stun_like_packet());
+        raw.record_raw_rtp_datagram(&rtcp_like_packet());
+
+        raw.record_raw_rtp_datagram(&rtp_packet(10, 0x0102_0304));
+        raw.record_raw_rtp_datagram(&rtp_packet(11, 0x0102_0304));
+        raw.record_raw_rtp_datagram(&rtp_packet(15, 0x0102_0304));
+        raw.record_raw_rtp_datagram(&rtp_packet(15, 0x0102_0304));
+        raw.record_raw_rtp_datagram(&rtp_packet(14, 0x0102_0304));
+        raw.record_raw_rtp_datagram(&rtp_packet(1, 0x0506_0708));
+
+        assert_eq!(raw.raw_rtp_packets(), 6);
+        assert_eq!(raw.raw_rtp_bytes(), 72);
+        assert_eq!(raw.raw_rtp_packets_lost(), 3);
+        assert_eq!(raw.raw_rtp_sequence_gaps(), 1);
+        assert_eq!(raw.raw_rtp_max_sequence_gap(), 3);
+        assert_eq!(raw.raw_rtp_duplicate_packets(), 1);
+        assert_eq!(raw.raw_rtp_out_of_order_packets(), 1);
+        assert_eq!(raw.raw_rtp_sequence_resets(), 1);
+        assert_eq!(raw.raw_rtp_last_sequence(), Some(1));
+        assert_eq!(raw.raw_rtp_last_ssrc(), Some(0x0506_0708));
+    }
+
+    #[test]
+    fn raw_recv_rtp_sequence_tracking_handles_rollover() {
+        let raw = RawRecvCounters::default();
+        raw.record_raw_rtp_datagram(&rtp_packet(u16::MAX - 1, 0x0102_0304));
+        raw.record_raw_rtp_datagram(&rtp_packet(u16::MAX, 0x0102_0304));
+        raw.record_raw_rtp_datagram(&rtp_packet(0, 0x0102_0304));
+        raw.record_raw_rtp_datagram(&rtp_packet(2, 0x0102_0304));
+
+        assert_eq!(raw.raw_rtp_packets(), 4);
+        assert_eq!(raw.raw_rtp_packets_lost(), 1);
+        assert_eq!(raw.raw_rtp_sequence_gaps(), 1);
+        assert_eq!(raw.raw_rtp_last_sequence(), Some(2));
+    }
+
+    #[test]
     fn raw_recv_counters_shared_across_arc_clones() {
         use std::sync::Arc;
         // The recv task holds one Arc clone and the session task another; both
@@ -356,5 +689,23 @@ mod tests {
         }
         assert_eq!(raw.packets(), 8000);
         assert_eq!(raw.bytes(), 80_000);
+    }
+
+    fn rtp_packet(seq: u16, ssrc: u32) -> Vec<u8> {
+        let mut packet = vec![0u8; 12];
+        packet[0] = 0x80;
+        packet[1] = 111;
+        packet[2..4].copy_from_slice(&seq.to_be_bytes());
+        packet[4..8].copy_from_slice(&1234u32.to_be_bytes());
+        packet[8..12].copy_from_slice(&ssrc.to_be_bytes());
+        packet
+    }
+
+    fn stun_like_packet() -> Vec<u8> {
+        vec![0x00, 0x01, 0x00, 0x00]
+    }
+
+    fn rtcp_like_packet() -> Vec<u8> {
+        vec![0x80, 200, 0x00, 0x06, 0, 0, 0, 1, 0, 0, 0, 2]
     }
 }

@@ -1,4 +1,5 @@
 use crate::control::protocol::{EndpointDirection, EndpointId};
+use std::time::Instant;
 
 /// Configuration for an endpoint
 #[derive(Debug, Clone)]
@@ -12,6 +13,9 @@ pub struct InboundPacket {
     pub endpoint_id: EndpointId,
     pub source: std::net::SocketAddr,
     pub data: Vec<u8>,
+    /// Monotonic instant when the producing task received or synthesized this
+    /// packet before enqueueing it into the session task.
+    pub recv_at: Instant,
     /// True when the packet arrived on the dedicated RTCP socket (not the RTP socket)
     pub is_rtcp: bool,
     /// The local socket address the datagram arrived on. Only set by dual-socket

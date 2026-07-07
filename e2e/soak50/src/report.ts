@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 
-import type { CallPlan, CallRuntime, Failure, ScenarioPlan, TimelineEvent } from "./types.js";
+import type { CallPlan, CallRuntime, Failure, LoadSample, ScenarioPlan, TimelineEvent } from "./types.js";
 import { appendJsonl, monotonicMs, nowIso, writeJson } from "./utils.js";
 
 export class RunReporter {
@@ -41,6 +41,10 @@ export class RunReporter {
     await appendJsonl(path.join(this.runDir, "rtp-peer-stats", `${callId}.jsonl`), sample);
   }
 
+  async appendLoadSample(sample: LoadSample): Promise<void> {
+    await appendJsonl(path.join(this.runDir, "load-stats", "system.jsonl"), sample);
+  }
+
   async writeSummary(params: {
     plan: ScenarioPlan;
     runtimes: CallRuntime[];
@@ -70,6 +74,8 @@ export class RunReporter {
       impairment_counts: impairmentCounts,
       long_calls: longCalls,
       failures: params.failures,
+      failure_classification_counts: countFailureClassifications(params.failures),
+      bridge_added_failure_counts: countBridgeAddedClassifications(params.failures),
       max_flatline_ms: params.maxFlatlineMs,
       calls: params.plan.calls.map((call) => summarizeCall(call, params.failures)),
       sessions: params.runtimes.map((runtime) => ({
@@ -102,4 +108,32 @@ function countBy<T>(items: T[], key: (item: T) => string): Record<string, number
     counts[value] = (counts[value] ?? 0) + 1;
   }
   return counts;
+}
+
+function countFailureClassifications(failures: Failure[]): Record<string, number> {
+  return countBy(failures, (failure) => {
+    const classification = failureClassification(failure);
+    return classification?.cause ?? "unclassified";
+  });
+}
+
+function countBridgeAddedClassifications(failures: Failure[]): Record<string, number> {
+  return countBy(failures, (failure) => {
+    const classification = failureClassification(failure);
+    if (!classification) {
+      return "unclassified";
+    }
+    return String(classification.bridge_added);
+  });
+}
+
+function failureClassification(failure: Failure): { cause?: string; bridge_added?: boolean | "unknown" } | undefined {
+  if (!failure.detail || typeof failure.detail !== "object") {
+    return undefined;
+  }
+  const detail = failure.detail as { classification?: unknown };
+  if (!detail.classification || typeof detail.classification !== "object") {
+    return undefined;
+  }
+  return detail.classification as { cause?: string; bridge_added?: boolean | "unknown" };
 }

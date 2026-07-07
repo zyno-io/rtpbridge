@@ -371,6 +371,13 @@ export class WebRtcPeer {
       let receivedBytes = 0;
       let selectedLocalCandidateType;
       let selectedRemoteCandidateType;
+      let inboundPacketsLost = 0;
+      let inboundJitterMs = 0;
+      let jitterBufferDelayMs = 0;
+      let jitterBufferEmittedCount = 0;
+      let concealedSamples = 0;
+      let concealmentEvents = 0;
+      let totalSamplesReceived = 0;
 
       const isAudioRtp = (stat) =>
         stat.kind === "audio" ||
@@ -383,6 +390,13 @@ export class WebRtcPeer {
         } else if (stat.type === "inbound-rtp" && isAudioRtp(stat) && !stat.isRemote) {
           receivedPackets += stat.packetsReceived || 0;
           receivedBytes += stat.bytesReceived || 0;
+          inboundPacketsLost += stat.packetsLost || 0;
+          inboundJitterMs = Math.max(inboundJitterMs, (stat.jitter || 0) * 1000);
+          jitterBufferDelayMs += (stat.jitterBufferDelay || 0) * 1000;
+          jitterBufferEmittedCount += stat.jitterBufferEmittedCount || 0;
+          concealedSamples += stat.concealedSamples || 0;
+          concealmentEvents += stat.concealmentEvents || 0;
+          totalSamplesReceived += stat.totalSamplesReceived || 0;
         }
       }
 
@@ -425,6 +439,15 @@ export class WebRtcPeer {
         })),
         selectedLocalCandidateType,
         selectedRemoteCandidateType,
+        webRtcQuality: {
+          inboundPacketsLost,
+          inboundJitterMs,
+          jitterBufferDelayMs,
+          jitterBufferEmittedCount,
+          concealedSamples,
+          concealmentEvents,
+          totalSamplesReceived
+        },
         impairment: peer.impairmentStats
           ? {
               active: !!(peer.impairment && peer.impairment.active),

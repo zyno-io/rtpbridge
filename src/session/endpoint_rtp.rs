@@ -274,24 +274,34 @@ impl RtpEndpoint {
         let raw_recv = Arc::clone(&self.raw_recv);
         self.recv_tasks.push(tokio::spawn(async move {
             let mut buf = vec![0u8; 4096];
+            let mut last_recv_at: Option<Instant> = None;
             let exit_reason;
             loop {
                 tokio::select! {
                     result = rtp_socket.recv_from(&mut buf) => {
                         match result {
                             Ok((n, source)) => {
+                                let recv_at = Instant::now();
+                                let recv_gap =
+                                    last_recv_at.map(|last| recv_at.saturating_duration_since(last));
+                                last_recv_at = Some(recv_at);
                                 // Wire-level count: every datagram on the RTP
                                 // socket, before parse/decrypt drops invalid or
                                 // non-RTP traffic.
                                 raw_recv.record(n);
+                                raw_recv.record_recv_diagnostics(recv_gap, tx.capacity());
                                 let packet = InboundPacket {
                                     endpoint_id,
                                     source,
                                     data: buf[..n].to_vec(),
+                                    recv_at,
                                     is_rtcp: false,
                                     local: None,
                                 };
-                                if tx.send(packet).await.is_err() {
+                                let enqueue_started = Instant::now();
+                                let send_result = tx.send(packet).await;
+                                raw_recv.record_enqueue_wait(enqueue_started.elapsed());
+                                if send_result.is_err() {
                                     exit_reason = "session channel closed";
                                     break;
                                 }
@@ -322,24 +332,34 @@ impl RtpEndpoint {
         let raw_recv = Arc::clone(&self.raw_recv);
         self.recv_tasks.push(tokio::spawn(async move {
             let mut buf = vec![0u8; 4096];
+            let mut last_recv_at: Option<Instant> = None;
             let exit_reason;
             loop {
                 tokio::select! {
                     result = rtcp_socket.recv_from(&mut buf) => {
                         match result {
                             Ok((n, source)) => {
+                                let recv_at = Instant::now();
+                                let recv_gap =
+                                    last_recv_at.map(|last| recv_at.saturating_duration_since(last));
+                                last_recv_at = Some(recv_at);
                                 // Count RTCP datagrams into the same wire-level
                                 // tally: for plain RTP these are the peer's
                                 // liveness keepalives during media silence.
                                 raw_recv.record(n);
+                                raw_recv.record_recv_diagnostics(recv_gap, packet_tx.capacity());
                                 let packet = InboundPacket {
                                     endpoint_id,
                                     source,
                                     data: buf[..n].to_vec(),
+                                    recv_at,
                                     is_rtcp: true,
                                     local: None,
                                 };
-                                if packet_tx.send(packet).await.is_err() {
+                                let enqueue_started = Instant::now();
+                                let send_result = packet_tx.send(packet).await;
+                                raw_recv.record_enqueue_wait(enqueue_started.elapsed());
+                                if send_result.is_err() {
                                     exit_reason = "session channel closed";
                                     break;
                                 }

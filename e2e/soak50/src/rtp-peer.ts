@@ -1,8 +1,8 @@
 import dgram from "node:dgram";
 import type { RemoteInfo, Socket } from "node:dgram";
 
-import type { MediaImpairmentPlan, PeerCounters } from "./types.js";
-import { sleep } from "./utils.js";
+import type { MediaImpairmentPlan, PeerCounters, RtpReceiveQuality } from "./types.js";
+import { monotonicMs, sleep } from "./utils.js";
 
 export interface RtpAddress {
   ip: string;
@@ -24,6 +24,20 @@ export class RtpPeer {
     receivedPackets: 0,
     sentBytes: 0,
     receivedBytes: 0,
+    rtpQuality: {
+      packets: 0,
+      expectedPackets: 0,
+      lostPackets: 0,
+      duplicatePackets: 0,
+      outOfOrderPackets: 0,
+      sequenceGaps: 0,
+      maxGapPackets: 0,
+      ssrcChanges: 0,
+      interarrivalSamples: 0,
+      meanInterarrivalMs: 0,
+      maxInterarrivalMs: 0,
+      jitterMs: 0,
+    },
     impairment: {
       active: false,
       supported: true,
@@ -35,6 +49,7 @@ export class RtpPeer {
   };
   private impairment?: ActiveImpairment;
   private rngState = 1;
+  private lastArrivalMs?: number;
 
   private constructor(
     readonly label: string,
@@ -94,6 +109,7 @@ export class RtpPeer {
       }
       this.counters.receivedPackets += 1;
       this.counters.receivedBytes += message.length;
+      this.observeInboundRtp(message, monotonicMs());
     });
   }
 
@@ -128,6 +144,7 @@ export class RtpPeer {
   snapshot(): PeerCounters {
     return {
       ...this.counters,
+      rtpQuality: this.counters.rtpQuality ? { ...this.counters.rtpQuality } : undefined,
       impairment: this.counters.impairment ? { ...this.counters.impairment } : undefined,
     };
   }
@@ -199,6 +216,88 @@ export class RtpPeer {
       await this.sendTonePacket();
       await sleep(20);
     }
+  }
+
+  private observeInboundRtp(packet: Buffer, arrivalMs: number): void {
+    const quality = this.counters.rtpQuality;
+    if (!quality) {
+      return;
+    }
+
+    const seq = packet.readUInt16BE(2);
+    const timestamp = packet.readUInt32BE(4);
+    const ssrc = packet.readUInt32BE(8);
+
+    quality.packets += 1;
+
+    if (quality.lastSsrc !== undefined && quality.lastSsrc !== ssrc) {
+      quality.ssrcChanges += 1;
+      this.resetInboundStreamQuality(quality, ssrc, seq, timestamp, arrivalMs);
+      return;
+    }
+
+    this.observeInboundTiming(quality, timestamp, arrivalMs);
+
+    let advanceSequence = true;
+    if (quality.lastSequence === undefined) {
+      quality.expectedPackets = 1;
+    } else {
+      const delta = rtpSequenceDelta(seq, quality.lastSequence);
+      if (delta === 0) {
+        quality.duplicatePackets += 1;
+        advanceSequence = false;
+      } else if (delta < 0x8000) {
+        quality.expectedPackets += delta;
+        if (delta > 1) {
+          const missing = delta - 1;
+          quality.lostPackets += missing;
+          quality.sequenceGaps += 1;
+          quality.maxGapPackets = Math.max(quality.maxGapPackets, missing);
+        }
+      } else {
+        quality.outOfOrderPackets += 1;
+        advanceSequence = false;
+      }
+    }
+
+    if (advanceSequence) {
+      quality.lastSequence = seq;
+    }
+    quality.lastTimestamp = timestamp;
+    quality.lastSsrc = ssrc;
+    this.lastArrivalMs = arrivalMs;
+  }
+
+  private observeInboundTiming(quality: RtpReceiveQuality, timestamp: number, arrivalMs: number): void {
+    if (this.lastArrivalMs === undefined || quality.lastTimestamp === undefined) {
+      return;
+    }
+
+    const arrivalDeltaMs = Math.max(0, arrivalMs - this.lastArrivalMs);
+    quality.interarrivalSamples += 1;
+    quality.meanInterarrivalMs +=
+      (arrivalDeltaMs - quality.meanInterarrivalMs) / quality.interarrivalSamples;
+    quality.maxInterarrivalMs = Math.max(quality.maxInterarrivalMs, arrivalDeltaMs);
+
+    const timestampDeltaMs = rtpTimestampDelta(timestamp, quality.lastTimestamp) / 8;
+    if (timestampDeltaMs >= 0 && timestampDeltaMs < 1000) {
+      const variationMs = Math.abs(arrivalDeltaMs - timestampDeltaMs);
+      quality.jitterMs += (variationMs - quality.jitterMs) / 16;
+    }
+  }
+
+  private resetInboundStreamQuality(
+    quality: RtpReceiveQuality,
+    ssrc: number,
+    seq: number,
+    timestamp: number,
+    arrivalMs: number,
+  ): void {
+    quality.expectedPackets += 1;
+    quality.lastSequence = seq;
+    quality.lastTimestamp = timestamp;
+    quality.lastSsrc = ssrc;
+    this.lastArrivalMs = arrivalMs;
   }
 
   private async sendTonePacket(): Promise<void> {
@@ -343,6 +442,14 @@ function buildRtpPacket(
   packet.writeUInt32BE(ssrc >>> 0, 8);
   payload.copy(packet, 12);
   return packet;
+}
+
+function rtpSequenceDelta(seq: number, previousSeq: number): number {
+  return (seq - previousSeq + 0x10000) & 0xffff;
+}
+
+function rtpTimestampDelta(timestamp: number, previousTimestamp: number): number {
+  return (timestamp - previousTimestamp) >>> 0;
 }
 
 function linearToUlaw(sample: number): number {

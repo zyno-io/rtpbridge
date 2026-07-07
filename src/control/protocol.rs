@@ -468,6 +468,11 @@ pub struct FaxDetectStopParams {
 pub struct StatsSubscribeParams {
     #[serde(default = "default_stats_interval")]
     pub interval_ms: u32,
+    /// Include receive-path diagnostics such as raw socket/RTP sequence counters
+    /// and session-channel delay/overflow fields. Defaults off to keep stats
+    /// events small for clients that poll every active session.
+    #[serde(default)]
+    pub include_diagnostics: bool,
 }
 
 fn default_stats_interval() -> u32 {
@@ -528,6 +533,61 @@ pub struct InboundStats {
     pub raw_packets: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_bytes: Option<u64>,
+    /// RTP-looking datagrams observed at WebRTC socket ingress before str0m
+    /// demux/decrypt. SRTP leaves RTP sequence/SSRC fields in the clear, so these
+    /// counters separate upstream/TURN/socket loss from post-str0m RTP event loss.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_rtp_packets: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_rtp_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_rtp_packets_lost: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_rtp_sequence_gaps: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_rtp_max_sequence_gap: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_rtp_duplicate_packets: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_rtp_out_of_order_packets: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_rtp_sequence_resets: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_rtp_last_sequence: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_rtp_last_ssrc: Option<u64>,
+    /// Latest and maximum gap between datagrams delivered by a socket recv
+    /// task. A large value during media indicates the endpoint socket reader
+    /// was not being scheduled or was otherwise unable to keep pulling from the
+    /// OS socket.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recv_loop_gap_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_recv_loop_gap_ms: Option<u64>,
+    /// Latest and maximum time a recv task spent waiting to enqueue into the
+    /// session packet channel. Non-zero values on plain RTP are direct
+    /// backpressure evidence; WebRTC uses non-blocking enqueue, so this remains
+    /// zero and `channel_overflows` carries the drop signal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enqueue_wait_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_enqueue_wait_ms: Option<u64>,
+    /// Latest and maximum time an inbound packet sat in the session packet
+    /// channel before the media session task dequeued it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dequeue_delay_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_dequeue_delay_ms: Option<u64>,
+    /// Current and minimum observed remaining capacity in the session packet
+    /// channel when socket recv tasks tried to enqueue.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel_capacity: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_channel_capacity: Option<u64>,
+    /// Endpoint-local count of packets dropped by a non-blocking recv task
+    /// because the session packet channel was full.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel_overflows: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -959,6 +1019,26 @@ mod tests {
         assert_eq!(params.duration_ms, 320);
         assert_eq!(params.volume, 5);
         assert_eq!(params.digit, "#");
+    }
+
+    // ── StatsSubscribeParams defaults ─────────────────────────────────────
+
+    #[test]
+    fn stats_subscribe_params_default_to_compact_payload() {
+        let params: StatsSubscribeParams = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(params.interval_ms, 5000);
+        assert!(!params.include_diagnostics);
+    }
+
+    #[test]
+    fn stats_subscribe_params_can_include_diagnostics() {
+        let params: StatsSubscribeParams = serde_json::from_value(json!({
+            "interval_ms": 1000,
+            "include_diagnostics": true
+        }))
+        .unwrap();
+        assert_eq!(params.interval_ms, 1000);
+        assert!(params.include_diagnostics);
     }
 
     // ── VadStartParams defaults ─────────────────────────────────────────

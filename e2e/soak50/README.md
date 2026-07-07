@@ -64,7 +64,8 @@ npm run soak -- \
   --media-ip 127.0.0.1 \
   --turn-url "$TURN_URL" \
   --turn-user "$TURN_USER" \
-  --turn-pass "$TURN_PASS"
+  --turn-pass "$TURN_PASS" \
+  --load-pids "$(pgrep -x turnserver | paste -sd, -)"
 ```
 
 ## Full 50-Call Soak
@@ -81,7 +82,8 @@ npm run soak -- \
   --media-ip 127.0.0.1 \
   --turn-url "$TURN_URL" \
   --turn-user "$TURN_USER" \
-  --turn-pass "$TURN_PASS"
+  --turn-pass "$TURN_PASS" \
+  --load-pids "$(pgrep -x turnserver | paste -sd, -)"
 ```
 
 The default full run uses 2 to 15 minute call durations. Eight calls run longer
@@ -118,6 +120,9 @@ The runner fails when:
 
 - a control request unexpectedly fails;
 - any active media direction flatlines beyond the allowed grace window;
+- clean, non-grace media windows exceed RTP/WebRTC quality thresholds:
+  RTP sequence gaps/loss, reordering, duplicates, high inter-arrival gaps,
+  RTP jitter, WebRTC inbound loss, WebRTC jitter, or concealed audio samples;
 - a WebRTC relay peer selects a non-relay local candidate;
 - browser WebRTC enters `failed` or `closed` while active;
 - rtpbridge emits `endpoint.media_timeout` or `events.dropped`;
@@ -125,8 +130,26 @@ The runner fails when:
 
 Grace windows are applied around ICE restarts, RTP re-INVITEs, endpoint transfer
 parking, endpoint replacement, and hold music insertion/removal. Deliberate
-media impairments do not extend grace; packets must continue increasing while
-loss and jitter are active.
+media impairments do not extend grace for packet-continuity checks; packets must
+continue increasing while loss and jitter are active. Quality thresholds are
+suppressed while a scheduled impairment is active, plus a short cooldown, so
+expected injected degradation is captured in artifacts without failing the run as
+bridge-caused clean-path degradation.
+
+Quality failures include `detail.classification`, with `cause`, `path`,
+`bridge_added`, and short evidence strings. Inbound bridge sequence loss/jitter
+is classified as `bridge_rx_backpressure`, `bridge_session_dequeue_delay`, or
+`bridge_rx_loop_gap` when bridge receive diagnostics show the socket reader or
+session packet channel was late. For WebRTC ingress loss, raw SRTP/RTP header
+sequence counters split pre-bridge browser/TURN/socket loss from
+`bridge_webrtc_ingress_processing_loss`, where raw RTP ingress stayed continuous
+but post-str0m RTP event stats reported loss. Receiver-side loss is classified
+as upstream when source endpoint ingress loss rose in the same sample, as
+`bridge_added_egress_loss` when bridge outbound packet counters fall behind the
+receiver's expected sequence range, and otherwise as downstream
+peer/browser/TURN receive-path loss. Timing gaps are marked
+`bridge_added: "unknown"` unless packet counters prove an egress deficit,
+because the black-box stats do not include per-packet bridge send timestamps.
 
 ## Artifacts
 
@@ -143,11 +166,24 @@ artifacts/<timestamp>-seed-<seed>/
   sdp/
   browser-stats/
   bridge-stats/
+  load-stats/
   rtp-peer-stats/
 ```
 
 `summary.json` contains the final verdict and per-call status. `timeline.jsonl`
 contains structured lifecycle and mutation events.
+`bridge-stats/*.jsonl` includes the bridge's inbound loss/jitter view and peer
+snapshots. The runner subscribes with `include_diagnostics: true`, so these
+samples also include raw socket receive counters, WebRTC raw RTP sequence
+counters, recv-loop gaps, enqueue waits, session dequeue delays, and channel
+capacity/overflow diagnostics.
+`rtp-peer-stats/*.jsonl` includes receive-side RTP sequence, loss, duplicate,
+reorder, jitter, and inter-arrival measurements.
+`browser-stats/*.jsonl` includes browser WebRTC inbound loss, jitter,
+jitter-buffer, and concealed-sample measurements.
+`load-stats/system.jsonl` samples OS load plus rtpbridge, the soak runner,
+Chromium child processes, and any comma-separated process IDs passed with
+`--load-pids` such as local coturn.
 
 ## Notes
 

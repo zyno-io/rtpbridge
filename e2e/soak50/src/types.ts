@@ -82,6 +82,8 @@ export interface RunnerOptions {
   rtpPortStart: number;
   rtpPortEnd: number;
   sampleIntervalMs: number;
+  loadSampleIntervalMs: number;
+  loadPids: number[];
   startSpreadMs: number;
   webRtcImpairments: number;
   rtpImpairments: number;
@@ -118,8 +120,30 @@ export interface EndpointStats {
   inbound?: {
     packets?: number;
     bytes?: number;
+    packets_lost?: number;
+    jitter_ms?: number;
+    last_received_ms_ago?: number;
     raw_packets?: number;
     raw_bytes?: number;
+    raw_rtp_packets?: number;
+    raw_rtp_bytes?: number;
+    raw_rtp_packets_lost?: number;
+    raw_rtp_sequence_gaps?: number;
+    raw_rtp_max_sequence_gap?: number;
+    raw_rtp_duplicate_packets?: number;
+    raw_rtp_out_of_order_packets?: number;
+    raw_rtp_sequence_resets?: number;
+    raw_rtp_last_sequence?: number;
+    raw_rtp_last_ssrc?: number;
+    recv_loop_gap_ms?: number;
+    max_recv_loop_gap_ms?: number;
+    enqueue_wait_ms?: number;
+    max_enqueue_wait_ms?: number;
+    dequeue_delay_ms?: number;
+    max_dequeue_delay_ms?: number;
+    channel_capacity?: number;
+    min_channel_capacity?: number;
+    channel_overflows?: number;
   };
   outbound?: {
     packets?: number;
@@ -137,11 +161,40 @@ export interface StatsEvent {
   };
 }
 
+export interface RtpReceiveQuality {
+  packets: number;
+  expectedPackets: number;
+  lostPackets: number;
+  duplicatePackets: number;
+  outOfOrderPackets: number;
+  sequenceGaps: number;
+  maxGapPackets: number;
+  ssrcChanges: number;
+  interarrivalSamples: number;
+  meanInterarrivalMs: number;
+  maxInterarrivalMs: number;
+  jitterMs: number;
+  lastSequence?: number;
+  lastTimestamp?: number;
+  lastSsrc?: number;
+}
+
+export interface WebRtcReceiveQuality {
+  inboundPacketsLost: number;
+  inboundJitterMs: number;
+  jitterBufferDelayMs: number;
+  jitterBufferEmittedCount: number;
+  concealedSamples: number;
+  concealmentEvents: number;
+  totalSamplesReceived: number;
+}
+
 export interface PeerCounters {
   sentPackets: number;
   receivedPackets: number;
   sentBytes: number;
   receivedBytes: number;
+  rtpQuality?: RtpReceiveQuality;
   impairment?: {
     active: boolean;
     id?: string;
@@ -160,6 +213,7 @@ export interface WebRtcCounters extends PeerCounters {
   trackStates?: Array<{ readyState: string; enabled: boolean; muted: boolean }>;
   selectedLocalCandidateType?: string;
   selectedRemoteCandidateType?: string;
+  webRtcQuality?: WebRtcReceiveQuality;
 }
 
 export interface TimelineEvent {
@@ -175,4 +229,35 @@ export interface Failure {
   callId?: string;
   reason: string;
   detail?: unknown;
+}
+
+export interface LoadProcessSample {
+  label: string;
+  pid: number;
+  ppid: number;
+  cpu_pct: number;
+  mem_pct: number;
+  rss_kb: number;
+  vsz_kb: number;
+  state: string;
+  command: string;
+}
+
+export interface LoadProcessGroupSample {
+  label: string;
+  process_count: number;
+  cpu_pct: number;
+  rss_kb: number;
+}
+
+export interface LoadSample {
+  ts: string;
+  mono_ms: number;
+  loadavg: number[];
+  cpu_count: number;
+  total_mem_bytes: number;
+  free_mem_bytes: number;
+  process_count: number;
+  process_groups: LoadProcessGroupSample[];
+  processes: LoadProcessSample[];
 }

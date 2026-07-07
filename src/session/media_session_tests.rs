@@ -29,6 +29,7 @@ fn test_session_state() -> SessionState {
         recording_mgr: RecordingManager::new(),
         vad_monitors: HashMap::new(),
         stats_interval: None,
+        stats_include_diagnostics: false,
         last_stats_emit: Instant::now(),
         file_rtp_states: HashMap::new(),
         tone_rtp_states: HashMap::new(),
@@ -169,6 +170,238 @@ fn synth_grid_repaces_bursty_ws_inbound_from_pcap() {
     assert!(
         zero_pairs < small / 50,
         "egress is emitting catch-up bursts ({zero_pairs} sub-ms gaps) instead of pacing"
+    );
+}
+
+#[derive(Clone)]
+struct Str0mDatagram {
+    source: std::net::SocketAddr,
+    destination: std::net::SocketAddr,
+    data: Vec<u8>,
+}
+
+fn poll_str0m_until_timeout(
+    rtc: &mut str0m::Rtc,
+    now: Instant,
+    transmits: &mut Vec<Str0mDatagram>,
+    connected: &mut bool,
+) -> Vec<u16> {
+    let mut rtp_sequences = Vec::new();
+    loop {
+        match rtc.poll_output() {
+            Ok(str0m::Output::Transmit(t)) => transmits.push(Str0mDatagram {
+                source: t.source,
+                destination: t.destination,
+                data: t.contents.to_vec(),
+            }),
+            Ok(str0m::Output::Event(event)) => match event {
+                str0m::Event::Connected
+                | str0m::Event::IceConnectionStateChange(
+                    str0m::IceConnectionState::Connected | str0m::IceConnectionState::Completed,
+                ) => {
+                    *connected = true;
+                }
+                str0m::Event::RtpPacket(pkt) => {
+                    rtp_sequences.push(pkt.header.sequence_number);
+                }
+                _ => {}
+            },
+            Ok(str0m::Output::Timeout(_)) => {
+                let _ = rtc.handle_input(str0m::Input::Timeout(now));
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+    rtp_sequences
+}
+
+fn deliver_str0m_datagrams(
+    rtc: &mut str0m::Rtc,
+    datagrams: impl IntoIterator<Item = Str0mDatagram>,
+    now: Instant,
+) {
+    for datagram in datagrams {
+        if let Ok(receive) = str0m::net::Receive::new(
+            str0m::net::Protocol::Udp,
+            datagram.source,
+            datagram.destination,
+            &datagram.data,
+        ) {
+            let _ = rtc.handle_input(str0m::Input::Receive(now, receive));
+        }
+    }
+}
+
+fn write_str0m_opus_packet(rtc: &mut str0m::Rtc, mid: str0m::media::Mid, seq: u64, now: Instant) {
+    let mut api = rtc.direct_api();
+    let stream = api
+        .stream_tx_by_mid(mid, None)
+        .expect("TX stream must exist for sendrecv audio");
+    stream.write_rtp(
+        str0m::rtp::RtpWrite::new(
+            111.into(),
+            seq.into(),
+            (seq as u32) * 960,
+            now,
+            vec![0x80u8; 160],
+        )
+        .marker(seq == 0),
+    );
+}
+
+fn wire_rtp_sequence(data: &[u8]) -> Option<u16> {
+    if data.len() < 12 || data[0] >> 6 != 2 {
+        return None;
+    }
+    let pt = data[1] & 0x7f;
+    if (64..=95).contains(&pt) {
+        return None;
+    }
+    Some(u16::from_be_bytes([data[2], data[3]]))
+}
+
+fn poll_until_rtp_datagrams(
+    rtc: &mut str0m::Rtc,
+    start: Instant,
+    transmits: &mut Vec<Str0mDatagram>,
+    connected: &mut bool,
+    target_rtp_count: usize,
+) {
+    for tick in 0..250 {
+        let now = start + Duration::from_millis(tick * 10);
+        let _ = poll_str0m_until_timeout(rtc, now, transmits, connected);
+        if transmits
+            .iter()
+            .filter(|datagram| wire_rtp_sequence(&datagram.data).is_some())
+            .count()
+            >= target_rtp_count
+        {
+            return;
+        }
+    }
+}
+
+/// Contract test for the WebRTC ingress bug fixed in the session loop.
+///
+/// str0m 0.21 RTP mode stores one pending RTP packet for the next
+/// `poll_output()` instead of queueing all packets received since the prior
+/// poll. If the bridge feeds two inbound RTP datagrams before polling, only
+/// the newest packet is emitted. The media session therefore must drain
+/// `poll_output()` immediately after each WebRTC `handle_receive()`.
+#[test]
+fn str0m_rtp_mode_requires_poll_after_each_inbound_rtp_packet() {
+    use str0m::change::{SdpAnswer, SdpOffer};
+    use str0m::media::{Direction, MediaKind};
+    use str0m::{Candidate, RtcConfig};
+
+    let server_addr: std::net::SocketAddr = "127.0.0.1:40100".parse().unwrap();
+    let client_addr: std::net::SocketAddr = "127.0.0.1:40101".parse().unwrap();
+
+    let mut server = RtcConfig::new()
+        .set_ice_lite(true)
+        .set_rtp_mode(true)
+        .build(Instant::now());
+    server.add_local_candidate(Candidate::host(server_addr, "udp").unwrap());
+
+    let mut api = server.sdp_api();
+    let mid = api.add_media(MediaKind::Audio, Direction::SendRecv, None, None, None);
+    let (offer, pending) = api.apply().unwrap();
+
+    let mut client = RtcConfig::new().set_rtp_mode(true).build(Instant::now());
+    client.add_local_candidate(Candidate::host(client_addr, "udp").unwrap());
+
+    let answer = client
+        .sdp_api()
+        .accept_offer(SdpOffer::from_sdp_string(&offer.to_sdp_string()).unwrap())
+        .unwrap();
+    server
+        .sdp_api()
+        .accept_answer(
+            pending,
+            SdpAnswer::from_sdp_string(&answer.to_sdp_string()).unwrap(),
+        )
+        .unwrap();
+
+    let start = Instant::now();
+    let mut s2c = Vec::new();
+    let mut c2s = Vec::new();
+    let mut connected = false;
+
+    for tick in 0..250 {
+        let now = start + Duration::from_millis(tick * 10);
+        let _ = poll_str0m_until_timeout(&mut server, now, &mut s2c, &mut connected);
+        let _ = poll_str0m_until_timeout(&mut client, now, &mut c2s, &mut connected);
+        deliver_str0m_datagrams(&mut client, s2c.drain(..).collect::<Vec<_>>(), now);
+        deliver_str0m_datagrams(&mut server, c2s.drain(..).collect::<Vec<_>>(), now);
+        if connected && tick > 120 {
+            break;
+        }
+    }
+    assert!(connected, "ICE/DTLS should connect before RTP write");
+
+    let now = start + Duration::from_secs(4);
+    let mut batch = Vec::new();
+    let mut ignored_connected = connected;
+    for seq in 10..15 {
+        write_str0m_opus_packet(&mut server, mid, seq, now);
+    }
+    poll_until_rtp_datagrams(&mut server, now, &mut batch, &mut ignored_connected, 2);
+    let batch_rtp_sequences: Vec<u16> = batch
+        .iter()
+        .filter_map(|datagram| wire_rtp_sequence(&datagram.data))
+        .collect();
+    assert!(
+        batch_rtp_sequences.len() >= 2,
+        "sender should have emitted multiple RTP datagrams, got {batch_rtp_sequences:?}"
+    );
+    let expected_latest = *batch_rtp_sequences.last().unwrap();
+
+    deliver_str0m_datagrams(&mut client, batch.clone(), now + Duration::from_millis(20));
+    let received_without_drain = poll_str0m_until_timeout(
+        &mut client,
+        now + Duration::from_millis(20),
+        &mut c2s,
+        &mut ignored_connected,
+    );
+    assert_eq!(
+        received_without_drain,
+        vec![expected_latest],
+        "without an intervening poll, str0m RTP mode emits only the latest packet"
+    );
+
+    let mut received_with_drain = Vec::new();
+    for seq in [20_u64, 21] {
+        let packet_time = now + Duration::from_millis(seq);
+        let mut one_packet = Vec::new();
+        write_str0m_opus_packet(&mut server, mid, seq, packet_time);
+        poll_until_rtp_datagrams(
+            &mut server,
+            packet_time,
+            &mut one_packet,
+            &mut ignored_connected,
+            1,
+        );
+        assert!(
+            one_packet
+                .iter()
+                .any(|datagram| wire_rtp_sequence(&datagram.data) == Some(seq as u16)),
+            "sender should have emitted RTP seq {seq}"
+        );
+        for datagram in one_packet {
+            deliver_str0m_datagrams(&mut client, [datagram], packet_time);
+            received_with_drain.extend(poll_str0m_until_timeout(
+                &mut client,
+                packet_time,
+                &mut c2s,
+                &mut ignored_connected,
+            ));
+        }
+    }
+    assert_eq!(
+        received_with_drain,
+        vec![20, 21],
+        "polling after each inbound RTP datagram preserves every packet"
     );
 }
 
@@ -533,12 +766,14 @@ async fn test_handle_command_stats_subscribe_unsubscribe() {
             SessionCommand::StatsSubscribe {
                 reply: reply_tx,
                 interval_ms: 5000,
+                include_diagnostics: false,
             },
             &packet_tx,
         )
         .await;
     assert!(reply_rx.await.unwrap().is_ok());
     assert_eq!(state.stats_interval, Some(Duration::from_millis(5000)));
+    assert!(!state.stats_include_diagnostics);
 
     let (reply_tx, reply_rx) = oneshot::channel();
     state
@@ -549,6 +784,7 @@ async fn test_handle_command_stats_subscribe_unsubscribe() {
         .await;
     assert!(reply_rx.await.unwrap().is_ok());
     assert!(state.stats_interval.is_none());
+    assert!(!state.stats_include_diagnostics);
 }
 
 #[tokio::test]
@@ -563,6 +799,7 @@ async fn test_stats_resubscribe_preserves_emit_anchor() {
             SessionCommand::StatsSubscribe {
                 reply: reply_tx,
                 interval_ms: 5000,
+                include_diagnostics: false,
             },
             &packet_tx,
         )
@@ -582,12 +819,14 @@ async fn test_stats_resubscribe_preserves_emit_anchor() {
             SessionCommand::StatsSubscribe {
                 reply: reply_tx,
                 interval_ms: 10000,
+                include_diagnostics: true,
             },
             &packet_tx,
         )
         .await;
     assert!(reply_rx.await.unwrap().is_ok());
     assert_eq!(state.stats_interval, Some(Duration::from_millis(10000)));
+    assert!(state.stats_include_diagnostics);
     assert_eq!(
         state.last_stats_emit, anchor,
         "re-subscribe must not re-anchor the emit timeline"
@@ -941,6 +1180,7 @@ async fn test_inbound_rtcp_classified_by_is_rtcp_flag() {
         endpoint_id: eid,
         source: "10.0.0.1:20001".parse().unwrap(),
         data: rtcp_data,
+        recv_at: Instant::now(),
         is_rtcp: true,
         local: None,
     };
@@ -991,6 +1231,7 @@ async fn test_inbound_rtp_not_misclassified() {
         endpoint_id: eid,
         source: "10.0.0.1:20000".parse().unwrap(),
         data: rtp_data,
+        recv_at: Instant::now(),
         is_rtcp: false,
         local: None,
     };

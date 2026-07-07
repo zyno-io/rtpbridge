@@ -1,4 +1,5 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::time::Instant;
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
@@ -285,6 +286,7 @@ async fn ws_io_task(
                             endpoint_id,
                             source: null_addr,
                             data: payload,
+                            recv_at: Instant::now(),
                             is_rtcp: false,
                             local: None,
                         };

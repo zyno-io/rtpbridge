@@ -92,19 +92,34 @@ Wireshark will automatically dissect RTP/RTCP protocols. Endpoints are assigned 
 
 ### Use stats for live diagnosis
 
-Subscribe to per-endpoint statistics over the WebSocket:
+Subscribe to per-endpoint statistics over the WebSocket. For normal polling, use
+the default compact payload. For receive-path diagnosis, opt into diagnostics:
 
 ```json
 {"id":"1","method":"stats.subscribe","params":{"interval_ms":1000}}
+```
+
+```json
+{"id":"2","method":"stats.subscribe","params":{"interval_ms":1000,"include_diagnostics":true}}
 ```
 
 Key fields to watch:
 - `inbound.packets` / `outbound.packets` — Are packets flowing?
 - `inbound.raw_packets` — Are socket-level datagrams arriving? If raw packets
   keep rising while `inbound.packets` is flat, the path is alive but no media is
-  being decoded. If both are flat, the remote path is likely dead.
-- `inbound.packets_lost` — Network-level loss
+  being decoded. If both are flat, the remote path is likely dead. Present only
+  with `include_diagnostics: true`.
+- `inbound.raw_rtp_packets_lost` / `inbound.raw_rtp_sequence_gaps` — RTP sequence
+  loss before bridge media processing. For WebRTC, this separates browser/TURN
+  or network loss from loss added after socket ingress. Present only with
+  `include_diagnostics: true`.
+- `inbound.packets_lost` — Media-plane loss after endpoint processing. If this
+  rises while raw RTP sequence counters stay clean, investigate bridge-side
+  WebRTC/RTP processing.
 - `inbound.jitter_ms` — Network jitter
+- `inbound.recv_loop_gap_ms`, `inbound.dequeue_delay_ms`, and
+  `inbound.channel_overflows` — Receive-loop stalls or session-channel
+  backpressure. Present only with `include_diagnostics: true`.
 - `inbound.last_received_ms_ago` — Time since last packet (high values indicate stalled media)
 - `rtt_ms` — Round-trip time from RTCP for plain RTP/SRTP endpoints
 

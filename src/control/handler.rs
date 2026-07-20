@@ -181,6 +181,7 @@ pub async fn handle_request(
         "endpoint.remove" => handle_endpoint_remove(id, req.params, state).await,
 
         "endpoint.dtmf.inject" => handle_dtmf_inject(id, req.params, state).await,
+        "endpoint.dtmf.set_sensitive" => handle_dtmf_set_sensitive(id, req.params, state).await,
 
         "recording.start" => handle_recording_start(id, req.params, state, manager).await,
         "recording.stop" => handle_recording_stop(id, req.params, state).await,
@@ -779,6 +780,40 @@ async fn handle_dtmf_inject(
             digit,
             duration_ms: params.duration_ms,
             volume: params.volume,
+        },
+        reply_rx,
+        &id,
+    )
+    .await
+    {
+        Ok(Ok(())) => Response::ok(id, serde_json::json!({})),
+        Ok(Err(e)) => Response::err(id, "ENDPOINT_ERROR", e.to_string()),
+        Err(resp) => resp,
+    }
+}
+
+async fn handle_dtmf_set_sensitive(
+    id: String,
+    params: serde_json::Value,
+    state: &mut ConnectionState,
+) -> Response {
+    let cmd_tx = match state.require_session(&id) {
+        Ok(tx) => tx.clone(),
+        Err(resp) => return resp,
+    };
+
+    let params: DtmfSetSensitiveParams = match serde_json::from_value(params) {
+        Ok(p) => p,
+        Err(e) => return Response::err(id, "INVALID_PARAMS", e.to_string()),
+    };
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    match send_and_recv(
+        &cmd_tx,
+        SessionCommand::DtmfSetSensitive {
+            reply: reply_tx,
+            endpoint_id: params.endpoint_id,
+            enabled: params.enabled,
         },
         reply_rx,
         &id,

@@ -321,6 +321,7 @@ const INFO_REPLY_METHODS: &[&str] = &[
     "endpoint.ice_restart",
     "endpoint.transfer",
     "endpoint.remove",
+    "endpoint.dtmf.set_sensitive",
     "endpoint.srtp_rekey",
     "endpoint.rtp.srtp_rekey",
 ];

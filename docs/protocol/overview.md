@@ -139,6 +139,7 @@ Most methods that require a session can return `NO_SESSION` (no session bound), 
 | `endpoint.remove` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
 | `endpoint.transfer` | `INVALID_PARAMS`, `SESSION_NOT_FOUND`, `ENDPOINT_ERROR`, `TRANSFER_FAILED` |
 | `endpoint.dtmf.inject` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
+| `endpoint.dtmf.set_sensitive` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
 | `endpoint.create_with_file` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
 | `endpoint.create_tone` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |
 | `endpoint.create_websocket` | `INVALID_PARAMS`, `ENDPOINT_ERROR` |

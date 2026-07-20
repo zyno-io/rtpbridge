@@ -113,6 +113,7 @@ All communication uses JSON over WebSocket. Each connection is bound to exactly 
 | `endpoint.file.pause` | Pause file playback |
 | `endpoint.file.resume` | Resume file playback |
 | `endpoint.dtmf.inject` | Inject DTMF digit into endpoint |
+| `endpoint.dtmf.set_sensitive` | Redact DTMF logs, tag control events, and omit DTMF packets from recordings for an endpoint |
 | `endpoint.srtp_rekey` | Initiate SRTP rekey (plain RTP/SRTP only) |
 | `endpoint.transfer` | Transfer an endpoint to a different session |
 | `session.bridge` | Bidirectional audio bridge between two sessions |

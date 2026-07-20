@@ -162,11 +162,31 @@ async fn test_dtmf_event_delivery() {
     let mut client = TestControlClient::connect(&server.addr).await;
 
     let (ep_id, mut peer) = setup_rtp_session(&mut client).await;
+    let pcap_path = std::path::Path::new(&server.recording_dir).join("sensitive-dtmf.pcap");
+    let recording = client
+        .request_ok(
+            "recording.start",
+            json!({"file_path": pcap_path.to_str().unwrap()}),
+        )
+        .await;
+    let recording_id = recording["recording_id"].as_str().unwrap();
 
     // Subscribe to stats (to ensure event_tx is wired up)
     client
         .request_ok("stats.subscribe", json!({"interval_ms": 5000}))
         .await;
+    client
+        .request_ok(
+            "endpoint.dtmf.set_sensitive",
+            json!({"endpoint_id": ep_id, "enabled": true}),
+        )
+        .await;
+
+    // Audio remains recordable while only sensitive DTMF packets are suspended.
+    for _ in 0..3 {
+        peer.send_pcmu(&[0x80; 160]).await;
+        tokio::time::sleep(timing::PACING).await;
+    }
 
     // Send DTMF digit '5' as RFC 4733 telephone-event packets
     // Multiple packets with same timestamp, end bit on last
@@ -199,11 +219,78 @@ async fn test_dtmf_event_delivery() {
                     "5",
                     "DTMF digit should be '5': {event}"
                 );
+                assert_eq!(
+                    event["data"]["sensitive"].as_bool(),
+                    Some(true),
+                    "sensitive DTMF event must be tagged for the trusted controller: {event}"
+                );
                 break;
             }
         }
     }
     assert!(got_dtmf, "should have received a DTMF event");
+
+    client
+        .request_ok(
+            "endpoint.dtmf.set_sensitive",
+            json!({"endpoint_id": ep_id, "enabled": false}),
+        )
+        .await;
+
+    // Normal DTMF recording resumes after the sensitive window.
+    for i in 0..5 {
+        peer.send_dtmf_event(6, i == 4, (i + 1) * 160).await;
+        tokio::time::sleep(timing::PACING).await;
+    }
+    for _ in 0..2 {
+        peer.send_dtmf_event(6, true, 5 * 160).await;
+        tokio::time::sleep(timing::PACING).await;
+    }
+    tokio::time::sleep(timing::scaled_ms(100)).await;
+
+    client
+        .request_ok("recording.stop", json!({"recording_id": recording_id}))
+        .await;
+    tokio::time::sleep(timing::scaled_ms(100)).await;
+
+    let file = std::fs::File::open(&pcap_path).expect("sensitive DTMF PCAP should exist");
+    let mut reader = pcap_file::pcap::PcapReader::new(file).expect("valid sensitive DTMF PCAP");
+    let udp_payload_offset = 14 + 20 + 8;
+    let mut recorded_audio = false;
+    let mut recorded_normal_dtmf = false;
+    let mut recorded_sensitive_dtmf = false;
+    while let Some(packet) = reader.next_packet() {
+        let packet = packet.expect("valid PCAP packet");
+        if packet.data.len() <= udp_payload_offset + 12 {
+            continue;
+        }
+        let rtp = &packet.data[udp_payload_offset..];
+        if rtp[0] >> 6 != 2 {
+            continue;
+        }
+        let payload_type = rtp[1] & 0x7f;
+        if payload_type == 0 {
+            recorded_audio = true;
+        } else if payload_type == 101 {
+            match rtp[12] {
+                5 => recorded_sensitive_dtmf = true,
+                6 => recorded_normal_dtmf = true,
+                _ => {}
+            }
+        }
+    }
+    assert!(
+        recorded_audio,
+        "audio recording must continue during the call"
+    );
+    assert!(
+        recorded_normal_dtmf,
+        "normal DTMF recording must resume after the sensitive window"
+    );
+    assert!(
+        !recorded_sensitive_dtmf,
+        "sensitive DTMF packets must be omitted from the PCAP"
+    );
 
     client.request_ok("session.destroy", json!({})).await;
 }

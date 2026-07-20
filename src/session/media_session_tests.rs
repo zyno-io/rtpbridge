@@ -25,6 +25,7 @@ fn test_session_state() -> SessionState {
         dropped_events: Arc::new(AtomicU64::new(0)),
         endpoints: HashMap::new(),
         dtmf_state: HashMap::new(),
+        sensitive_dtmf_endpoints: HashSet::new(),
         routing: RoutingTable::new(),
         recording_mgr: RecordingManager::new(),
         vad_monitors: HashMap::new(),
@@ -1112,6 +1113,55 @@ fn test_dtmf_inject_file_endpoint_rejected() {
     let result = state.handle_dtmf_inject(&eid, '5', 200, 10);
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("file endpoint"));
+}
+
+#[test]
+fn test_sensitive_dtmf_mode_requires_an_existing_endpoint() {
+    let mut state = test_session_state();
+    let result = state.handle_dtmf_set_sensitive(EndpointId::new_v4(), true);
+    assert!(result.is_err());
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("Endpoint not found")
+    );
+}
+
+#[test]
+fn test_sensitive_dtmf_packets_are_omitted_from_recordings_only_while_enabled() {
+    let endpoint_id = EndpointId::new_v4();
+    let packet = RoutedRtpPacket {
+        source_endpoint_id: endpoint_id,
+        payload_type: 101,
+        sequence_number: 1,
+        timestamp: 2,
+        ssrc: 3,
+        marker: true,
+        payload: vec![1, 2, 3, 4],
+    };
+    let dtmf_state = HashMap::from([(
+        endpoint_id,
+        EndpointDtmf {
+            detector: DtmfDetector::new(),
+            te_pt: Some(101),
+        },
+    )]);
+    let mut sensitive = HashSet::new();
+
+    assert!(should_record_inbound(&packet, &dtmf_state, &sensitive));
+    sensitive.insert(endpoint_id);
+    assert!(!should_record_inbound(&packet, &dtmf_state, &sensitive));
+
+    let audio_packet = RoutedRtpPacket {
+        payload_type: 0,
+        ..packet
+    };
+    assert!(should_record_inbound(
+        &audio_packet,
+        &dtmf_state,
+        &sensitive
+    ));
 }
 
 // ── URL file-cache cleanup on destroy ───────────────────────────

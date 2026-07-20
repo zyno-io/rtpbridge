@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 
@@ -113,9 +113,11 @@ pub async fn drain_dtmf_injection(
 }
 
 /// Detect DTMF events and forward DTMF packets to destinations.
+#[allow(clippy::too_many_arguments)]
 pub async fn process_dtmf_packets(
     dtmf_packets: &[RoutedRtpPacket],
     dtmf_state: &mut HashMap<EndpointId, EndpointDtmf>,
+    sensitive_dtmf_endpoints: &HashSet<EndpointId>,
     routing: &RoutingTable,
     endpoints: &mut HashMap<EndpointId, Endpoint>,
     event_tx: &Option<mpsc::Sender<Event>>,
@@ -130,9 +132,12 @@ pub async fn process_dtmf_packets(
                 .map(Endpoint::telephone_event_clock_rate)
                 .unwrap_or(8000);
             if let Some(evt) = ds.detector.process(&pkt.payload, pkt.timestamp, clock_rate) {
+                let sensitive = sensitive_dtmf_endpoints.contains(&pkt.source_endpoint_id);
                 debug!(
                     endpoint_id = %pkt.source_endpoint_id,
+                    digit = %if sensitive { '~' } else { evt.digit },
                     duration_ms = evt.duration_ms,
+                    sensitive,
                     "DTMF detected"
                 );
                 metrics.dtmf_events.inc();
@@ -143,6 +148,7 @@ pub async fn process_dtmf_packets(
                         endpoint_id: pkt.source_endpoint_id,
                         digit: evt.digit.to_string(),
                         duration_ms: evt.duration_ms,
+                        sensitive,
                     },
                     dropped_events,
                     metrics,
@@ -200,6 +206,7 @@ pub async fn process_dtmf_packets(
 /// Call this periodically from the session event loop.
 pub fn check_dtmf_timeouts(
     dtmf_state: &mut HashMap<EndpointId, EndpointDtmf>,
+    sensitive_dtmf_endpoints: &HashSet<EndpointId>,
     endpoints: &HashMap<EndpointId, Endpoint>,
     event_tx: &Option<mpsc::Sender<Event>>,
     dropped_events: &AtomicU64,
@@ -211,9 +218,12 @@ pub fn check_dtmf_timeouts(
             .map(Endpoint::telephone_event_clock_rate)
             .unwrap_or(8000);
         if let Some(evt) = ds.detector.check_timeout(clock_rate) {
+            let sensitive = sensitive_dtmf_endpoints.contains(eid);
             debug!(
                 endpoint_id = %eid,
+                digit = %if sensitive { '~' } else { evt.digit },
                 duration_ms = evt.duration_ms,
+                sensitive,
                 "DTMF detected (end-bit timeout)"
             );
             metrics.dtmf_events.inc();
@@ -224,6 +234,7 @@ pub fn check_dtmf_timeouts(
                     endpoint_id: *eid,
                     digit: evt.digit.to_string(),
                     duration_ms: evt.duration_ms,
+                    sensitive,
                 },
                 dropped_events,
                 metrics,

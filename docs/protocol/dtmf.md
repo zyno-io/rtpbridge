@@ -12,12 +12,38 @@ When a remote endpoint sends DTMF via telephone-event RTP packets, rtpbridge aut
   "data": {
     "endpoint_id": "...",
     "digit": "5",
-    "duration_ms": 160
+    "duration_ms": 160,
+    "sensitive": false
   }
 }
 ```
 
 Supported digits: `0`-`9`, `*`, `#`, `A`-`D`.
+
+## Sensitive input
+
+### endpoint.dtmf.set_sensitive
+
+Enable this immediately before collecting payment or other sensitive DTMF input,
+and disable it immediately after the gather completes:
+
+```json
+{
+  "id": "1",
+  "method": "endpoint.dtmf.set_sensitive",
+  "params": {
+    "endpoint_id": "...",
+    "enabled": true
+  }
+}
+```
+
+While enabled for an endpoint, detected digits are written to rtpbridge logs as
+`~` and RFC 4733 DTMF packets from that endpoint are omitted from PCAP recordings.
+Audio and non-sensitive endpoints continue to be recorded and logged normally.
+The `dtmf` control event contains `sensitive: true`; the attached trusted
+controller must use the real digit only to complete the active gather and redact
+it before any downstream logging or event fan-out.
 
 ## Injection
 

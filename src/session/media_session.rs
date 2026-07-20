@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -46,6 +46,7 @@ pub struct EndpointTransferBundle {
     pub endpoint: Endpoint,
     pub source_session_id: SessionId,
     pub dtmf_state: Option<EndpointDtmf>,
+    pub sensitive_dtmf: bool,
     pub vad_monitor: Option<VadMonitor>,
     pub fax_detector: Option<FaxDetector>,
     pub analysis_decoder: Option<Box<dyn crate::media::codec::AudioDecoder>>,
@@ -111,6 +112,11 @@ pub enum SessionCommand {
         digit: char,
         duration_ms: u32,
         volume: u8,
+    },
+    DtmfSetSensitive {
+        reply: oneshot::Sender<anyhow::Result<()>>,
+        endpoint_id: EndpointId,
+        enabled: bool,
     },
     RecordingStart {
         reply: oneshot::Sender<anyhow::Result<RecordingId>>,
@@ -274,6 +280,10 @@ struct SessionState {
     dropped_events: Arc<AtomicU64>,
     endpoints: HashMap<EndpointId, Endpoint>,
     dtmf_state: HashMap<EndpointId, EndpointDtmf>,
+    /// Endpoints whose DTMF values must be redacted from logs and omitted from
+    /// packet recordings. The control event still carries the digit to the
+    /// attached controller so it can complete the active gather.
+    sensitive_dtmf_endpoints: HashSet<EndpointId>,
     routing: RoutingTable,
     recording_mgr: RecordingManager,
     vad_monitors: HashMap<EndpointId, VadMonitor>,
@@ -461,6 +471,13 @@ impl SessionState {
             } => {
                 let _ =
                     reply.send(self.handle_dtmf_inject(&endpoint_id, digit, duration_ms, volume));
+            }
+            SessionCommand::DtmfSetSensitive {
+                reply,
+                endpoint_id,
+                enabled,
+            } => {
+                let _ = reply.send(self.handle_dtmf_set_sensitive(endpoint_id, enabled));
             }
             SessionCommand::RecordingStart {
                 reply,
@@ -1449,6 +1466,7 @@ impl SessionState {
 
         // Extract ancillary state
         let dtmf_state = self.dtmf_state.remove(&endpoint_id);
+        let sensitive_dtmf = self.sensitive_dtmf_endpoints.remove(&endpoint_id);
         let vad_monitor = self.vad_monitors.remove(&endpoint_id);
         let fax_detector = self.fax_detectors.remove(&endpoint_id);
         let analysis_decoder = self.analysis_decoders.remove(&endpoint_id);
@@ -1505,6 +1523,7 @@ impl SessionState {
             endpoint,
             source_session_id: self.session_id,
             dtmf_state,
+            sensitive_dtmf,
             vad_monitor,
             fax_detector,
             analysis_decoder,
@@ -1562,6 +1581,9 @@ impl SessionState {
         // Insert ancillary state
         if let Some(dtmf) = bundle.dtmf_state.take() {
             self.dtmf_state.insert(endpoint_id, dtmf);
+        }
+        if bundle.sensitive_dtmf {
+            self.sensitive_dtmf_endpoints.insert(endpoint_id);
         }
         if let Some(vad) = bundle.vad_monitor.take() {
             self.vad_monitors.insert(endpoint_id, vad);
@@ -1859,6 +1881,29 @@ impl SessionState {
         Ok(())
     }
 
+    fn handle_dtmf_set_sensitive(
+        &mut self,
+        endpoint_id: EndpointId,
+        enabled: bool,
+    ) -> anyhow::Result<()> {
+        if !self.endpoints.contains_key(&endpoint_id) {
+            anyhow::bail!("Endpoint not found");
+        }
+
+        if enabled {
+            self.sensitive_dtmf_endpoints.insert(endpoint_id);
+        } else {
+            self.sensitive_dtmf_endpoints.remove(&endpoint_id);
+        }
+        info!(
+            session_id = %self.session_id,
+            endpoint_id = %endpoint_id,
+            enabled,
+            "sensitive DTMF mode changed"
+        );
+        Ok(())
+    }
+
     // ── VAD ─────────────────────────────────────────────────────────
 
     fn handle_vad_start(
@@ -2138,6 +2183,7 @@ impl SessionState {
     /// (caller is responsible for that) and does NOT touch recordings.
     async fn cleanup_endpoint_state(&mut self, endpoint_id: EndpointId) {
         self.dtmf_state.remove(&endpoint_id);
+        self.sensitive_dtmf_endpoints.remove(&endpoint_id);
         // Clear any pending DTMF injection targeting this endpoint
         if self
             .dtmf_injection
@@ -2530,6 +2576,7 @@ pub async fn run_media_session(
         dropped_events: Arc::new(AtomicU64::new(0)),
         endpoints: HashMap::new(),
         dtmf_state: HashMap::new(),
+        sensitive_dtmf_endpoints: HashSet::new(),
         routing: RoutingTable::new(),
         recording_mgr: RecordingManager::with_config(
             max_recordings,
@@ -2630,6 +2677,8 @@ pub async fn run_media_session(
                     record_inbound(
                         &mut state.recording_mgr,
                         &routed,
+                        &state.dtmf_state,
+                        &state.sensitive_dtmf_endpoints,
                         desc.as_ref(),
                         local,
                         Some(pkt.source),
@@ -2644,6 +2693,8 @@ pub async fn run_media_session(
                     pkt.endpoint_id,
                     &mut state.endpoints,
                     &mut state.recording_mgr,
+                    &state.dtmf_state,
+                    &state.sensitive_dtmf_endpoints,
                     &state.event_tx,
                     &state.critical_event_tx,
                     &state.dropped_events,
@@ -2718,6 +2769,8 @@ pub async fn run_media_session(
                         record_inbound(
                             &mut state.recording_mgr,
                             &routed,
+                            &state.dtmf_state,
+                            &state.sensitive_dtmf_endpoints,
                             desc.as_ref(),
                             local,
                             Some(pkt.source),
@@ -2732,6 +2785,8 @@ pub async fn run_media_session(
                         pkt.endpoint_id,
                         &mut state.endpoints,
                         &mut state.recording_mgr,
+                        &state.dtmf_state,
+                        &state.sensitive_dtmf_endpoints,
                         &state.event_tx,
                         &state.critical_event_tx,
                         &state.dropped_events,
@@ -2796,6 +2851,7 @@ pub async fn run_media_session(
         (next_webrtc_timeout, needs_routing_rebuild) = poll_and_route(
             &mut state.endpoints,
             &mut state.dtmf_state,
+            &state.sensitive_dtmf_endpoints,
             &state.routing,
             &state.event_tx,
             &state.critical_event_tx,
@@ -2871,6 +2927,7 @@ pub async fn run_media_session(
         fax_tap::check_fax_timeouts(&mut state.fax_detectors);
         super::session_dtmf::check_dtmf_timeouts(
             &mut state.dtmf_state,
+            &state.sensitive_dtmf_endpoints,
             &state.endpoints,
             &state.event_tx,
             &state.dropped_events,
@@ -3185,6 +3242,8 @@ fn endpoint_rtcp_local(ep: &Endpoint) -> Option<SocketAddr> {
 fn record_inbound(
     recording_mgr: &mut RecordingManager,
     pkt: &RoutedRtpPacket,
+    dtmf_state: &HashMap<EndpointId, EndpointDtmf>,
+    sensitive_dtmf_endpoints: &HashSet<EndpointId>,
     descriptor: Option<&crate::recording::meta::StreamDescriptor>,
     local: Option<SocketAddr>,
     remote: Option<SocketAddr>,
@@ -3194,6 +3253,9 @@ fn record_inbound(
     metrics: &crate::metrics::Metrics,
 ) {
     if !recording_mgr.is_recording() {
+        return;
+    }
+    if !should_record_inbound(pkt, dtmf_state, sensitive_dtmf_endpoints) {
         return;
     }
     // Refresh the cached descriptor (no-op unless codec/addr changed) so it is
@@ -3215,11 +3277,22 @@ fn record_inbound(
     metrics.packets_recorded.inc();
 }
 
+fn should_record_inbound(
+    pkt: &RoutedRtpPacket,
+    dtmf_state: &HashMap<EndpointId, EndpointDtmf>,
+    sensitive_dtmf_endpoints: &HashSet<EndpointId>,
+) -> bool {
+    !sensitive_dtmf_endpoints.contains(&pkt.source_endpoint_id)
+        || !super::session_dtmf::classify_dtmf(pkt, dtmf_state)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn drain_webrtc_output_into_inbound(
     endpoint_id: EndpointId,
     endpoints: &mut HashMap<EndpointId, Endpoint>,
     recording_mgr: &mut RecordingManager,
+    dtmf_state: &HashMap<EndpointId, EndpointDtmf>,
+    sensitive_dtmf_endpoints: &HashSet<EndpointId>,
     event_tx: &Option<mpsc::Sender<Event>>,
     critical_event_tx: &Option<mpsc::Sender<Event>>,
     dropped_events: &AtomicU64,
@@ -3245,6 +3318,8 @@ fn drain_webrtc_output_into_inbound(
                         record_inbound(
                             recording_mgr,
                             &pkt,
+                            dtmf_state,
+                            sensitive_dtmf_endpoints,
                             desc.as_ref(),
                             local,
                             remote,
@@ -3320,6 +3395,7 @@ fn emit_webrtc_events(
 async fn poll_and_route(
     endpoints: &mut HashMap<EndpointId, Endpoint>,
     dtmf_state: &mut HashMap<EndpointId, EndpointDtmf>,
+    sensitive_dtmf_endpoints: &HashSet<EndpointId>,
     routing: &RoutingTable,
     event_tx: &Option<mpsc::Sender<Event>>,
     critical_event_tx: &Option<mpsc::Sender<Event>>,
@@ -3359,6 +3435,8 @@ async fn poll_and_route(
             endpoint_id,
             endpoints,
             recording_mgr,
+            dtmf_state,
+            sensitive_dtmf_endpoints,
             event_tx,
             critical_event_tx,
             dropped_events,
@@ -3435,6 +3513,8 @@ async fn poll_and_route(
             record_inbound(
                 recording_mgr,
                 routed,
+                dtmf_state,
+                sensitive_dtmf_endpoints,
                 desc.as_ref(),
                 local,
                 remote,
@@ -3463,6 +3543,7 @@ async fn poll_and_route(
     super::session_dtmf::process_dtmf_packets(
         &dtmf_packets,
         dtmf_state,
+        sensitive_dtmf_endpoints,
         routing,
         endpoints,
         event_tx,

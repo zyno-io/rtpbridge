@@ -379,6 +379,12 @@ pub struct DtmfInjectParams {
     pub volume: u8,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct DtmfSetSensitiveParams {
+    pub endpoint_id: EndpointId,
+    pub enabled: bool,
+}
+
 fn default_dtmf_duration() -> u32 {
     160
 }
@@ -712,6 +718,7 @@ pub struct DtmfEventData {
     pub endpoint_id: EndpointId,
     pub digit: String,
     pub duration_ms: u32,
+    pub sensitive: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1021,6 +1028,16 @@ mod tests {
         assert_eq!(params.digit, "#");
     }
 
+    #[test]
+    fn dtmf_sensitive_params_require_an_explicit_state() {
+        let params: DtmfSetSensitiveParams = serde_json::from_value(json!({
+            "endpoint_id": "00000000-0000-0000-0000-000000000001",
+            "enabled": true
+        }))
+        .unwrap();
+        assert!(params.enabled);
+    }
+
     // ── StatsSubscribeParams defaults ─────────────────────────────────────
 
     #[test]
@@ -1111,12 +1128,14 @@ mod tests {
             endpoint_id: Uuid::nil(),
             digit: "9".into(),
             duration_ms: 160,
+            sensitive: true,
         };
         let evt = Event::new("dtmf", data);
         let val = serde_json::to_value(&evt).unwrap();
         assert_eq!(val["event"], "dtmf");
         assert_eq!(val["data"]["digit"], "9");
         assert_eq!(val["data"]["duration_ms"], 160);
+        assert_eq!(val["data"]["sensitive"], true);
         assert_eq!(
             val["data"]["endpoint_id"],
             "00000000-0000-0000-0000-000000000000"

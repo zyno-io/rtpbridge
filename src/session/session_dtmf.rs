@@ -132,7 +132,6 @@ pub async fn process_dtmf_packets(
             if let Some(evt) = ds.detector.process(&pkt.payload, pkt.timestamp, clock_rate) {
                 debug!(
                     endpoint_id = %pkt.source_endpoint_id,
-                    digit = %evt.digit,
                     duration_ms = evt.duration_ms,
                     "DTMF detected"
                 );
@@ -214,7 +213,6 @@ pub fn check_dtmf_timeouts(
         if let Some(evt) = ds.detector.check_timeout(clock_rate) {
             debug!(
                 endpoint_id = %eid,
-                digit = %evt.digit,
                 duration_ms = evt.duration_ms,
                 "DTMF detected (end-bit timeout)"
             );

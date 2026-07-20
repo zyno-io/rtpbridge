@@ -104,7 +104,7 @@ async fn handle_connection_inner(
                     warn!(error = %e, "failed to serialize critical event");
                     r#"{"event":"error","data":{}}"#.to_string()
                 });
-                trace!(payload = %json, "ws send critical event");
+                trace!(event = %event.event, payload_bytes = json.len(), "ws send critical event");
                 if ws_tx.send(Message::Text(json.into())).await.is_err() {
                     break;
                 }
@@ -114,7 +114,7 @@ async fn handle_connection_inner(
             msg = ws_rx.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        trace!(payload = %text, "ws recv");
+                        trace!(payload_bytes = text.len(), "ws recv");
                         // NOTE: serde_json has no recursion depth limit. Deeply nested JSON could
                         // cause stack overflow, bounded by the WebSocket message size limit.
                         let req: Request = match serde_json::from_str(&text) {
@@ -237,7 +237,7 @@ async fn handle_connection_inner(
                     warn!(error = %e, "failed to serialize event");
                     r#"{"event":"error","data":{}}"#.to_string()
                 });
-                trace!(payload = %json, "ws send event");
+                trace!(event = %event.event, payload_bytes = json.len(), "ws send event");
                 if ws_tx.send(Message::Text(json.into())).await.is_err() {
                     break;
                 }
@@ -275,7 +275,7 @@ async fn send_ws_response(
         );
         r#"{"error":{"code":"INTERNAL_ERROR","message":"serialize error"}}"#.to_string()
     });
-    trace!(payload = %json, "ws send response");
+    trace!(id = %resp.id, method = %method, payload_bytes = json.len(), "ws send response");
 
     match ws_tx.send(Message::Text(json.into())).await {
         Ok(()) => {
@@ -384,7 +384,7 @@ async fn drain_pending_events(
             warn!(error = %e, "failed to serialize critical event");
             r#"{"event":"error","data":{}}"#.to_string()
         });
-        trace!(payload = %json, "ws send critical event");
+        trace!(event = %event.event, payload_bytes = json.len(), "ws send critical event");
         if ws_tx.send(Message::Text(json.into())).await.is_err() {
             return false;
         }
@@ -394,7 +394,7 @@ async fn drain_pending_events(
             warn!(error = %e, "failed to serialize event");
             r#"{"event":"error","data":{}}"#.to_string()
         });
-        trace!(payload = %json, "ws send event");
+        trace!(event = %event.event, payload_bytes = json.len(), "ws send event");
         if ws_tx.send(Message::Text(json.into())).await.is_err() {
             return false;
         }

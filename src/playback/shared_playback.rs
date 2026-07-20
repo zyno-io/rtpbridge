@@ -138,7 +138,7 @@ impl SharedPlaybackManager {
                 // Last subscriber — signal cooperative shutdown
                 entry.cancel.cancel();
                 state.entries.remove(source);
-                debug!(source = source, "shared playback stopped (no subscribers)");
+                debug!(source = %crate::control::logging::source_summary(source), "shared playback stopped (no subscribers)");
             }
         }
     }
@@ -155,7 +155,7 @@ impl SharedPlaybackSubscriber {
             if entry.ref_count == 0 {
                 entry.cancel.cancel();
                 state.entries.remove(&self.source);
-                debug!(source = %self.source, "shared playback stopped (no subscribers)");
+                debug!(source = %crate::control::logging::source_summary(&self.source), "shared playback stopped (no subscribers)");
             }
         }
     }
@@ -193,7 +193,7 @@ impl Drop for SharedPlaybackSubscriber {
             None => {
                 // No tokio runtime at construction or drop time.
                 // This is expected during process shutdown; the OS will reclaim resources.
-                debug!(source = %source, "SharedPlaybackSubscriber dropped outside tokio runtime, ref_count not decremented");
+                debug!(source = %crate::control::logging::source_summary(&source), "SharedPlaybackSubscriber dropped outside tokio runtime, ref_count not decremented");
             }
         }
     }
@@ -226,11 +226,11 @@ async fn shared_decode_task(
     {
         Ok(Ok(ep)) => ep,
         Ok(Err(e)) => {
-            tracing::warn!(source = %source_str, error = %e, "failed to open shared playback file");
+            tracing::warn!(source = %crate::control::logging::source_summary(&source_str), error = %e, "failed to open shared playback file");
             return;
         }
         Err(e) => {
-            tracing::warn!(source = %source_str, error = %e, "spawn_blocking failed for shared playback");
+            tracing::warn!(source = %crate::control::logging::source_summary(&source_str), error = %e, "spawn_blocking failed for shared playback");
             return;
         }
     };

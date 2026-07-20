@@ -956,7 +956,7 @@ impl SessionState {
                 session_id = %self.session_id,
                 endpoint_id = %id,
                 endpoint_type = "file",
-                source = %source,
+                source = %crate::control::logging::source_summary(source),
                 shared = shared,
                 gain_db = gain_db,
                 "file endpoint created (downloading)"
@@ -1029,7 +1029,7 @@ impl SessionState {
                 session_id = %self.session_id,
                 endpoint_id = %id,
                 endpoint_type = "file",
-                source = %source,
+                source = %crate::control::logging::source_summary(source),
                 shared = shared,
                 start_ms = start_ms,
                 loop_count = ?loop_count,
@@ -1721,7 +1721,7 @@ impl SessionState {
                             info!(
                                 session_id = %self.session_id,
                                 endpoint_id = %endpoint_id,
-                                source = %path_str,
+                                source = %crate::control::logging::source_summary(&path_str),
                                 shared = is_shared,
                                 "file endpoint playback started"
                             );

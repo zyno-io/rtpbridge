@@ -10,6 +10,9 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{Instrument, debug, debug_span, info, info_span, trace, warn};
 
 use super::handler::{ConnectionState, handle_request};
+use super::logging::{
+    error_message_summary, event_body, request_body, response_body, safe_protocol_name,
+};
 use super::protocol::{Event, Request, Response};
 use crate::session::SessionManager;
 use crate::shutdown::ShutdownCoordinator;
@@ -85,6 +88,7 @@ async fn handle_connection_inner(
             );
             match serde_json::to_string(&orphan_event) {
                 Ok(json) => {
+                    trace!(event = %safe_protocol_name(&orphan_event.event), payload_bytes = json.len(), body = %event_body(&orphan_event), "ws send event");
                     let _ = ws_tx.send(Message::Text(json.into())).await;
                 }
                 Err(e) => {
@@ -104,7 +108,7 @@ async fn handle_connection_inner(
                     warn!(error = %e, "failed to serialize critical event");
                     r#"{"event":"error","data":{}}"#.to_string()
                 });
-                trace!(event = %event.event, payload_bytes = json.len(), "ws send critical event");
+                trace!(event = %safe_protocol_name(&event.event), payload_bytes = json.len(), body = %event_body(&event), "ws send critical event");
                 if ws_tx.send(Message::Text(json.into())).await.is_err() {
                     break;
                 }
@@ -114,12 +118,12 @@ async fn handle_connection_inner(
             msg = ws_rx.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        trace!(payload_bytes = text.len(), "ws recv");
                         // NOTE: serde_json has no recursion depth limit. Deeply nested JSON could
                         // cause stack overflow, bounded by the WebSocket message size limit.
                         let req: Request = match serde_json::from_str(&text) {
                             Ok(r) => r,
                             Err(e) => {
+                                trace!(payload_bytes = text.len(), error = %e, "ws recv invalid JSON");
                                 // Best-effort ID extraction: try to pull "id" from the raw JSON
                                 // so the client can correlate the error to their request.
                                 let req_id = extract_request_id_best_effort(&text);
@@ -134,6 +138,8 @@ async fn handle_connection_inner(
                                 continue;
                             }
                         };
+
+                        trace!(payload_bytes = text.len(), method = %safe_protocol_name(&req.method), body = %request_body(&req), "ws recv request");
 
                         if req.id.len() > MAX_REQUEST_ID_LEN {
                             let truncated_id = truncate_to_byte_boundary(&req.id, MAX_REQUEST_ID_LEN);
@@ -150,7 +156,7 @@ async fn handle_connection_inner(
 
                         let req_span = debug_span!("ws_req",
                             id = %req.id,
-                            method = %req.method,
+                            method = %safe_protocol_name(&req.method),
                             session_id = tracing::field::Empty,
                         );
                         if let Some(sid) = state.session_id {
@@ -227,17 +233,19 @@ async fn handle_connection_inner(
                         "events.dropped",
                         serde_json::json!({ "count": dropped }),
                     );
-                    if let Ok(json) = serde_json::to_string(&drop_event)
-                        && ws_tx.send(Message::Text(json.into())).await.is_err() {
+                    if let Ok(json) = serde_json::to_string(&drop_event) {
+                        trace!(event = %safe_protocol_name(&drop_event.event), payload_bytes = json.len(), body = %event_body(&drop_event), "ws send event");
+                        if ws_tx.send(Message::Text(json.into())).await.is_err() {
                             break;
                         }
+                    }
                 }
 
                 let json = serde_json::to_string(&event).unwrap_or_else(|e| {
                     warn!(error = %e, "failed to serialize event");
                     r#"{"event":"error","data":{}}"#.to_string()
                 });
-                trace!(event = %event.event, payload_bytes = json.len(), "ws send event");
+                trace!(event = %safe_protocol_name(&event.event), payload_bytes = json.len(), body = %event_body(&event), "ws send event");
                 if ws_tx.send(Message::Text(json.into())).await.is_err() {
                     break;
                 }
@@ -266,16 +274,17 @@ async fn send_ws_response(
     method: &str,
     resp: Response,
 ) -> bool {
+    let logged_method = safe_protocol_name(method);
     let json = serde_json::to_string(&resp).unwrap_or_else(|e| {
         warn!(
             id = %resp.id,
-            method = %method,
+            method = %logged_method,
             error = %e,
             "failed to serialize JSON-RPC response"
         );
         r#"{"error":{"code":"INTERNAL_ERROR","message":"serialize error"}}"#.to_string()
     });
-    trace!(id = %resp.id, method = %method, payload_bytes = json.len(), "ws send response");
+    trace!(id = %resp.id, method = %logged_method, payload_bytes = json.len(), body = %response_body(method, &resp), "ws send response");
 
     match ws_tx.send(Message::Text(json.into())).await {
         Ok(()) => {
@@ -285,7 +294,7 @@ async fn send_ws_response(
         Err(e) => {
             warn!(
                 id = %resp.id,
-                method = %method,
+                method = %logged_method,
                 error = %e,
                 "failed to send JSON-RPC response"
             );
@@ -327,26 +336,27 @@ const INFO_REPLY_METHODS: &[&str] = &[
 ];
 
 fn log_ws_response_sent(method: &str, resp: &Response) {
+    let logged_method = safe_protocol_name(method);
     if let Some(error) = &resp.error {
         info!(
             id = %resp.id,
-            method = %method,
+            method = %logged_method,
             result = "error",
             error_code = %error.code,
-            error_message = %error.message,
+            error_message = %error_message_summary(&error.message),
             "JSON-RPC response sent"
         );
     } else if INFO_REPLY_METHODS.contains(&method) {
         info!(
             id = %resp.id,
-            method = %method,
+            method = %logged_method,
             result = "ok",
             "JSON-RPC response sent"
         );
     } else {
         debug!(
             id = %resp.id,
-            method = %method,
+            method = %logged_method,
             result = "ok",
             "JSON-RPC response sent"
         );
@@ -373,10 +383,11 @@ async fn drain_pending_events(
         );
         let drop_event =
             super::protocol::Event::new("events.dropped", serde_json::json!({ "count": dropped }));
-        if let Ok(json) = serde_json::to_string(&drop_event)
-            && ws_tx.send(Message::Text(json.into())).await.is_err()
-        {
-            return false;
+        if let Ok(json) = serde_json::to_string(&drop_event) {
+            trace!(event = %safe_protocol_name(&drop_event.event), payload_bytes = json.len(), body = %event_body(&drop_event), "ws send event");
+            if ws_tx.send(Message::Text(json.into())).await.is_err() {
+                return false;
+            }
         }
     }
 
@@ -385,7 +396,7 @@ async fn drain_pending_events(
             warn!(error = %e, "failed to serialize critical event");
             r#"{"event":"error","data":{}}"#.to_string()
         });
-        trace!(event = %event.event, payload_bytes = json.len(), "ws send critical event");
+        trace!(event = %safe_protocol_name(&event.event), payload_bytes = json.len(), body = %event_body(&event), "ws send critical event");
         if ws_tx.send(Message::Text(json.into())).await.is_err() {
             return false;
         }
@@ -395,7 +406,7 @@ async fn drain_pending_events(
             warn!(error = %e, "failed to serialize event");
             r#"{"event":"error","data":{}}"#.to_string()
         });
-        trace!(event = %event.event, payload_bytes = json.len(), "ws send event");
+        trace!(event = %safe_protocol_name(&event.event), payload_bytes = json.len(), body = %event_body(&event), "ws send event");
         if ws_tx.send(Message::Text(json.into())).await.is_err() {
             return false;
         }

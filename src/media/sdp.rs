@@ -76,6 +76,23 @@ pub fn select_answer_codec(codecs: &[SdpCodec]) -> Option<&SdpCodec> {
         })
 }
 
+/// Select the single RFC 4733 mapping to negotiate for an audio codec.
+///
+/// Some SIP carriers offer multiple `telephone-event` payload types at
+/// different clock rates. An RTP endpoint currently has one DTMF payload type
+/// and clock, so prefer the mapping whose clock matches the selected audio
+/// codec and otherwise retain the offerer's first mapping.
+pub fn select_telephone_event_codec(
+    codecs: &[SdpCodec],
+    media_clock_rate: u32,
+) -> Option<&SdpCodec> {
+    let first = codecs.iter().find(|c| c.name == "telephone-event")?;
+    codecs
+        .iter()
+        .find(|c| c.name == "telephone-event" && c.clock_rate == media_clock_rate)
+        .or(Some(first))
+}
+
 /// Codecs to advertise in a plain-RTP offer.
 ///
 /// With no caller preference (`prefer` is `None`), codecs are advertised
@@ -243,13 +260,6 @@ pub fn parse_sdp(sdp: &str) -> ParsedSdp {
                 if rtpmap.len() < 32 {
                     rtpmap.insert(pt, (name.to_string(), clock_rate, channels));
                 }
-                if name.eq_ignore_ascii_case("telephone-event") {
-                    result.telephone_event_pt = Some(pt);
-                    // Track the negotiated DTMF clock; default a malformed/zero
-                    // rate to the 8000 SIP convention.
-                    result.telephone_event_clock_rate =
-                        Some(if clock_rate > 0 { clock_rate } else { 8000 });
-                }
             }
         } else if let Some(rest) = line.strip_prefix("a=crypto:") {
             // e.g., "1 AES_CM_128_HMAC_SHA1_80 inline:base64key..."
@@ -331,6 +341,14 @@ pub fn parse_sdp(sdp: &str) -> ParsedSdp {
             }
             _ => {}
         }
+    }
+
+    let selected_media_clock = select_answer_codec(&result.codecs)
+        .map(|codec| codec.clock_rate)
+        .unwrap_or(8000);
+    if let Some(codec) = select_telephone_event_codec(&result.codecs, selected_media_clock) {
+        result.telephone_event_pt = Some(codec.pt);
+        result.telephone_event_clock_rate = Some(codec.clock_rate);
     }
 
     // Detect OSRTP (RFC 8643): RTP/AVP profile with a=crypto present.

@@ -251,6 +251,50 @@ async fn test_from_offer_answer_advertises_selected_codec_first() {
     );
 }
 
+#[tokio::test]
+async fn test_from_offer_selects_matching_telephone_event_when_multiple_are_offered() {
+    let pool = crate::net::socket_pool::SocketPool::new("127.0.0.1".parse().unwrap(), 41300, 41400)
+        .unwrap();
+    let pair = pool.allocate_pair().await.unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    let offer = "v=0\r\n\
+                 o=Telnyx 1 2 IN IP4 127.0.0.1\r\n\
+                 s=Telnyx\r\n\
+                 c=IN IP4 127.0.0.1\r\n\
+                 t=0 0\r\n\
+                 m=audio 20000 RTP/AVP 0 9 101 105\r\n\
+                 a=rtpmap:0 PCMU/8000\r\n\
+                 a=rtpmap:9 G722/8000\r\n\
+                 a=rtpmap:101 telephone-event/8000\r\n\
+                 a=fmtp:101 0-15\r\n\
+                 a=rtpmap:105 telephone-event/16000\r\n\
+                 a=fmtp:105 0-15\r\n\
+                 a=sendrecv\r\n";
+
+    let (ep, answer) = RtpEndpoint::from_offer(
+        EndpointId::new_v4(),
+        EndpointDirection::SendRecv,
+        offer,
+        pair,
+        "127.0.0.1".parse().unwrap(),
+        tx,
+    )
+    .unwrap();
+
+    assert_eq!(ep.send_codec.as_ref().map(|codec| codec.name), Some("G722"));
+    assert_eq!(ep.telephone_event_pt, Some(101));
+    assert_eq!(ep.telephone_event_clock_rate, 8000);
+    assert!(
+        answer.contains("m=audio 41300 RTP/AVP 9 101"),
+        "answer:\n{answer}"
+    );
+    assert!(answer.contains("a=rtpmap:101 telephone-event/8000"));
+    assert!(
+        !answer.contains("telephone-event/16000"),
+        "answer:\n{answer}"
+    );
+}
+
 /// Build a minimal plain-RTP offer for the given connection family.
 fn family_offer(is_v6: bool, port: u16) -> String {
     let (ver, addr) = if is_v6 {

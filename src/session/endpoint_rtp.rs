@@ -430,12 +430,11 @@ impl RtpEndpoint {
             .map(|c| c.clock_rate)
             .unwrap_or(8000);
 
-        // Commit to a single media codec: keep only the selected codec plus the
-        // offered telephone-event. This endpoint decodes ALL inbound media as
-        // send_codec (see endpoint_audio_codec) — advertising other audio codecs
-        // the peer could then send would cause them to be misdecoded. Trimming the
-        // set here makes every answer we generate (initial and re-INVITE) advertise
-        // exactly the selected codec.
+        // Commit to a single media codec and a single telephone-event mapping.
+        // This endpoint decodes ALL inbound media as send_codec (see
+        // endpoint_audio_codec) and tracks one RFC 4733 PT/clock. Advertising
+        // additional audio or telephone-event mappings would let the peer send a
+        // payload we cannot classify correctly.
         endpoint.codecs = endpoint
             .send_codec
             .iter()
@@ -444,7 +443,8 @@ impl RtpEndpoint {
                 parsed
                     .codecs
                     .iter()
-                    .filter(|c| c.name == "telephone-event")
+                    .filter(|c| Some(c.pt) == endpoint.telephone_event_pt)
+                    .take(1)
                     .cloned(),
             )
             .collect();

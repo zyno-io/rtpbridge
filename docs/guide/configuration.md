@@ -13,6 +13,7 @@ rtpbridge [OPTIONS]
 | `-l, --listen <ADDRS>` | `0.0.0.0:9100` | WebSocket/HTTP control plane listen address(es), comma-separated |
 | `-m, --media-ip <IP>` | `127.0.0.1` | IP address for all media sockets |
 | `-c, --config <PATH>` | — | Path to TOML configuration file |
+| `--legacy-ice-renomination` | disabled | Advertise legacy libwebrtc ICE re-nomination for WebRTC endpoints |
 | `--log-level <LEVEL>` | `info` | Log level: trace, debug, info, warn, error |
 
 ## TOML Config File
@@ -28,6 +29,7 @@ media_ip = "203.0.113.5"
 
 # UDP port range for plain RTP endpoints [start, end]
 rtp_port_range = [30000, 39999]
+legacy_ice_renomination = false
 
 # Session disconnect timeout (seconds)
 # When a WS connection drops, the session stays alive for this long
@@ -268,6 +270,7 @@ All configuration options with their types, defaults, and descriptions. All chan
 | `max_sdp_size_kb` | `usize` | `64` | Maximum SDP size in KB; rejects oversized offers/answers |
 | `session_idle_timeout_secs` | `u64` | `0` | Auto-destroy sessions with no activity for this duration (0 = disabled) |
 | `empty_session_timeout_secs` | `u64` | `0` | Auto-destroy sessions with zero endpoints for this duration (0 = disabled) |
+| `legacy_ice_renomination` | `bool` | `false` | Advertise legacy libwebrtc ICE re-nomination; disable as the rollout kill switch |
 | `max_connections` | `usize` | `1000` | Maximum concurrent WebSocket connections (0 = unlimited) |
 | `ws_ping_interval_secs` | `u64` | `30` | WebSocket ping interval for keepalive and dead connection detection |
 | `event_channel_size` | `usize` | `256` | Buffer size for normal event channel per connection |

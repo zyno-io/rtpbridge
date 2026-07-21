@@ -43,6 +43,30 @@ The session task may batch-drain its packet channel, but each WebRTC datagram is
 followed by an endpoint-local output drain before the next WebRTC datagram can
 be handled.
 
+### Legacy libwebrtc ICE re-nomination
+
+rtpbridge supports libwebrtc's deployed legacy re-nomination extension
+(`a=ice-options:renomination` and the authenticated STUN `NOMINATION` attribute
+`0xC001`) through a pinned str0m fork. Support is disabled by default. Operators
+enable it with `legacy_ice_renomination = true` in TOML or the
+`--legacy-ice-renomination` CLI flag; disabling that setting is the rollout kill
+switch and restores ordinary `USE-CANDIDATE` nomination without changing the
+wire protocol.
+
+When enabled, a newer authenticated nomination may change only the selected
+remote transport address. The WebRTC endpoint, ICE generation, DTLS and SRTP
+state, RTP sequence/timestamp continuity, and SSRCs remain unchanged. The
+authoritative selected-pair state updates endpoint diagnostics and increments
+`rtpbridge_webrtc_ice_pair_switches_total` whenever an established pair changes.
+The existing ICE-restart RPC remains the fallback if media does not recover.
+
+The exact M144 desktop protocol/media result and the remaining real-device
+rollout gates are recorded in
+[`../experiments/libwebrtc-ice-renomination.md`](../experiments/libwebrtc-ice-renomination.md).
+The compile-only `legacy-ice-renomination-experiment` Cargo feature enables the
+local path-failure injector; normal release and PR images never compile that
+injector.
+
 ### Per-Endpoint Sockets
 
 Each socket-backed endpoint binds its own UDP socket(s) rather than sharing a mux. WebRTC endpoints use one OS-assigned UDP socket, with ICE multiplexing RTP/RTCP and DTLS/SRTP on that port. Plain RTP/SRTP endpoints allocate an even/odd pair from `rtp_port_range` for RTP and RTCP sockets; if `rtcp-mux` is negotiated, RTCP traffic is demuxed on the RTP socket but the local pair is still allocated. For WebRTC, the OS-assigned port becomes the ICE host candidate.

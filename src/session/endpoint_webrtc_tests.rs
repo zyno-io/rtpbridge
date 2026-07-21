@@ -10,9 +10,91 @@ async fn mk_webrtc_ts_endpoint() -> WebRtcEndpoint {
         },
         &[bind_addr],
         Arc::new(Metrics::new()),
+        false,
     )
     .await
     .expect("new_with_socket should succeed")
+}
+
+#[tokio::test]
+async fn test_enabled_offer_advertises_legacy_ice_renomination() {
+    let id = uuid::Uuid::new_v4();
+    let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let (tx, _rx) = mpsc::channel(16);
+
+    let (_endpoint, offer) = WebRtcEndpoint::create_offer_with_legacy_ice_renomination(
+        id,
+        EndpointDirection::SendRecv,
+        &[bind_addr],
+        tx,
+        Arc::new(Metrics::new()),
+        true,
+    )
+    .await
+    .expect("experiment offer should be created");
+
+    assert!(
+        offer.contains("a=ice-options:trickle renomination\r\n"),
+        "the runtime-enabled endpoint must advertise the patched capability"
+    );
+}
+
+#[cfg(feature = "legacy-ice-renomination-experiment")]
+#[test]
+fn test_experiment_fault_drops_only_first_selected_path_after_delay() {
+    let endpoint_id = EndpointId::new_v4();
+    let local: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+    let first_remote: SocketAddr = "192.0.2.10:50000".parse().unwrap();
+    let replacement_remote: SocketAddr = "198.51.100.20:50001".parse().unwrap();
+    let now = Instant::now();
+    let mut fault = RenominationPathFault {
+        delay: Duration::from_millis(500),
+        first_remote: None,
+        activate_at: None,
+        activated: false,
+        replacement_observed: false,
+    };
+
+    fault.observe_selected_pair(endpoint_id, local, first_remote, now);
+    assert!(!fault.should_drop(endpoint_id, first_remote, now));
+    assert!(!fault.should_drop(
+        endpoint_id,
+        replacement_remote,
+        now + Duration::from_secs(1)
+    ));
+    assert!(fault.should_drop(endpoint_id, first_remote, now + Duration::from_millis(500)));
+
+    fault.observe_selected_pair(
+        endpoint_id,
+        local,
+        replacement_remote,
+        now + Duration::from_secs(1),
+    );
+    assert!(fault.replacement_observed);
+    assert!(!fault.should_drop(
+        endpoint_id,
+        replacement_remote,
+        now + Duration::from_secs(1)
+    ));
+}
+
+#[tokio::test]
+async fn test_default_offer_does_not_advertise_legacy_ice_renomination() {
+    let id = uuid::Uuid::new_v4();
+    let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let (tx, _rx) = mpsc::channel(16);
+
+    let (_endpoint, offer) = WebRtcEndpoint::create_offer(
+        id,
+        EndpointDirection::SendRecv,
+        &[bind_addr],
+        tx,
+        Arc::new(Metrics::new()),
+    )
+    .await
+    .expect("default offer should be created");
+
+    assert!(!offer.contains("renomination"));
 }
 
 #[tokio::test]
@@ -147,6 +229,7 @@ async fn test_supervise_recv_detects_never_started() {
         },
         &[bind_addr],
         metrics.clone(),
+        false,
     )
     .await
     .expect("new_with_socket should succeed");

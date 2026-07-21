@@ -105,6 +105,46 @@ jobs:
           context: .
           push: false
 
+  docker-push-pr:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    needs: [fmt, clippy, audit, test-unit, test-integration, build-release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish PR image
+        id: image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          build-args: |
+            BUILD_VERSION=pr-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          tags: ghcr.io/${{ github.repository }}:pr-${{ github.event.pull_request.number }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.event.pull_request.head.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+
+      - name: Write staging image details
+        run: |
+          echo '### Staging image' >> "$GITHUB_STEP_SUMMARY"
+          echo '`ghcr.io/${{ github.repository }}:pr-${{ github.event.pull_request.number }}`' >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Digest: `${{ steps.image.outputs.digest }}`' >> "$GITHUB_STEP_SUMMARY"
+
   docker-push:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [fmt, clippy, audit, test-unit, test-integration, build-release]

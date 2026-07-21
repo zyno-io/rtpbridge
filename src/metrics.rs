@@ -68,6 +68,9 @@ pub struct Metrics {
     /// (credential divergence → silent media blackhole). A non-zero value
     /// means a caller issued overlapping ICE restarts.
     pub webrtc_ice_restart_conflicts: Counter,
+    /// Established WebRTC selected ICE pair changes observed from str0m's
+    /// authoritative selected-pair state.
+    pub webrtc_ice_pair_switches: Counter,
     /// WebRTC per-endpoint UDP recv task reached its receive loop. The
     /// receive loop is the ONLY thing that pulls inbound ICE/STUN/SRTP off an
     /// endpoint's socket, so this is the heartbeat of the media datapath.
@@ -149,6 +152,7 @@ impl Metrics {
         let webrtc_packet_errors = Counter::default();
         let webrtc_connecting_stuck = Counter::default();
         let webrtc_ice_restart_conflicts = Counter::default();
+        let webrtc_ice_pair_switches = Counter::default();
         let webrtc_recv_task_started = Counter::default();
         let webrtc_recv_task_exited = Counter::default();
         let webrtc_recv_task_dead = Counter::default();
@@ -248,6 +252,11 @@ impl Metrics {
             webrtc_ice_restart_conflicts.clone(),
         );
         registry.register(
+            "rtpbridge_webrtc_ice_pair_switches",
+            "Established WebRTC selected ICE pair changes",
+            webrtc_ice_pair_switches.clone(),
+        );
+        registry.register(
             "rtpbridge_webrtc_recv_task_started",
             "WebRTC recv tasks that reached their receive loop",
             webrtc_recv_task_started.clone(),
@@ -315,6 +324,7 @@ impl Metrics {
             webrtc_packet_errors,
             webrtc_connecting_stuck,
             webrtc_ice_restart_conflicts,
+            webrtc_ice_pair_switches,
             webrtc_recv_task_started,
             webrtc_recv_task_exited,
             webrtc_recv_task_dead,

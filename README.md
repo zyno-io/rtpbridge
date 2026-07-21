@@ -60,6 +60,7 @@ websocat ws://localhost:9100
 |----------|---------|-------------|
 | `--listen` | `0.0.0.0:9100` | WebSocket/HTTP control plane address(es), comma-separated |
 | `--media-ip` | `127.0.0.1` | IP for all media sockets (RTP/WebRTC) |
+| `--legacy-ice-renomination` | disabled | Advertise legacy libwebrtc ICE re-nomination |
 | `--config` | — | Path to TOML config file |
 | `--log-level` | `info` | Log level (trace/debug/info/warn/error) |
 

@@ -195,6 +195,7 @@ Create a new plain RTP endpoint and generate an SDP offer.
   "params": {
     "direction": "sendrecv",
     "srtp": false,
+    "srtp_optional": true,
     "codecs": ["pcmu", "opus"]
   }
 }
@@ -203,7 +204,8 @@ Create a new plain RTP endpoint and generate an SDP offer.
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | `direction` | string | `"sendrecv"` | `"sendrecv"`, `"recvonly"`, `"sendonly"`, or `"inactive"` |
-| `srtp` | bool | `false` | Include `a=crypto` in offer |
+| `srtp` | bool | `false` | Require SRTP by offering `RTP/SAVP` with `a=crypto` |
+| `srtp_optional` | bool | `false` | Offer opportunistic SRTP (RFC 8643) using `RTP/AVP` with `a=crypto`; the answer may select SRTP or plain RTP. Mutually exclusive with `srtp` |
 | `codecs` | string[] | all | Preferred codec order |
 
 **Response:**

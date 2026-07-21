@@ -498,6 +498,7 @@ async fn handle_endpoint_create_offer(
         params.direction,
         params.endpoint_type,
         params.srtp,
+        params.srtp_optional,
         params.codecs,
     )
     .await
@@ -517,6 +518,7 @@ async fn handle_endpoint_create_offer_webrtc(
         state,
         params.direction,
         EndpointType::Webrtc,
+        false,
         false,
         None,
     )
@@ -538,6 +540,7 @@ async fn handle_endpoint_create_offer_rtp(
         params.direction,
         EndpointType::Rtp,
         params.srtp,
+        params.srtp_optional,
         params.codecs,
     )
     .await
@@ -549,8 +552,17 @@ async fn handle_endpoint_create_offer_inner(
     direction: EndpointDirection,
     endpoint_type: EndpointType,
     srtp: bool,
+    srtp_optional: bool,
     codecs: Option<Vec<String>>,
 ) -> Response {
+    if srtp && srtp_optional {
+        return Response::err(
+            id,
+            "INVALID_PARAMS",
+            "srtp and srtp_optional cannot both be enabled",
+        );
+    }
+
     let cmd_tx = match state.require_session(&id) {
         Ok(tx) => tx.clone(),
         Err(resp) => return resp,
@@ -564,6 +576,7 @@ async fn handle_endpoint_create_offer_inner(
             direction,
             endpoint_type,
             srtp,
+            srtp_optional,
             codecs,
         },
         reply_rx,

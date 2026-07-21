@@ -14,7 +14,7 @@ use super::endpoint_enum::{
     endpoint_send_pt, endpoint_stream_descriptor,
 };
 use super::endpoint_file::FileEndpoint;
-use super::endpoint_rtp::RtpEndpoint;
+use super::endpoint_rtp::{RtpEndpoint, RtpMediaSecurity};
 use super::endpoint_webrtc::{WebRtcEndpoint, WebRtcEvent, ice_state_str};
 use super::endpoint_websocket::{AudioWsStream, WebSocketEndpoint};
 use super::fax_tap;
@@ -84,6 +84,7 @@ pub enum SessionCommand {
         direction: EndpointDirection,
         endpoint_type: EndpointType,
         srtp: bool,
+        srtp_optional: bool,
         codecs: Option<Vec<String>>,
     },
     AcceptAnswer {
@@ -427,10 +428,18 @@ impl SessionState {
                 direction,
                 endpoint_type,
                 srtp,
+                srtp_optional,
                 codecs,
             } => {
                 let result = self
-                    .handle_create_offer(packet_tx, direction, endpoint_type, srtp, codecs)
+                    .handle_create_offer(
+                        packet_tx,
+                        direction,
+                        endpoint_type,
+                        srtp,
+                        srtp_optional,
+                        codecs,
+                    )
                     .await;
                 if result.is_ok() {
                     self.metrics.endpoints_total.inc();
@@ -846,6 +855,7 @@ impl SessionState {
         direction: EndpointDirection,
         endpoint_type: EndpointType,
         srtp: bool,
+        srtp_optional: bool,
         codecs: Option<Vec<String>>,
     ) -> anyhow::Result<(EndpointId, String)> {
         if self.max_endpoints > 0 && self.endpoints.len() >= self.max_endpoints {
@@ -892,13 +902,20 @@ impl SessionState {
                 // SIP answerer's default first-match selection stays as wideband
                 // as it can instead of dropping to PCMU. See `offer_codec_list`.
                 let offer_codecs = sdp::offer_codec_list(codecs.as_deref());
+                let media_security = if srtp {
+                    RtpMediaSecurity::Srtp
+                } else if srtp_optional {
+                    RtpMediaSecurity::OptionalSrtp
+                } else {
+                    RtpMediaSecurity::PlainRtp
+                };
                 let (ep, offer) = RtpEndpoint::create_offer(
                     id,
                     direction,
                     pair,
                     bind_ip,
                     &offer_codecs,
-                    srtp,
+                    media_security,
                     packet_tx.clone(),
                 )?;
                 let te = ep.telephone_event_pt;
@@ -911,6 +928,7 @@ impl SessionState {
                     local_addr = %ep.local_rtp_addr,
                     codecs = ?codec_names,
                     srtp = srtp,
+                    srtp_optional = srtp_optional,
                     "endpoint created (offer generated)"
                 );
                 self.endpoints.insert(id, Endpoint::Rtp(Box::new(ep)));

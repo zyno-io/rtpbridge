@@ -403,9 +403,9 @@ fn request_fields(method: &str) -> &'static [&'static str] {
         "endpoint.create_from_offer"
         | "endpoint.webrtc.create_from_offer"
         | "endpoint.rtp.create_from_offer" => &["sdp", "direction"],
-        "endpoint.create_offer" => &["direction", "type", "srtp", "codecs"],
+        "endpoint.create_offer" => &["direction", "type", "srtp", "srtp_optional", "codecs"],
         "endpoint.webrtc.create_offer" => &["direction"],
-        "endpoint.rtp.create_offer" => &["direction", "srtp", "codecs"],
+        "endpoint.rtp.create_offer" => &["direction", "srtp", "srtp_optional", "codecs"],
         "endpoint.accept_answer"
         | "endpoint.webrtc.accept_answer"
         | "endpoint.rtp.accept_answer" => &["endpoint_id", "sdp", "offer_generation"],

@@ -116,6 +116,9 @@ pub struct RtpEndpoint {
     /// re-emit the same key in a re-INVITE answer (peer is still using it to
     /// decrypt our packets, so the answer must repeat it).
     srtp_tx_key_b64: Option<String>,
+    /// Whether the initial offer used RFC 8643 opportunistic SRTP, allowing a
+    /// plain-RTP answer to explicitly decline the offered crypto.
+    srtp_optional: bool,
 
     /// SRTCP context for outgoing RTCP (None = plain RTCP)
     srtcp_tx: Option<SrtcpContext>,
@@ -145,6 +148,13 @@ pub struct RtpEndpoint {
     cancel_token: CancellationToken,
     /// Recv task handles
     recv_tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RtpMediaSecurity {
+    PlainRtp,
+    OptionalSrtp,
+    Srtp,
 }
 
 impl RtpEndpoint {
@@ -183,6 +193,7 @@ impl RtpEndpoint {
             rekey_switchover: None,
             srtp_rx_key_b64: None,
             srtp_tx_key_b64: None,
+            srtp_optional: false,
             srtcp_tx: None,
             srtcp_rx: None,
             srtcp_rx_new: None,
@@ -524,7 +535,7 @@ impl RtpEndpoint {
         socket_pair: SocketPair,
         bind_ip: std::net::IpAddr,
         codecs: &[SdpCodec],
-        srtp: bool,
+        media_security: RtpMediaSecurity,
         packet_tx: mpsc::Sender<InboundPacket>,
     ) -> anyhow::Result<(Self, String)> {
         let mut endpoint = Self::new(id, direction, socket_pair);
@@ -537,7 +548,7 @@ impl RtpEndpoint {
         endpoint.telephone_event_clock_rate = te_codec.map_or(8000, |c| c.clock_rate);
 
         // Generate crypto if SRTP requested
-        let crypto = if srtp {
+        let crypto = if media_security != RtpMediaSecurity::PlainRtp {
             // Generate a random 30-byte key (128-bit master key + 112-bit salt)
             let mut key_bytes = [0u8; 30];
             for b in key_bytes.iter_mut() {
@@ -563,15 +574,27 @@ impl RtpEndpoint {
         } else {
             None
         };
+        endpoint.srtp_optional = media_security == RtpMediaSecurity::OptionalSrtp;
 
         let offer_codecs: Vec<&SdpCodec> = endpoint.codecs.iter().collect();
-        let offer = sdp::generate_sdp_offer(
-            SocketAddr::new(bind_ip, endpoint.local_rtp_addr.port()),
-            endpoint.local_rtp_addr.port(),
-            &offer_codecs,
-            crypto.as_ref(),
-            id.as_u128() as u64,
-        );
+        let local_addr = SocketAddr::new(bind_ip, endpoint.local_rtp_addr.port());
+        let offer = if endpoint.srtp_optional {
+            sdp::generate_osrtp_sdp_offer(
+                local_addr,
+                endpoint.local_rtp_addr.port(),
+                &offer_codecs,
+                crypto.as_ref().expect("OSRTP offer must have crypto"),
+                id.as_u128() as u64,
+            )
+        } else {
+            sdp::generate_sdp_offer(
+                local_addr,
+                endpoint.local_rtp_addr.port(),
+                &offer_codecs,
+                crypto.as_ref(),
+                id.as_u128() as u64,
+            )
+        };
 
         endpoint.state = EndpointState::Connecting;
         endpoint.start_recv_tasks(packet_tx);
@@ -603,11 +626,61 @@ impl RtpEndpoint {
     pub fn accept_answer(&mut self, answer_sdp: &str) -> anyhow::Result<()> {
         let parsed = sdp::parse_sdp(answer_sdp);
 
+        // An SRTP offer and a plain-RTP answer (or the inverse) cannot produce
+        // usable bidirectional media. In particular, retaining the offer-side
+        // TX context after a peer omits a=crypto encrypts every outbound packet
+        // with a key the peer never accepted while inbound plain RTP still
+        // appears healthy. Reject the negotiation instead of establishing a
+        // deceptively one-way call.
+        let offered_srtp = self.srtp_tx_key_b64.is_some();
+        let answered_srtp = parsed.crypto.is_some();
+        let selected_plain_rtp = offered_srtp && !answered_srtp && self.srtp_optional;
+        if offered_srtp != answered_srtp && !selected_plain_rtp {
+            anyhow::bail!(
+                "SDP answer media security does not match the offer (offered {}, answered {})",
+                if offered_srtp { "SRTP" } else { "RTP" },
+                if answered_srtp { "SRTP" } else { "RTP" },
+            );
+        }
+
         // Reject an address-family change before mutating any state: our RTP
         // socket is already bound to one family, and we don't migrate sockets, so
         // a v4↔v6 flip would leave us unable to reach the remote. Bail here (no
         // partial mutation) rather than half-applying the SDP.
         self.reject_family_change(parsed.remote_addr)?;
+        if parsed.remote_addr.is_none() {
+            anyhow::bail!("SDP answer has no connection address");
+        }
+
+        // Validate the answer's codec intersection before applying any of its
+        // negotiated state to the endpoint.
+        let negotiated_codecs = if parsed.codecs.is_empty() {
+            None
+        } else {
+            let offered: std::collections::HashSet<String> = self
+                .codecs
+                .iter()
+                .map(|c| c.name.to_ascii_uppercase())
+                .collect();
+            let valid: Vec<_> = parsed
+                .codecs
+                .iter()
+                .filter(|c| offered.contains(&c.name.to_ascii_uppercase()))
+                .cloned()
+                .collect();
+            if valid.is_empty() && !offered.is_empty() {
+                anyhow::bail!("SDP answer contains no codecs from the original offer");
+            }
+            Some(valid)
+        };
+
+        if selected_plain_rtp {
+            self.srtp_tx = None;
+            self.srtcp_tx = None;
+            self.srtp_tx_key_b64 = None;
+            self.srtp_optional = false;
+            info!(endpoint_id = %self.id, "OSRTP peer selected plain RTP");
+        }
 
         if let Some(dir) = parsed
             .direction
@@ -634,21 +707,7 @@ impl RtpEndpoint {
 
         // Update codecs from answer — only accept codecs that were in our offer.
         // self.codecs contains the offered set (set during from_offer or create_offer).
-        if !parsed.codecs.is_empty() {
-            let offered: std::collections::HashSet<String> = self
-                .codecs
-                .iter()
-                .map(|c| c.name.to_ascii_uppercase())
-                .collect();
-            let valid: Vec<_> = parsed
-                .codecs
-                .iter()
-                .filter(|c| offered.contains(&c.name.to_ascii_uppercase()))
-                .cloned()
-                .collect();
-            if valid.is_empty() && !offered.is_empty() {
-                anyhow::bail!("SDP answer contains no codecs from the original offer");
-            }
+        if let Some(valid) = negotiated_codecs {
             self.codecs = valid;
             self.send_codec = self
                 .codecs
@@ -717,10 +776,6 @@ impl RtpEndpoint {
                     "SRTP TX key generated in accept_answer fallback — \
                      remote peer may not know this key since it was not in the original offer");
             }
-        }
-
-        if self.remote_rtp_addr.is_none() {
-            anyhow::bail!("SDP answer has no connection address");
         }
 
         self.state = EndpointState::Connected;
@@ -1416,13 +1471,24 @@ impl RtpEndpoint {
 
         let bind_ip = self.local_rtp_addr.ip();
         let offer_codecs: Vec<&SdpCodec> = self.codecs.iter().collect();
-        let sdp = sdp::generate_sdp_offer(
-            SocketAddr::new(bind_ip, self.local_rtp_addr.port()),
-            self.local_rtp_addr.port(),
-            &offer_codecs,
-            Some(&crypto),
-            self.id.as_u128() as u64,
-        );
+        let local_addr = SocketAddr::new(bind_ip, self.local_rtp_addr.port());
+        let sdp = if self.srtp_optional {
+            sdp::generate_osrtp_sdp_offer(
+                local_addr,
+                self.local_rtp_addr.port(),
+                &offer_codecs,
+                &crypto,
+                self.id.as_u128() as u64,
+            )
+        } else {
+            sdp::generate_sdp_offer(
+                local_addr,
+                self.local_rtp_addr.port(),
+                &offer_codecs,
+                Some(&crypto),
+                self.id.as_u128() as u64,
+            )
+        };
 
         // Re-open the symmetric RTP address learning window.
         // After rekey, the remote peer may change its NAT binding, so we need

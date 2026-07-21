@@ -373,7 +373,20 @@ pub fn generate_sdp_offer(
     crypto: Option<&SdpCrypto>,
     session_id: u64,
 ) -> String {
-    generate_sdp(local_addr, rtp_port, codecs, crypto, session_id)
+    generate_sdp(local_addr, rtp_port, codecs, crypto, session_id, false)
+}
+
+/// Generate an opportunistic-SRTP offer (RFC 8643): advertise RTP/AVP while
+/// including SDES keying material, allowing the answerer to select either
+/// SRTP (by returning a crypto attribute) or plain RTP (by omitting it).
+pub fn generate_osrtp_sdp_offer(
+    local_addr: SocketAddr,
+    rtp_port: u16,
+    codecs: &[&SdpCodec],
+    crypto: &SdpCrypto,
+    session_id: u64,
+) -> String {
+    generate_sdp(local_addr, rtp_port, codecs, Some(crypto), session_id, true)
 }
 
 /// Generate an SDP answer for a plain RTP endpoint
@@ -384,7 +397,7 @@ pub fn generate_sdp_answer(
     crypto: Option<&SdpCrypto>,
     session_id: u64,
 ) -> String {
-    generate_sdp(local_addr, rtp_port, codecs, crypto, session_id)
+    generate_sdp(local_addr, rtp_port, codecs, crypto, session_id, false)
 }
 
 fn generate_sdp(
@@ -393,10 +406,11 @@ fn generate_sdp(
     codecs: &[&SdpCodec],
     crypto: Option<&SdpCrypto>,
     session_id: u64,
+    use_rtp_avp_profile: bool,
 ) -> String {
     let ip = local_addr.ip();
     let ip_ver = if ip.is_ipv4() { "IP4" } else { "IP6" };
-    let proto = if crypto.is_some() {
+    let proto = if crypto.is_some() && !use_rtp_avp_profile {
         "RTP/SAVP"
     } else {
         "RTP/AVP"

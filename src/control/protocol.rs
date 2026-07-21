@@ -179,6 +179,8 @@ pub struct EndpointCreateOfferParams {
     #[serde(default)]
     pub srtp: bool,
     #[serde(default)]
+    pub srtp_optional: bool,
+    #[serde(default)]
     pub codecs: Option<Vec<String>>,
 }
 
@@ -194,6 +196,8 @@ pub struct RtpCreateOfferParams {
     pub direction: EndpointDirection,
     #[serde(default)]
     pub srtp: bool,
+    #[serde(default)]
+    pub srtp_optional: bool,
     #[serde(default)]
     pub codecs: Option<Vec<String>>,
 }
@@ -979,6 +983,16 @@ mod tests {
         let json = r#"{"source":"test.wav"}"#;
         let params: EndpointCreateWithFileParams = serde_json::from_str(json).unwrap();
         assert!(!params.shared);
+    }
+
+    #[test]
+    fn rtp_create_offer_params_support_optional_srtp() {
+        let params: RtpCreateOfferParams = serde_json::from_value(json!({
+            "srtp_optional": true
+        }))
+        .unwrap();
+        assert!(!params.srtp);
+        assert!(params.srtp_optional);
     }
 
     #[test]

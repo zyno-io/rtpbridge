@@ -12,6 +12,8 @@ a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:<base64-key>
 
 When accepting an offer with `a=crypto`, rtpbridge generates an independent TX key for the SDP answer. The offerer's key is used only for the RX (decrypt) direction to prevent keystream reuse between directions.
 
+For carrier trunks where encryption is preferred but not universally supported, `srtp_optional: true` generates an RFC 8643 opportunistic-SRTP offer: `RTP/AVP` with an `a=crypto` attribute. An answer that returns crypto uses SRTP; an answer that omits crypto selects plain RTP and rtpbridge removes the provisional transmit crypto context. A strict `srtp: true` offer rejects a plaintext answer instead of establishing one-way media. `srtp` and `srtp_optional` are mutually exclusive.
+
 ## Cipher Suite
 
 Only `AES_CM_128_HMAC_SHA1_80` is supported:

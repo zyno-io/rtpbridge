@@ -393,7 +393,7 @@ async fn test_accept_answer_rejects_address_family_flip() {
         pair,
         "127.0.0.1".parse().unwrap(),
         &[sdp::CODEC_PCMU],
-        false,
+        RtpMediaSecurity::PlainRtp,
         tx,
     )
     .unwrap();
@@ -523,7 +523,7 @@ async fn test_accept_answer_applies_initial_remote_direction_in_auto_mode() {
         pair,
         "127.0.0.1".parse().unwrap(),
         &codecs,
-        false,
+        RtpMediaSecurity::PlainRtp,
         tx,
     )
     .unwrap();
@@ -613,7 +613,7 @@ async fn test_update_remote_sdp_preserves_codecs() {
 
 #[tokio::test]
 async fn test_update_remote_sdp_resets_addr_lock() {
-    let pool = crate::net::socket_pool::SocketPool::new("127.0.0.1".parse().unwrap(), 51600, 51700)
+    let pool = crate::net::socket_pool::SocketPool::new("127.0.0.1".parse().unwrap(), 55100, 55200)
         .unwrap();
     let pair = pool.allocate_pair().await.unwrap();
     let mut ep = RtpEndpoint::new(EndpointId::new_v4(), EndpointDirection::SendRecv, pair);
@@ -948,6 +948,113 @@ fn make_savp_sdp(port: u16, key_b64: &str) -> String {
     )
 }
 
+#[tokio::test]
+async fn test_accept_answer_rejects_plain_rtp_downgrade_from_srtp_offer() {
+    let pool = crate::net::socket_pool::SocketPool::new("127.0.0.1".parse().unwrap(), 51600, 51700)
+        .unwrap();
+    let pair = pool.allocate_pair().await.unwrap();
+    let (mut ep, _) = RtpEndpoint::create_offer(
+        EndpointId::new_v4(),
+        EndpointDirection::SendRecv,
+        pair,
+        "127.0.0.1".parse().unwrap(),
+        &[
+            crate::media::sdp::CODEC_PCMU,
+            crate::media::sdp::CODEC_TELEPHONE_EVENT,
+        ],
+        RtpMediaSecurity::Srtp,
+        tokio::sync::mpsc::channel(1).0,
+    )
+    .unwrap();
+
+    let plain_answer = "v=0\r\n\
+        o=- 254709 865470 IN IP4 208.69.81.90\r\n\
+        s=-\r\n\
+        c=IN IP4 208.69.81.90\r\n\
+        t=0 0\r\n\
+        m=audio 45502 RTP/AVP 0 101\r\n\
+        a=rtpmap:101 telephone-event/8000\r\n\
+        a=fmtp:101 0-15\r\n\
+        a=ptime:20\r\n";
+
+    let err = ep.accept_answer(plain_answer).unwrap_err();
+    assert!(
+        err.to_string().contains("offered SRTP, answered RTP"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(ep.state, EndpointState::Connecting);
+    assert!(ep.remote_rtp_addr.is_none());
+}
+
+#[tokio::test]
+async fn test_accept_answer_rejects_unoffered_srtp() {
+    let pool = crate::net::socket_pool::SocketPool::new("127.0.0.1".parse().unwrap(), 55200, 55300)
+        .unwrap();
+    let pair = pool.allocate_pair().await.unwrap();
+    let (mut ep, _) = RtpEndpoint::create_offer(
+        EndpointId::new_v4(),
+        EndpointDirection::SendRecv,
+        pair,
+        "127.0.0.1".parse().unwrap(),
+        &[crate::media::sdp::CODEC_PCMU],
+        RtpMediaSecurity::PlainRtp,
+        tokio::sync::mpsc::channel(1).0,
+    )
+    .unwrap();
+
+    let err = ep
+        .accept_answer(&make_savp_sdp(
+            45502,
+            "E4peZWnTvtquGbT3QN3ZJOM8i0Q2zNLc55bTN2VW",
+        ))
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("offered RTP, answered SRTP"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(ep.state, EndpointState::Connecting);
+    assert!(ep.remote_rtp_addr.is_none());
+}
+
+#[tokio::test]
+async fn test_accept_answer_allows_plain_rtp_for_osrtp_offer() {
+    let pool = crate::net::socket_pool::SocketPool::new("127.0.0.1".parse().unwrap(), 55300, 55400)
+        .unwrap();
+    let pair = pool.allocate_pair().await.unwrap();
+    let (mut ep, offer) = RtpEndpoint::create_offer(
+        EndpointId::new_v4(),
+        EndpointDirection::SendRecv,
+        pair,
+        "127.0.0.1".parse().unwrap(),
+        &[
+            crate::media::sdp::CODEC_PCMU,
+            crate::media::sdp::CODEC_TELEPHONE_EVENT,
+        ],
+        RtpMediaSecurity::OptionalSrtp,
+        tokio::sync::mpsc::channel(1).0,
+    )
+    .unwrap();
+
+    assert!(offer.contains("m=audio ") && offer.contains(" RTP/AVP 0 101"));
+    assert!(offer.contains("a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:"));
+
+    let plain_answer = "v=0\r\n\
+        o=- 254709 865470 IN IP4 208.69.81.90\r\n\
+        s=-\r\n\
+        c=IN IP4 208.69.81.90\r\n\
+        t=0 0\r\n\
+        m=audio 45502 RTP/AVP 0 101\r\n\
+        a=rtpmap:101 telephone-event/8000\r\n\
+        a=fmtp:101 0-15\r\n\
+        a=ptime:20\r\n";
+
+    ep.accept_answer(plain_answer).unwrap();
+    assert_eq!(ep.state, EndpointState::Connected);
+    assert!(ep.srtp_tx.is_none());
+    assert!(ep.srtcp_tx.is_none());
+    assert!(!ep.has_srtp());
+}
+
 /// A hold/unhold re-INVITE that carries the same SRTP crypto line as the initial
 /// answer must NOT trigger a rekey: resetting the SRTP RX context discards the
 /// running rollover counter and produces garbled/static audio for ~5s while the
@@ -958,14 +1065,19 @@ async fn test_update_remote_sdp_same_srtp_key_skips_rekey() {
     let pool = crate::net::socket_pool::SocketPool::new("127.0.0.1".parse().unwrap(), 51700, 51800)
         .unwrap();
     let pair = pool.allocate_pair().await.unwrap();
-    let mut ep = RtpEndpoint::new(EndpointId::new_v4(), EndpointDirection::SendRecv, pair);
-
-    // Seed the offered codec set so accept_answer's intersect-with-offer logic
-    // populates codecs/srtp_rx.
-    ep.codecs = vec![
-        crate::media::sdp::CODEC_PCMU,
-        crate::media::sdp::CODEC_TELEPHONE_EVENT,
-    ];
+    let (mut ep, _) = RtpEndpoint::create_offer(
+        EndpointId::new_v4(),
+        EndpointDirection::SendRecv,
+        pair,
+        "127.0.0.1".parse().unwrap(),
+        &[
+            crate::media::sdp::CODEC_PCMU,
+            crate::media::sdp::CODEC_TELEPHONE_EVENT,
+        ],
+        RtpMediaSecurity::Srtp,
+        tokio::sync::mpsc::channel(1).0,
+    )
+    .unwrap();
 
     let key = "E4peZWnTvtquGbT3QN3ZJOM8i0Q2zNLc55bTN2VW";
     ep.accept_answer(&make_savp_sdp(30000, key)).unwrap();
@@ -1012,12 +1124,19 @@ async fn test_update_remote_sdp_different_srtp_key_triggers_rekey() {
     let pool = crate::net::socket_pool::SocketPool::new("127.0.0.1".parse().unwrap(), 51800, 51900)
         .unwrap();
     let pair = pool.allocate_pair().await.unwrap();
-    let mut ep = RtpEndpoint::new(EndpointId::new_v4(), EndpointDirection::SendRecv, pair);
-
-    ep.codecs = vec![
-        crate::media::sdp::CODEC_PCMU,
-        crate::media::sdp::CODEC_TELEPHONE_EVENT,
-    ];
+    let (mut ep, _) = RtpEndpoint::create_offer(
+        EndpointId::new_v4(),
+        EndpointDirection::SendRecv,
+        pair,
+        "127.0.0.1".parse().unwrap(),
+        &[
+            crate::media::sdp::CODEC_PCMU,
+            crate::media::sdp::CODEC_TELEPHONE_EVENT,
+        ],
+        RtpMediaSecurity::Srtp,
+        tokio::sync::mpsc::channel(1).0,
+    )
+    .unwrap();
 
     let key1 = "E4peZWnTvtquGbT3QN3ZJOM8i0Q2zNLc55bTN2VW";
     let key2 = "yyuehWOy8nibRn+adLgDP5fiaZ61fEw7RuxBimMr";

@@ -26,3 +26,8 @@ multiple-versions = "warn"
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+allow-git = [
+    # Re-nomination support is pinned to an immutable revision of our str0m
+    # fork until the upstream change is released.
+    "https://github.com/zyno-io/str0m",
+]

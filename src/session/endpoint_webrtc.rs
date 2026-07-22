@@ -13,7 +13,7 @@ use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig}
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use super::endpoint::{EndpointConfig, InboundPacket, RoutedRtpPacket};
 use super::stats::{EndpointStats, RawRecvCounters};
@@ -85,6 +85,11 @@ pub struct WebRtcEndpoint {
     /// Last destination str0m emitted a transmit to once ICE was nominated.
     /// Cleared on disconnect.
     pub remote_addr: Option<SocketAddr>,
+    /// Experiment-only single-path fault injector. Absent unless the binary is
+    /// built with the re-nomination feature and the explicit environment
+    /// variable is set.
+    #[cfg(feature = "legacy-ice-renomination-experiment")]
+    renomination_path_fault: Option<RenominationPathFault>,
     /// Mid for the audio media line (set after SDP negotiation)
     pub audio_mid: Option<Mid>,
     /// Destination-owned outbound RTP sequence number. str0m owns the outgoing
@@ -158,6 +163,91 @@ pub struct WebRtcEndpoint {
     /// endpoint's recv task is wedged — died, or never started — while the
     /// endpoint was still active.
     recv_dead_reported: bool,
+}
+
+#[cfg(feature = "legacy-ice-renomination-experiment")]
+struct RenominationPathFault {
+    delay: Duration,
+    first_remote: Option<SocketAddr>,
+    activate_at: Option<Instant>,
+    activated: bool,
+    replacement_observed: bool,
+}
+
+#[cfg(feature = "legacy-ice-renomination-experiment")]
+impl RenominationPathFault {
+    fn from_environment() -> Option<Self> {
+        let raw = std::env::var("RTPBRIDGE_RENOMINATION_DROP_FIRST_PATH_AFTER_MS").ok()?;
+        let millis = match raw.parse::<u64>() {
+            Ok(value) if value > 0 => value,
+            _ => {
+                warn!(
+                    value = %raw,
+                    "ignoring invalid RTPBRIDGE_RENOMINATION_DROP_FIRST_PATH_AFTER_MS"
+                );
+                return None;
+            }
+        };
+
+        Some(Self {
+            delay: Duration::from_millis(millis),
+            first_remote: None,
+            activate_at: None,
+            activated: false,
+            replacement_observed: false,
+        })
+    }
+
+    fn observe_selected_pair(
+        &mut self,
+        endpoint_id: EndpointId,
+        local: SocketAddr,
+        remote: SocketAddr,
+        now: Instant,
+    ) {
+        match self.first_remote {
+            None => {
+                self.first_remote = Some(remote);
+                self.activate_at = Some(now + self.delay);
+                info!(
+                    endpoint_id = %endpoint_id,
+                    local = %local,
+                    remote = %remote,
+                    delay_ms = self.delay.as_millis(),
+                    "armed experiment fault for first selected ICE path"
+                );
+            }
+            Some(first_remote) if remote != first_remote && !self.replacement_observed => {
+                self.replacement_observed = true;
+                info!(
+                    endpoint_id = %endpoint_id,
+                    local = %local,
+                    old_remote = %first_remote,
+                    new_remote = %remote,
+                    "experiment observed replacement selected ICE path"
+                );
+            }
+            Some(_) => {}
+        }
+    }
+
+    fn should_drop(&mut self, endpoint_id: EndpointId, source: SocketAddr, now: Instant) -> bool {
+        if self.first_remote != Some(source)
+            || self.activate_at.is_none_or(|activate_at| now < activate_at)
+        {
+            return false;
+        }
+
+        if !self.activated {
+            self.activated = true;
+            warn!(
+                endpoint_id = %endpoint_id,
+                remote = %source,
+                "experiment fault activated; dropping first selected ICE path"
+            );
+        }
+        true
+    }
 }
 
 fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
@@ -254,6 +344,7 @@ impl WebRtcEndpoint {
         config: EndpointConfig,
         bind_addrs: &[SocketAddr],
         metrics: Arc<Metrics>,
+        legacy_ice_renomination: bool,
     ) -> anyhow::Result<Self> {
         // WebRTC endpoints use OS-assigned ephemeral ports (not rtp_port_range).
         // ICE negotiates connectivity dynamically, so fixed port ranges don't apply.
@@ -270,14 +361,21 @@ impl WebRtcEndpoint {
         }
         let local_addr = sockets[0].0;
 
-        let rtc = RtcConfig::new()
+        let rtc_config = RtcConfig::new()
             .set_ice_lite(true)
             .set_rtp_mode(true)
             // Emit periodic stats so we can surface RTT for the WebRTC leg.
             // str0m owns RTCP here, so RTT only reaches us via these events
             // (see `peer_rtt_ms` and the stats arms in the event loop).
             .set_stats_interval(Some(Duration::from_secs(1)))
-            .build(Instant::now());
+            .set_legacy_ice_renomination(legacy_ice_renomination);
+
+        let rtc = rtc_config.build(Instant::now());
+
+        #[cfg(feature = "legacy-ice-renomination-experiment")]
+        let renomination_path_fault = legacy_ice_renomination
+            .then(RenominationPathFault::from_environment)
+            .flatten();
 
         Ok(Self {
             id,
@@ -292,6 +390,8 @@ impl WebRtcEndpoint {
             sockets,
             local_addr,
             remote_addr: None,
+            #[cfg(feature = "legacy-ice-renomination-experiment")]
+            renomination_path_fault,
             audio_mid: None,
             outbound_seq_no: (rand::random::<u16>() as u64).into(),
             last_outbound_ts: None,
@@ -567,17 +667,20 @@ impl WebRtcEndpoint {
         }
     }
 
-    /// Create from a remote SDP offer, returning the SDP answer string
-    pub async fn from_offer(
+    /// Create from a remote SDP offer with the runtime-gated legacy libwebrtc
+    /// re-nomination capability.
+    pub async fn from_offer_with_legacy_ice_renomination(
         id: EndpointId,
         direction: EndpointDirection,
         offer_sdp: &str,
         bind_addrs: &[SocketAddr],
         packet_tx: mpsc::Sender<InboundPacket>,
         metrics: Arc<Metrics>,
+        legacy_ice_renomination: bool,
     ) -> anyhow::Result<(Self, String)> {
         let config = EndpointConfig { direction };
-        let mut endpoint = Self::new_with_socket(id, config, bind_addrs, metrics).await?;
+        let mut endpoint =
+            Self::new_with_socket(id, config, bind_addrs, metrics, legacy_ice_renomination).await?;
 
         // One ICE host candidate per bound socket (IPv4 and/or IPv6).
         endpoint.add_host_candidates()?;
@@ -602,6 +705,7 @@ impl WebRtcEndpoint {
     }
 
     /// Create an SDP offer for a new outgoing endpoint
+    #[cfg(test)]
     pub async fn create_offer(
         id: EndpointId,
         direction: EndpointDirection,
@@ -609,8 +713,25 @@ impl WebRtcEndpoint {
         packet_tx: mpsc::Sender<InboundPacket>,
         metrics: Arc<Metrics>,
     ) -> anyhow::Result<(Self, String)> {
+        Self::create_offer_with_legacy_ice_renomination(
+            id, direction, bind_addrs, packet_tx, metrics, false,
+        )
+        .await
+    }
+
+    /// Create an SDP offer with the runtime-gated legacy libwebrtc
+    /// re-nomination capability.
+    pub async fn create_offer_with_legacy_ice_renomination(
+        id: EndpointId,
+        direction: EndpointDirection,
+        bind_addrs: &[SocketAddr],
+        packet_tx: mpsc::Sender<InboundPacket>,
+        metrics: Arc<Metrics>,
+        legacy_ice_renomination: bool,
+    ) -> anyhow::Result<(Self, String)> {
         let config = EndpointConfig { direction };
-        let mut endpoint = Self::new_with_socket(id, config, bind_addrs, metrics).await?;
+        let mut endpoint =
+            Self::new_with_socket(id, config, bind_addrs, metrics, legacy_ice_renomination).await?;
 
         // One ICE host candidate per bound socket (IPv4 and/or IPv6).
         endpoint.add_host_candidates()?;
@@ -740,6 +861,15 @@ impl WebRtcEndpoint {
         data: &[u8],
         now: Instant,
     ) -> anyhow::Result<()> {
+        #[cfg(feature = "legacy-ice-renomination-experiment")]
+        if self
+            .renomination_path_fault
+            .as_mut()
+            .is_some_and(|fault| fault.should_drop(self.id, source, now))
+        {
+            return Ok(());
+        }
+
         let receive = Receive::new(Protocol::Udp, source, local, data)?;
         let input = Input::Receive(now, receive);
         self.rtc.handle_input(input)?;
@@ -782,13 +912,41 @@ impl WebRtcEndpoint {
         let mut events = Vec::new();
 
         loop {
-            match self.rtc.poll_output()? {
+            let output = self.rtc.poll_output()?;
+
+            if let Some((local, remote)) = self.rtc.selected_ice_candidate_pair() {
+                if let Some(previous_remote) = self.remote_addr
+                    && previous_remote != remote
+                {
+                    self.metrics.webrtc_ice_pair_switches.inc();
+                    info!(
+                        endpoint_id = %self.id,
+                        local = %local,
+                        old_remote = %previous_remote,
+                        new_remote = %remote,
+                        "WebRTC selected ICE pair changed"
+                    );
+                }
+                self.remote_addr = Some(remote);
+                #[cfg(feature = "legacy-ice-renomination-experiment")]
+                if let Some(fault) = &mut self.renomination_path_fault {
+                    fault.observe_selected_pair(self.id, local, remote, Instant::now());
+                }
+            }
+
+            match output {
                 Output::Timeout(when) => {
                     return Ok((events, when));
                 }
                 Output::Transmit(transmit) => {
-                    if self.state == EndpointState::Connected {
+                    if self.state == EndpointState::Connected && self.remote_addr.is_none() {
                         self.remote_addr = Some(transmit.destination);
+                    }
+                    #[cfg(feature = "legacy-ice-renomination-experiment")]
+                    if self.renomination_path_fault.as_mut().is_some_and(|fault| {
+                        fault.should_drop(self.id, transmit.destination, Instant::now())
+                    }) {
+                        continue;
                     }
                     // Route by `transmit.source`: str0m sets it to the local
                     // candidate base (== one of our bound socket addresses), so

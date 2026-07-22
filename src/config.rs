@@ -68,6 +68,10 @@ pub struct Cli {
     #[arg(short, long)]
     pub config: Option<PathBuf>,
 
+    /// Advertise legacy libwebrtc ICE re-nomination for WebRTC endpoints
+    #[arg(long)]
+    pub legacy_ice_renomination: bool,
+
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, default_value = "info")]
     pub log_level: String,
@@ -148,6 +152,10 @@ pub struct Config {
     /// no RTP packets are received from a remote endpoint for this duration.
     pub media_timeout_secs: u64,
 
+    /// Advertise and accept libwebrtc's legacy ICE re-nomination extension.
+    /// Disabled by default; ICE restart remains the recovery fallback.
+    pub legacy_ice_renomination: bool,
+
     /// Maximum concurrent WebSocket connections (0 = unlimited)
     pub max_connections: usize,
 
@@ -211,6 +219,7 @@ impl Default for Config {
             session_idle_timeout_secs: 0,
             empty_session_timeout_secs: 0,
             media_timeout_secs: 5,
+            legacy_ice_renomination: false,
             max_connections: 1000,
             ws_ping_interval_secs: 30,
             event_channel_size: 256,
@@ -252,6 +261,9 @@ impl Config {
         }
         if let Some(ips) = &cli.media_ip {
             config.media_ip = ips.clone();
+        }
+        if matches.value_source("legacy_ice_renomination") == Some(ValueSource::CommandLine) {
+            config.legacy_ice_renomination = cli.legacy_ice_renomination;
         }
         if matches.value_source("log_level") == Some(ValueSource::CommandLine)
             || cli.config.is_none()
@@ -489,6 +501,7 @@ mod tests {
         assert_eq!(config.cache_cleanup_interval_secs, 300);
         assert_eq!(config.max_sessions, 10000);
         assert_eq!(config.max_endpoints_per_session, 20);
+        assert!(!config.legacy_ice_renomination);
     }
 
     #[test]
@@ -528,6 +541,16 @@ mod tests {
         );
         assert_eq!(config.rtp_port_range, (30000, 39999));
         assert_eq!(config.max_sessions, 10000);
+        assert!(!config.legacy_ice_renomination);
+    }
+
+    #[test]
+    fn test_legacy_ice_renomination_config_and_cli_enablement() {
+        let config: Config = toml::from_str("legacy_ice_renomination = true").unwrap();
+        assert!(config.legacy_ice_renomination);
+
+        let cli = Cli::try_parse_from(["rtpbridge", "--legacy-ice-renomination"]).unwrap();
+        assert!(cli.legacy_ice_renomination);
     }
 
     #[test]
@@ -542,6 +565,7 @@ mod tests {
             listen: vec!["127.0.0.1:9100".parse().unwrap()],
             media_ip: Some(vec!["192.168.1.1".parse().unwrap()]),
             config: Some(tmp.clone()),
+            legacy_ice_renomination: false,
             log_level: "debug".to_string(),
         };
         // Simulate explicit CLI args using matches
@@ -658,6 +682,7 @@ mod tests {
             listen: vec!["0.0.0.0:9100".parse().unwrap()],
             media_ip: None,
             config: Some(tmp.clone()),
+            legacy_ice_renomination: false,
             log_level: "info".to_string(),
         };
         let matches =

@@ -39,6 +39,7 @@ async fn main() -> anyhow::Result<()> {
         version = version::BUILD_VERSION,
         listen = ?config.listen,
         media_ip = ?config.media_ip,
+        legacy_ice_renomination = config.legacy_ice_renomination,
         "rtpbridge starting"
     );
 
@@ -130,6 +131,7 @@ async fn main() -> anyhow::Result<()> {
         config.session_idle_timeout_secs,
         config.empty_session_timeout_secs,
         config.media_timeout_secs,
+        config.legacy_ice_renomination,
         config.transcode_cache_size,
         config.media_dir.clone(),
         file_cache,

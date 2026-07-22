@@ -273,6 +273,7 @@ struct SessionState {
     file_cache: Arc<crate::playback::file_cache::FileCache>,
     endpoint_count: Arc<std::sync::atomic::AtomicUsize>,
     max_endpoints: usize,
+    legacy_ice_renomination: bool,
     metrics: Arc<crate::metrics::Metrics>,
     cmd_tx: mpsc::Sender<SessionCommand>,
 
@@ -795,13 +796,14 @@ impl SessionState {
                 .ips()
                 .map(|ip| SocketAddr::new(ip, 0))
                 .collect();
-            let (ep, answer) = WebRtcEndpoint::from_offer(
+            let (ep, answer) = WebRtcEndpoint::from_offer_with_legacy_ice_renomination(
                 id,
                 direction,
                 sdp_str,
                 &bind_addrs,
                 packet_tx.clone(),
                 self.metrics.clone(),
+                self.legacy_ice_renomination,
             )
             .await?;
             info!(
@@ -871,12 +873,13 @@ impl SessionState {
                     .ips()
                     .map(|ip| SocketAddr::new(ip, 0))
                     .collect();
-                let (ep, offer) = WebRtcEndpoint::create_offer(
+                let (ep, offer) = WebRtcEndpoint::create_offer_with_legacy_ice_renomination(
                     id,
                     direction,
                     &bind_addrs,
                     packet_tx.clone(),
                     self.metrics.clone(),
+                    self.legacy_ice_renomination,
                 )
                 .await?;
                 info!(
@@ -2555,6 +2558,7 @@ pub async fn run_media_session(
     session_idle_timeout_secs: u64,
     empty_session_timeout_secs: u64,
     media_timeout_secs: u64,
+    legacy_ice_renomination: bool,
     transcode_cache_size: usize,
     metrics: Arc<crate::metrics::Metrics>,
     shared_playback: Arc<crate::playback::shared_playback::SharedPlaybackManager>,
@@ -2586,6 +2590,7 @@ pub async fn run_media_session(
         file_cache,
         endpoint_count,
         max_endpoints,
+        legacy_ice_renomination,
         metrics: Arc::clone(&metrics),
         shared_playback,
         cmd_tx,

@@ -1202,7 +1202,7 @@ checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
 [[package]]
 name = "is"
 version = "0.10.0"
-source = "git+https://github.com/zyno-io/str0m?rev=243581d4acb7d996f210c616804b4a9426371180#243581d4acb7d996f210c616804b4a9426371180"
+source = "git+https://github.com/zyno-io/str0m?rev=750888c45c338bcbad64c51f009417b0bf459bd1#750888c45c338bcbad64c51f009417b0bf459bd1"
 dependencies = [
  "crc",
  "serde",
@@ -2379,7 +2379,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "str0m"
 version = "0.21.0"
-source = "git+https://github.com/zyno-io/str0m?rev=243581d4acb7d996f210c616804b4a9426371180#243581d4acb7d996f210c616804b4a9426371180"
+source = "git+https://github.com/zyno-io/str0m?rev=750888c45c338bcbad64c51f009417b0bf459bd1#750888c45c338bcbad64c51f009417b0bf459bd1"
 dependencies = [
  "arrayvec",
  "base64ct",
@@ -2399,7 +2399,7 @@ dependencies = [
 [[package]]
 name = "str0m-openssl"
 version = "0.5.0"
-source = "git+https://github.com/zyno-io/str0m?rev=243581d4acb7d996f210c616804b4a9426371180#243581d4acb7d996f210c616804b4a9426371180"
+source = "git+https://github.com/zyno-io/str0m?rev=750888c45c338bcbad64c51f009417b0bf459bd1#750888c45c338bcbad64c51f009417b0bf459bd1"
 dependencies = [
  "libc",
  "openssl",
@@ -2411,7 +2411,7 @@ dependencies = [
 [[package]]
 name = "str0m-proto"
 version = "0.6.0"
-source = "git+https://github.com/zyno-io/str0m?rev=243581d4acb7d996f210c616804b4a9426371180#243581d4acb7d996f210c616804b4a9426371180"
+source = "git+https://github.com/zyno-io/str0m?rev=750888c45c338bcbad64c51f009417b0bf459bd1#750888c45c338bcbad64c51f009417b0bf459bd1"
 dependencies = [
  "base64ct",
  "dimpl",

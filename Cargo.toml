@@ -40,7 +40,7 @@ rand = "0.10"
 # WebRTC. The fork is pinned to an immutable revision that adds the legacy
 # libwebrtc ICE re-nomination extension; runtime advertisement remains off by
 # default in rtpbridge.
-str0m = { version = "0.21", git = "https://github.com/zyno-io/str0m", rev = "243581d4acb7d996f210c616804b4a9426371180", default-features = false, features = ["openssl", "vendored"] }
+str0m = { version = "0.21", git = "https://github.com/zyno-io/str0m", rev = "750888c45c338bcbad64c51f009417b0bf459bd1", default-features = false, features = ["openssl", "vendored"] }
 
 # Codecs
 xlaw = "0.0.3"
@@ -86,7 +86,7 @@ legacy-ice-renomination-experiment = []
 [patch.crates-io]
 # str0m's internal ICE crate is independently published, so pin it to the same
 # fork revision as str0m to keep the protocol implementation atomic.
-is = { git = "https://github.com/zyno-io/str0m", rev = "243581d4acb7d996f210c616804b4a9426371180" }
+is = { git = "https://github.com/zyno-io/str0m", rev = "750888c45c338bcbad64c51f009417b0bf459bd1" }
 
 [dependencies.openssl]
 version = "0.10"

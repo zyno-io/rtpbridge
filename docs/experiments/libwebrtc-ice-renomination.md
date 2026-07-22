@@ -73,7 +73,10 @@ existing username, ICE generation, role, and message-integrity checks. Within
 one ICE generation, only a value greater than the highest authenticated value
 already accepted can replace the nominated send pair. Zero, stale, duplicate,
 malformed, wrong-generation, and unauthenticated values cannot change routing.
-An ICE restart resets the remote nomination sequence.
+Pair pruning and later connectivity events cannot select an older nomination;
+if the newest nominated pair disappears, the existing recovery ladder must wait
+for a newer nomination or perform an ICE restart. An ICE restart resets the
+remote nomination sequence.
 
 Ordinary `USE-CANDIDATE` remains the baseline for peers that do not negotiate
 the extension. Merely adding the SDP token is forbidden: after negotiation,
@@ -117,7 +120,7 @@ exist to measure a safe operating envelope. No tested value is a proposed
 production default yet.
 
 The patched str0m and `is` crates are pinned to immutable fork commit
-`243581d4acb7d996f210c616804b4a9426371180`. A normal build contains the
+`750888c45c338bcbad64c51f009417b0bf459bd1`. A normal build contains the
 capability but leaves it disabled. Enable it in a staging configuration with:
 
 ```toml

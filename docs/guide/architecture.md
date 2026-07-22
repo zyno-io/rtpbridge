@@ -56,8 +56,11 @@ wire protocol.
 When enabled, a newer authenticated nomination may change only the selected
 remote transport address. The WebRTC endpoint, ICE generation, DTLS and SRTP
 state, RTP sequence/timestamp continuity, and SSRCs remain unchanged. The
-authoritative selected-pair state updates endpoint diagnostics and increments
-`rtpbridge_webrtc_ice_pair_switches_total` whenever an established pair changes.
+accepted nomination sequence is monotonic for an ICE generation: pruning a
+pair or processing later connectivity events cannot reactivate a pair carrying
+an older nomination. The authoritative selected-pair state updates endpoint
+diagnostics and increments `rtpbridge_webrtc_ice_pair_switches_total` whenever
+an established pair changes.
 The existing ICE-restart RPC remains the fallback if media does not recover.
 
 The exact M144 desktop protocol/media result and the remaining real-device

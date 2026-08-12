@@ -441,6 +441,7 @@ fn request_fields(method: &str) -> &'static [&'static str] {
         "endpoint.update_direction" => &["endpoint_id", "direction"],
         "endpoint.update_remote_sdp" | "endpoint.rtp.reinvite" => &["endpoint_id", "sdp"],
         "stats.subscribe" => &["interval_ms", "include_diagnostics"],
+        "stats.snapshot" => &["include_diagnostics"],
         "endpoint.transfer" => &["endpoint_id", "target_session_id"],
         "session.bridge" => &["target_session_id", "direction"],
         "session.create" | "session.destroy" | "session.info" | "session.list" | "server.info"
@@ -478,6 +479,7 @@ fn response_fields(method: &str) -> &'static [&'static str] {
         "endpoint.create_websocket" => &["endpoint_id", "connect_token"],
         "recording.start" => &["recording_id"],
         "recording.stop" => &["file_path", "duration_ms", "packets", "dropped_packets"],
+        "stats.snapshot" => &["endpoints"],
         "endpoint.transfer" => &["endpoint_id", "target_session_id"],
         "session.bridge" => &["endpoint_id", "target_endpoint_id"],
         _ => &[],

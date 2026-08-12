@@ -124,6 +124,75 @@ fn test_rr_wrong_ssrc_ignored() {
         stats.rtt_ms.is_none(),
         "RTT should not be computed for wrong SSRC"
     );
+    assert!(
+        stats.remote_receiver_report().is_none(),
+        "a report for a different outbound SSRC must not affect egress quality"
+    );
+}
+
+#[test]
+fn test_receiver_report_tracks_signed_egress_quality_and_resets_generation() {
+    let our_ssrc = 0x12345678;
+    let mut stats = RtcpStats::new();
+    let report = ReportBlock {
+        ssrc: our_ssrc,
+        fraction_lost: 0,
+        cumulative_lost: -2,
+        highest_seq: 0x0001_0002,
+        jitter: 160,
+        last_sr: 0,
+        delay_since_last_sr: 0,
+    };
+
+    stats.process_rr(&report, our_ssrc);
+    let first = stats
+        .remote_receiver_report()
+        .expect("accepted report must be retained for outbound stats");
+    assert_eq!(first.packets_lost, -2);
+    assert_eq!(first.highest_sequence, 0x0001_0002);
+    assert_eq!(first.jitter, 160);
+    assert_eq!(first.generation, 0);
+    assert_eq!(first.count, 1);
+
+    stats.process_rr(&report, our_ssrc);
+    assert_eq!(
+        stats.remote_receiver_report().unwrap().count,
+        2,
+        "each accepted report advances the generation-local count"
+    );
+
+    stats.reset_remote_receiver_report();
+    assert!(stats.remote_receiver_report().is_none());
+
+    stats.process_rr(&report, our_ssrc);
+    let after_reset = stats.remote_receiver_report().unwrap();
+    assert_eq!(after_reset.generation, 1);
+    assert_eq!(after_reset.count, 1);
+}
+
+#[test]
+fn test_parse_rr_preserves_signed_cumulative_loss() {
+    // RFC 3550's cumulative loss is a signed 24-bit value. -2 is encoded as
+    // 0xff_ff_fe; parsing it as an unsigned integer would turn it into a
+    // misleading multi-million-packet loss total.
+    let data = [
+        0x81, RTCP_RR, 0x00, 0x07, // V=2, RC=1, one 32-byte RR packet
+        0x11, 0x22, 0x33, 0x44, // reporter SSRC
+        0x12, 0x34, 0x56, 0x78, // reported sender SSRC
+        0x00, // fraction lost
+        0xff, 0xff, 0xfe, // signed cumulative loss = -2
+        0x00, 0x01, 0x00, 0x02, // extended highest sequence
+        0x00, 0x00, 0x00, 0xa0, // jitter
+        0x00, 0x00, 0x00, 0x00, // LSR
+        0x00, 0x00, 0x00, 0x00, // DLSR
+    ];
+
+    let packets = parse_rtcp(&data);
+    let RtcpPacket::ReceiverReport(report) = &packets[0] else {
+        panic!("expected receiver report");
+    };
+    assert_eq!(report.report_blocks[0].cumulative_lost, -2);
+    assert_eq!(report.report_blocks[0].highest_seq, 0x0001_0002);
 }
 
 #[test]

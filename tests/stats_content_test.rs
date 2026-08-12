@@ -9,6 +9,41 @@ use helpers::test_rtp_peer::{TestRtpPeer, parse_rtp_addr_from_sdp};
 use helpers::test_server::TestServer;
 use helpers::timing;
 
+/// A synchronous snapshot is session-bound but intentionally independent from
+/// periodic `stats.subscribe` state, so terminal callers can capture a final
+/// compact sample without first waiting for a timer tick.
+#[tokio::test]
+async fn test_stats_snapshot_is_session_bound_without_subscription() {
+    let server = TestServer::start().await;
+    let mut client = TestControlClient::connect(&server.addr).await;
+
+    let no_session = client.request("stats.snapshot", json!({})).await;
+    assert_eq!(no_session["error"]["code"], "NO_SESSION");
+
+    client.request_ok("session.create", json!({})).await;
+    let snapshot = client.request_ok("stats.snapshot", json!({})).await;
+    assert!(
+        snapshot["endpoints"].is_array(),
+        "snapshot should return the same endpoints payload as a stats event: {snapshot}"
+    );
+    assert_eq!(snapshot["endpoints"].as_array().unwrap().len(), 0);
+
+    let omitted_params = client
+        .send_raw(r#"{"id":"stats-snapshot-no-params","method":"stats.snapshot"}"#)
+        .await;
+    assert!(
+        omitted_params["result"]["endpoints"].is_array(),
+        "omitted snapshot params should use default options: {omitted_params}"
+    );
+
+    let invalid_params = client
+        .request("stats.snapshot", json!({"include_diagnostics": "yes"}))
+        .await;
+    assert_eq!(invalid_params["error"]["code"], "INVALID_PARAMS");
+
+    client.request_ok("session.destroy", json!({})).await;
+}
+
 /// Test: stats event contains an `endpoints` array with entries that have
 /// non-zero `inbound.packets` and/or `outbound.packets` after media flows
 /// between two RTP endpoints.

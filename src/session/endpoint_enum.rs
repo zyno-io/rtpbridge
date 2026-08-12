@@ -12,6 +12,30 @@ use crate::control::protocol::{EndpointDirection, EndpointId, EndpointState};
 use crate::media::codec::AudioCodec;
 use crate::recording::meta::StreamDescriptor;
 use std::net::SocketAddr;
+use std::time::Instant;
+
+/// Source-aware RTT returned to control-plane stats consumers.
+#[derive(Debug, Clone)]
+pub struct EndpointRttObservation {
+    pub ms: f64,
+    pub observed_ms_ago: u64,
+    pub source: &'static str,
+}
+
+/// Latest receiver report about media rtpbridge sent to an endpoint.
+#[derive(Debug, Clone)]
+pub struct EndpointRemoteReceiverReport {
+    pub packets_lost: i64,
+    pub highest_sequence: u64,
+    pub jitter_ms: Option<f64>,
+    pub received_ms_ago: u64,
+    pub generation: u64,
+    pub count: u64,
+}
+
+fn elapsed_ms(instant: Instant) -> u64 {
+    instant.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
 
 /// Unified endpoint wrapping WebRTC, plain RTP, file playback, and bridge
 pub enum Endpoint {
@@ -196,14 +220,72 @@ impl Endpoint {
         }
     }
 
-    /// RTT in milliseconds. Plain RTP computes it from the remote's RR
-    /// (RFC 3550 §6.4.1); WebRTC surfaces str0m's stats RTT (`peer_rtt_ms`),
-    /// since str0m owns RTCP for those legs.
-    pub fn rtt_ms(&self) -> Option<f64> {
+    /// Latest RTT observation. Plain RTP derives it from a Receiver Report;
+    /// WebRTC retains the deterministic source selected from str0m's periodic
+    /// peer/media stats.
+    pub fn rtt_observation(&self) -> Option<EndpointRttObservation> {
         match self {
-            Endpoint::Rtp(ep) => ep.rtcp_stats.rtt_ms,
-            Endpoint::WebRtc(ep) => ep.peer_rtt_ms,
+            Endpoint::Rtp(ep) => {
+                ep.rtcp_stats
+                    .rtt_ms
+                    .zip(ep.rtcp_stats.rtt_observed_at)
+                    .map(|(ms, observed_at)| EndpointRttObservation {
+                        ms,
+                        observed_ms_ago: elapsed_ms(observed_at),
+                        source: "rtcp_receiver_report",
+                    })
+            }
+            Endpoint::WebRtc(ep) => ep
+                .rtt_observation
+                .map(|observation| EndpointRttObservation {
+                    ms: observation.ms,
+                    observed_ms_ago: elapsed_ms(observation.observed_at),
+                    source: observation.source.as_str(),
+                }),
             _ => None,
+        }
+    }
+
+    /// Compatibility helper for logging and existing call paths that only need
+    /// the RTT value. New protocol serialization should use
+    /// [`Self::rtt_observation`] so it includes age and source.
+    pub fn rtt_ms(&self) -> Option<f64> {
+        self.rtt_observation().map(|observation| observation.ms)
+    }
+
+    /// Latest remote receiver report for media rtpbridge sent through this
+    /// endpoint. The report never implies reception when absent; outbound RTP
+    /// counters remain bridge-write counters only.
+    pub fn remote_receiver_report(&self) -> Option<EndpointRemoteReceiverReport> {
+        match self {
+            Endpoint::Rtp(ep) => {
+                let report = ep.rtcp_stats.remote_receiver_report()?;
+                let clock_rate = ep.send_codec.as_ref().map(|codec| codec.clock_rate);
+                Some(EndpointRemoteReceiverReport {
+                    packets_lost: i64::from(report.packets_lost),
+                    highest_sequence: u64::from(report.highest_sequence),
+                    jitter_ms: clock_rate.map(|rate| report.jitter as f64 * 1000.0 / rate as f64),
+                    received_ms_ago: elapsed_ms(report.received_at),
+                    generation: report.generation,
+                    count: report.count,
+                })
+            }
+            Endpoint::WebRtc(ep) => {
+                let report = ep.remote_receiver_report.as_ref()?;
+                let clock_rate = ep.negotiated_codec().map(|codec| codec.clock_rate);
+                Some(EndpointRemoteReceiverReport {
+                    packets_lost: report.packets_lost,
+                    highest_sequence: report.highest_sequence,
+                    jitter_ms: clock_rate.map(|rate| report.jitter as f64 * 1000.0 / rate as f64),
+                    received_ms_ago: elapsed_ms(report.received_at),
+                    generation: report.generation,
+                    count: report.count,
+                })
+            }
+            Endpoint::File(_)
+            | Endpoint::Tone(_)
+            | Endpoint::Bridge(_)
+            | Endpoint::WebSocket(_) => None,
         }
     }
 

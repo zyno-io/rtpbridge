@@ -30,11 +30,28 @@ pub struct ReceiverReport {
 pub struct ReportBlock {
     pub ssrc: u32,
     pub fraction_lost: u8,
-    pub cumulative_lost: u32, // 24-bit
+    /// RFC 3550 encodes this as a signed 24-bit integer.
+    pub cumulative_lost: i32,
     pub highest_seq: u32,
     pub jitter: u32,
     pub last_sr: u32,
     pub delay_since_last_sr: u32,
+}
+
+/// The most recent receiver report about rtpbridge's outbound RTP stream.
+///
+/// The report is scoped to the current outbound receiver-report generation.
+/// A generation reset is deliberately explicit: an SSRC or outbound clock-rate
+/// change makes deltas across the old and new report streams meaningless.
+#[derive(Debug, Clone)]
+pub struct RemoteReceiverReport {
+    pub packets_lost: i32,
+    pub highest_sequence: u32,
+    /// Jitter in the RTP timestamp clock of the stream rtpbridge sent.
+    pub jitter: u32,
+    pub received_at: std::time::Instant,
+    pub generation: u64,
+    pub count: u64,
 }
 
 /// Statistics tracker for generating RTCP reports (RFC 3550 Appendix A.3)
@@ -74,6 +91,15 @@ pub struct RtcpStats {
 
     // Computed RTT from the remote's RR (RFC 3550 §6.4.1)
     pub rtt_ms: Option<f64>,
+    /// Instant at which `rtt_ms` was last accepted from a receiver report.
+    pub rtt_observed_at: Option<std::time::Instant>,
+
+    /// Latest receiver report about our outbound RTP stream. Kept separately
+    /// from receive-side RFC 3550 stats because it describes the far endpoint's
+    /// observation of rtpbridge egress, not rtpbridge ingress.
+    remote_receiver_report: Option<RemoteReceiverReport>,
+    remote_report_generation: u64,
+    remote_report_count: u64,
 
     // Source SSRC of the current stream generation. A mid-call SSRC change
     // (a hold/re-INVITE that restarts the RTP stream with a fresh SSRC and
@@ -111,6 +137,10 @@ impl RtcpStats {
             octets_sent: 0,
             our_last_sr_ntp_middle: 0,
             rtt_ms: None,
+            rtt_observed_at: None,
+            remote_receiver_report: None,
+            remote_report_generation: 0,
+            remote_report_count: 0,
             current_ssrc: None,
             lost_accumulated: 0,
         }
@@ -256,12 +286,24 @@ impl RtcpStats {
         self.last_sr_ssrc = Some(sr.ssrc);
     }
 
-    /// Process a Receiver Report block that references our SSRC.
-    /// Computes RTT from LSR/DLSR fields per RFC 3550 §6.4.1.
+    /// Process a Receiver Report block that references our current outbound
+    /// SSRC. The accepted block records far-end egress quality as well as RTT
+    /// when it references one of our Sender Reports.
     pub fn process_rr(&mut self, block: &ReportBlock, our_ssrc: u32) {
         if block.ssrc != our_ssrc {
             return;
         }
+
+        self.remote_report_count = self.remote_report_count.saturating_add(1);
+        self.remote_receiver_report = Some(RemoteReceiverReport {
+            packets_lost: block.cumulative_lost,
+            highest_sequence: block.highest_seq,
+            jitter: block.jitter,
+            received_at: std::time::Instant::now(),
+            generation: self.remote_report_generation,
+            count: self.remote_report_count,
+        });
+
         if block.last_sr == 0 {
             return; // remote hasn't received an SR from us yet
         }
@@ -285,7 +327,22 @@ impl RtcpStats {
         // Sanity: positive and < 10 seconds
         if (0.0..10000.0).contains(&rtt) {
             self.rtt_ms = Some(rtt);
+            self.rtt_observed_at = Some(std::time::Instant::now());
         }
+    }
+
+    /// Drop stale far-end report state when rtpbridge starts a new outbound RTP
+    /// report stream (for example, a sender SSRC or RTP clock-rate change).
+    /// Keeping the generation visible lets controllers detect the rebaseline
+    /// without crossing counters from incomparable streams.
+    pub fn reset_remote_receiver_report(&mut self) {
+        self.remote_report_generation = self.remote_report_generation.saturating_add(1);
+        self.remote_report_count = 0;
+        self.remote_receiver_report = None;
+    }
+
+    pub fn remote_receiver_report(&self) -> Option<&RemoteReceiverReport> {
+        self.remote_receiver_report.as_ref()
     }
 
     /// Record that we sent an SR with the given NTP timestamp.
@@ -532,7 +589,12 @@ fn parse_report_blocks(data: &[u8], count: u8) -> Vec<ReportBlock> {
         blocks.push(ReportBlock {
             ssrc: u32::from_be_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]),
             fraction_lost: data[off + 4],
-            cumulative_lost: u32::from_be_bytes([0, data[off + 5], data[off + 6], data[off + 7]]),
+            cumulative_lost: i32::from_be_bytes([
+                if data[off + 5] & 0x80 != 0 { 0xff } else { 0 },
+                data[off + 5],
+                data[off + 6],
+                data[off + 7],
+            ]),
             highest_seq: u32::from_be_bytes([
                 data[off + 8],
                 data[off + 9],

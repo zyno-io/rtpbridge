@@ -789,6 +789,35 @@ async fn test_handle_command_stats_subscribe_unsubscribe() {
 }
 
 #[tokio::test]
+async fn test_handle_command_stats_snapshot_is_available_without_subscription() {
+    let mut state = test_session_state();
+    let (packet_tx, _packet_rx) = mpsc::channel(16);
+
+    assert!(state.stats_interval.is_none());
+    let (reply_tx, reply_rx) = oneshot::channel();
+    state
+        .handle_command(
+            SessionCommand::StatsSnapshot {
+                reply: reply_tx,
+                include_diagnostics: false,
+            },
+            &packet_tx,
+        )
+        .await;
+
+    let snapshot = reply_rx.await.expect("stats snapshot reply");
+    assert!(snapshot.endpoints.is_empty());
+    assert!(
+        state.stats_interval.is_none(),
+        "taking a snapshot must not create a periodic subscription"
+    );
+    assert!(
+        !state.stats_include_diagnostics,
+        "taking a compact snapshot must not change subscription diagnostics"
+    );
+}
+
+#[tokio::test]
 async fn test_stats_resubscribe_preserves_emit_anchor() {
     let mut state = test_session_state();
     let (packet_tx, _packet_rx) = mpsc::channel(16);

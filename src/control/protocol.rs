@@ -493,6 +493,15 @@ fn default_stats_interval() -> u32 {
 #[allow(dead_code)]
 pub struct StatsUnsubscribeParams {}
 
+/// Parameters for a point-in-time stats read. Diagnostics are opt-in just as
+/// they are for the periodic subscription, but a snapshot never changes the
+/// subscription state or emission cadence.
+#[derive(Debug, Deserialize)]
+pub struct StatsSnapshotParams {
+    #[serde(default)]
+    pub include_diagnostics: bool,
+}
+
 #[derive(Debug, Serialize)]
 pub struct StatsEvent {
     pub endpoints: Vec<EndpointStats>,
@@ -504,6 +513,12 @@ pub struct EndpointStats {
     pub inbound: InboundStats,
     pub outbound: OutboundStats,
     pub rtt_ms: Option<f64>,
+    /// Age of the observation that supplied `rtt_ms`. Omitted with `rtt_ms`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rtt_observed_ms_ago: Option<u64>,
+    /// Source of `rtt_ms`: `rtcp_receiver_report` or `webrtc_media_egress`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rtt_source: Option<String>,
     pub codec: String,
     pub state: String,
     /// Local RTP/socket address currently associated with this endpoint. For
@@ -604,6 +619,28 @@ pub struct InboundStats {
 pub struct OutboundStats {
     pub packets: u64,
     pub bytes: u64,
+    /// Latest cumulative loss reported by the remote receiver for media sent
+    /// by rtpbridge. This is signed because RFC 3550 represents the 24-bit
+    /// cumulative-loss field as a signed integer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_packets_lost: Option<i64>,
+    /// Extended highest RTP sequence number reported by the remote receiver.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_highest_sequence: Option<u64>,
+    /// Monotonic local generation for the accepted remote report stream. It
+    /// changes whenever rtpbridge re-baselines outbound receiver-report state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_report_generation: Option<u64>,
+    /// Number of accepted reports in `remote_report_generation`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_report_count: Option<u64>,
+    /// Jitter reported by the remote receiver, converted from its RTP clock to
+    /// milliseconds using this endpoint's outbound codec clock.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_jitter_ms: Option<f64>,
+    /// Age of the accepted remote receiver report.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_report_received_ms_ago: Option<u64>,
 }
 
 // ── Shared Enums ────────────────────────────────────────────────────────
@@ -1069,6 +1106,21 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(params.interval_ms, 1000);
+        assert!(params.include_diagnostics);
+    }
+
+    #[test]
+    fn stats_snapshot_params_default_to_compact_payload() {
+        let params: StatsSnapshotParams = serde_json::from_value(json!({})).unwrap();
+        assert!(!params.include_diagnostics);
+    }
+
+    #[test]
+    fn stats_snapshot_params_can_include_diagnostics() {
+        let params: StatsSnapshotParams = serde_json::from_value(json!({
+            "include_diagnostics": true
+        }))
+        .unwrap();
         assert!(params.include_diagnostics);
     }
 

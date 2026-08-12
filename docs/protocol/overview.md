@@ -159,6 +159,7 @@ Most methods that require a session can return `NO_SESSION` (no session bound), 
 | `fax_detect.start` | `INVALID_PARAMS`, `FAX_DETECT_ERROR` |
 | `fax_detect.stop` | `INVALID_PARAMS`, `FAX_DETECT_ERROR` |
 | `stats.subscribe` | `INVALID_PARAMS`, `STATS_ERROR` |
+| `stats.snapshot` | `INVALID_PARAMS` |
 | `stats.unsubscribe` | `STATS_ERROR` |
 
 Unknown methods return `UNKNOWN_METHOD`. Invalid JSON returns `PARSE_ERROR`.

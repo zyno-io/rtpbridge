@@ -1510,6 +1510,49 @@ async fn test_bump_outbound_ssrc_rotates_state() {
 }
 
 #[tokio::test]
+async fn test_rtcp_receiver_report_only_applies_to_current_outbound_ssrc() {
+    let pool = crate::net::socket_pool::SocketPool::new("127.0.0.1".parse().unwrap(), 53900, 54000)
+        .unwrap();
+    let pair = pool.allocate_pair().await.unwrap();
+    let mut ep = RtpEndpoint::new(EndpointId::new_v4(), EndpointDirection::SendRecv, pair);
+    let first_ssrc = ep.our_ssrc;
+
+    let mut report = vec![
+        0x81, 201, 0x00, 0x07, // V=2, RC=1, Receiver Report
+        0, 0, 0, 1, // reporter SSRC
+    ];
+    report.extend_from_slice(&first_ssrc.to_be_bytes());
+    report.extend_from_slice(&[
+        0, // fraction lost
+        0, 0, 2, // cumulative loss
+        0, 0, 0, 5, // extended highest sequence
+        0, 0, 0, 160, // jitter
+        0, 0, 0, 0, // LSR
+        0, 0, 0, 0, // DLSR
+    ]);
+
+    ep.handle_rtcp(&report);
+    let accepted = ep
+        .rtcp_stats
+        .remote_receiver_report()
+        .expect("report block for the current sender SSRC must be accepted");
+    assert_eq!(accepted.packets_lost, 2);
+    assert_eq!(accepted.highest_sequence, 5);
+
+    ep.bump_outbound_ssrc();
+    assert!(
+        ep.rtcp_stats.remote_receiver_report().is_none(),
+        "an SSRC rotation must re-baseline remote receiver-report counters"
+    );
+
+    ep.handle_rtcp(&report);
+    assert!(
+        ep.rtcp_stats.remote_receiver_report().is_none(),
+        "a delayed report for the retired SSRC must not contaminate the new stream"
+    );
+}
+
+#[tokio::test]
 async fn test_direction_is_sending_classification() {
     // is_sending() == "rtpbridge transmits to the peer" == the peer is
     // willing to receive (peer-perspective: SendRecv or RecvOnly).

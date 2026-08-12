@@ -300,3 +300,13 @@ mirror:
     else
       git push -u github HEAD:refs/heads/main --force
     fi
+
+osv scan:
+  stage: test
+  allow_failure: true
+  image:
+    name: ghcr.io/google/osv-scanner:latest
+    entrypoint: ['']
+  before_script: []
+  script:
+    - /osv-scanner scan source --recursive .

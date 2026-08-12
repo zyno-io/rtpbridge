@@ -242,6 +242,9 @@ impl RtpEndpoint {
         self.last_source_ts = None;
         self.dtmf_wire_ts = None;
         self.last_rtp_timestamp = new_ts;
+        // Receiver reports are keyed to our outbound SSRC. Never carry their
+        // counters across the fresh stream we are about to advertise.
+        self.rtcp_stats.reset_remote_receiver_report();
 
         // A new SSRC starts a fresh SRTP cryptographic context on the wire: the
         // peer (re-)initialises its per-SSRC rollover counter (ROC) at 0 when it
@@ -707,6 +710,7 @@ impl RtpEndpoint {
 
         // Update codecs from answer — only accept codecs that were in our offer.
         // self.codecs contains the offered set (set during from_offer or create_offer).
+        let previous_outbound_clock_rate = self.send_codec.as_ref().map(|codec| codec.clock_rate);
         if let Some(valid) = negotiated_codecs {
             self.codecs = valid;
             self.send_codec = self
@@ -714,6 +718,15 @@ impl RtpEndpoint {
                 .iter()
                 .find(|c| c.name != "telephone-event")
                 .cloned();
+        }
+        let outbound_clock_rate = self.send_codec.as_ref().map(|codec| codec.clock_rate);
+        if previous_outbound_clock_rate != outbound_clock_rate
+            && self.rtcp_stats.remote_receiver_report().is_some()
+        {
+            // A receiver report's jitter is expressed in the RTP clock of the
+            // stream we sent. A codec-clock change makes old and new report
+            // values incomparable even if the peer retains our SSRC.
+            self.rtcp_stats.reset_remote_receiver_report();
         }
 
         self.telephone_event_pt = parsed.telephone_event_pt;

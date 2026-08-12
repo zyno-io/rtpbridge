@@ -9,6 +9,7 @@ use str0m::crypto::Fingerprint;
 use str0m::media::{Direction, MediaKind, Mid};
 use str0m::net::{Protocol, Receive};
 use str0m::rtp::SeqNo;
+use str0m::stats::MediaEgressStats;
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -35,6 +36,43 @@ const WEBRTC_OPUS_RTP_CLOCK_HZ: u32 = 48_000;
 /// the hot path (in the 1 Hz sweep), so it never blocks endpoint creation or the
 /// session task. See docs/incident-research/webrtc-recv-task-wedge.md.
 const RECV_TASK_START_GRACE: Duration = Duration::from_secs(2);
+
+/// Where the current WebRTC RTT observation came from. Media egress is the
+/// RTCP receiver-report round trip for the stream rtpbridge sends. str0m's
+/// other WebRTC RTT statistics lack a usable freshness marker in ICE-lite mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebRtcRttSource {
+    MediaEgress,
+}
+
+impl WebRtcRttSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MediaEgress => "webrtc_media_egress",
+        }
+    }
+}
+
+/// Most recent source-aware WebRTC RTT observation.
+#[derive(Debug, Clone, Copy)]
+pub struct WebRtcRttObservation {
+    pub ms: f64,
+    pub observed_at: Instant,
+    pub source: WebRtcRttSource,
+}
+
+/// Latest far-end receiver report about media rtpbridge sent through this
+/// WebRTC endpoint. Jitter remains in RTP clock ticks here and is converted to
+/// milliseconds at the protocol boundary using the negotiated codec RTP clock.
+#[derive(Debug, Clone)]
+pub struct WebRtcRemoteReceiverReport {
+    pub packets_lost: i64,
+    pub highest_sequence: u64,
+    pub jitter: u32,
+    pub received_at: Instant,
+    pub generation: u64,
+    pub count: u64,
+}
 
 /// The negotiated audio codec on a WebRTC endpoint, derived from str0m's media
 /// line. `name` is one of `opus`/`PCMU`/`PCMA` (str0m has no G.722 audio codec).
@@ -67,12 +105,15 @@ pub struct WebRtcEndpoint {
     /// str0m computes these internally but does not expose them on
     /// MediaIngressStats, so we run our own pass over Event::RtpPacket.
     pub rtcp_stats: RtcpStats,
-    /// Most recent RTT to the WebRTC peer, in milliseconds, captured from
-    /// str0m's periodic stats (`PeerStats`/egress/ingress `rtt`). str0m owns
-    /// RTCP for WebRTC, so — unlike plain RTP — our own `rtcp_stats` never
-    /// computes RTT here; this is the value `Endpoint::rtt_ms()` reports for
-    /// WebRTC legs.
-    pub peer_rtt_ms: Option<f64>,
+    /// Most recent source-aware RTT to the WebRTC peer captured from str0m's
+    /// periodic stats. str0m owns WebRTC RTCP, so this stays separate from the
+    /// local `rtcp_stats` used for bridge-observed ingress quality.
+    pub rtt_observation: Option<WebRtcRttObservation>,
+    /// Most recent remote receiver report for the outbound audio stream.
+    pub remote_receiver_report: Option<WebRtcRemoteReceiverReport>,
+    remote_report_generation: u64,
+    remote_report_count: u64,
+    last_media_egress_rtt: Option<Duration>,
     pub rtc: Rtc,
     /// One UDP socket per bound address family (IPv4 and/or IPv6), each paired
     /// with its local address. We register one ICE host candidate per socket and
@@ -275,7 +316,7 @@ impl WebRtcEndpoint {
             .set_rtp_mode(true)
             // Emit periodic stats so we can surface RTT for the WebRTC leg.
             // str0m owns RTCP here, so RTT only reaches us via these events
-            // (see `peer_rtt_ms` and the stats arms in the event loop).
+            // (see `rtt_observation` and the stats arms in the event loop).
             .set_stats_interval(Some(Duration::from_secs(1)))
             .build(Instant::now());
 
@@ -287,7 +328,11 @@ impl WebRtcEndpoint {
             raw_recv: Arc::new(RawRecvCounters::default()),
             ice_connection_state: None,
             rtcp_stats: RtcpStats::new(),
-            peer_rtt_ms: None,
+            rtt_observation: None,
+            remote_receiver_report: None,
+            remote_report_generation: 0,
+            remote_report_count: 0,
+            last_media_egress_rtt: None,
             rtc,
             sockets,
             local_addr,
@@ -418,7 +463,84 @@ impl WebRtcEndpoint {
             "WebRTC outbound SSRC rotated"
         );
         self.reset_outbound_rtp_timeline();
+        self.reset_remote_receiver_report();
         Ok(())
+    }
+
+    fn record_egress_rtt(&mut self, rtt: Duration) {
+        self.rtt_observation = Some(WebRtcRttObservation {
+            ms: rtt.as_secs_f64() * 1000.0,
+            observed_at: Instant::now(),
+            source: WebRtcRttSource::MediaEgress,
+        });
+    }
+
+    /// Returns whether this stats event supplied a remote report that was
+    /// accepted as a new observation.
+    fn record_remote_receiver_report(&mut self, stats: &MediaEgressStats) -> bool {
+        // A WebRTC endpoint can theoretically negotiate more than one media
+        // line. Quality on an auxiliary stream must not be attributed to this
+        // endpoint's audio leg.
+        if self.audio_mid != Some(stats.mid) {
+            return false;
+        }
+        let Some(remote) = stats.remote.as_ref() else {
+            return false;
+        };
+
+        let raw_lost = remote.packets_lost & 0x00ff_ffff;
+        let packets_lost = if raw_lost & 0x0080_0000 != 0 {
+            i64::try_from(raw_lost).unwrap_or(i64::MAX) - (1_i64 << 24)
+        } else {
+            i64::try_from(raw_lost).unwrap_or(i64::MAX)
+        };
+        let remote_changed = self.remote_receiver_report.as_ref().is_none_or(|previous| {
+            previous.packets_lost != packets_lost
+                || previous.highest_sequence != *remote.maximum_sequence_number
+                || previous.jitter != remote.jitter
+        });
+
+        // str0m retains the last remote report in every periodic snapshot.
+        // `loss` is useful evidence of a newer report, but is only calculable
+        // from a pair of reports with a nonzero sequence span. Also accept an
+        // initial report, a changed remote tuple, or a changed egress RTT: each
+        // is demonstrably new evidence even when loss is unavailable. Exact
+        // duplicate RRs cannot be distinguished from a cached stats snapshot by
+        // str0m's public API, so they deliberately do not reset observation age.
+        if stats.loss.is_none() && !remote_changed && stats.rtt == self.last_media_egress_rtt {
+            return false;
+        }
+
+        self.remote_report_count = self.remote_report_count.saturating_add(1);
+        self.remote_receiver_report = Some(WebRtcRemoteReceiverReport {
+            // str0m 0.21 currently exposes RFC 3550's signed 24-bit field as
+            // `u64`; restore the wire sign before publishing it.
+            packets_lost,
+            highest_sequence: *remote.maximum_sequence_number,
+            jitter: remote.jitter,
+            received_at: Instant::now(),
+            generation: self.remote_report_generation,
+            count: self.remote_report_count,
+        });
+        self.last_media_egress_rtt = stats.rtt;
+        true
+    }
+
+    fn record_egress_stats(&mut self, stats: &MediaEgressStats) {
+        // str0m retains the last RTT in each periodic snapshot. Refresh it
+        // only alongside a newly accepted remote report so stale periodic
+        // stats do not reset its age.
+        let received_remote_report = self.record_remote_receiver_report(stats);
+        if received_remote_report && let Some(rtt) = stats.rtt {
+            self.record_egress_rtt(rtt);
+        }
+    }
+
+    fn reset_remote_receiver_report(&mut self) {
+        self.remote_report_generation = self.remote_report_generation.saturating_add(1);
+        self.remote_report_count = 0;
+        self.remote_receiver_report = None;
+        self.last_media_egress_rtt = None;
     }
 
     /// Start (or restart) the recv task that reads UDP packets and forwards them
@@ -956,27 +1078,14 @@ impl WebRtcEndpoint {
                             self.audio_mid = Some(media.mid);
                         }
                     }
-                    // RTT for the WebRTC leg. We capture whichever stats event
-                    // carries a value: PeerStats is ICE/transport-derived, but
-                    // because we run ICE-lite (str0m doesn't initiate STUN
-                    // binding requests) its `rtt` is often None, so the
-                    // egress/ingress RTCP round-trip is usually what fills this.
-                    // Any `Some` updates the field; a `None` never clobbers it.
-                    Event::PeerStats(s) => {
-                        if let Some(rtt) = s.rtt {
-                            self.peer_rtt_ms = Some(rtt.as_secs_f64() * 1000.0);
-                        }
-                    }
+                    // str0m exposes cached TWCC RTT in PeerStats and cached
+                    // ingress DLRR RTT, neither with a usable freshness marker
+                    // in ICE-lite mode. Only egress RR RTT is published.
+                    Event::PeerStats(_) => {}
                     Event::MediaEgressStats(s) => {
-                        if let Some(rtt) = s.rtt {
-                            self.peer_rtt_ms = Some(rtt.as_secs_f64() * 1000.0);
-                        }
+                        self.record_egress_stats(&s);
                     }
-                    Event::MediaIngressStats(s) => {
-                        if let Some(rtt) = s.rtt {
-                            self.peer_rtt_ms = Some(rtt.as_secs_f64() * 1000.0);
-                        }
-                    }
+                    Event::MediaIngressStats(_) => {}
                     _ => {
                         trace!(endpoint_id = %self.id, "unhandled str0m event");
                     }

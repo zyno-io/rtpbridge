@@ -209,6 +209,7 @@ pub async fn handle_request(
         "endpoint.rtp.reinvite" => handle_update_remote_sdp(id, req.params, state, manager).await,
 
         "stats.subscribe" => handle_stats_subscribe(id, req.params, state).await,
+        "stats.snapshot" => handle_stats_snapshot(id, req.params, state).await,
         "stats.unsubscribe" => handle_stats_unsubscribe(id, state).await,
 
         "endpoint.transfer" => handle_endpoint_transfer(id, req.params, state, manager).await,
@@ -1473,6 +1474,46 @@ async fn handle_stats_subscribe(
     {
         Ok(Ok(())) => Response::ok(id, serde_json::json!({})),
         Ok(Err(e)) => Response::err(id, "STATS_ERROR", e.to_string()),
+        Err(resp) => resp,
+    }
+}
+
+async fn handle_stats_snapshot(
+    id: String,
+    params: serde_json::Value,
+    state: &mut ConnectionState,
+) -> Response {
+    let cmd_tx = match state.require_session(&id) {
+        Ok(tx) => tx.clone(),
+        Err(resp) => return resp,
+    };
+
+    // An omitted JSON-RPC `params` member deserializes to JSON null. Snapshot
+    // options are entirely optional, so normalize that representation to the
+    // same empty object callers get by sending `params: {}`.
+    let params = if params.is_null() {
+        serde_json::json!({})
+    } else {
+        params
+    };
+    let params: StatsSnapshotParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(error) => return Response::err(id, "INVALID_PARAMS", error.to_string()),
+    };
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    match send_and_recv(
+        &cmd_tx,
+        SessionCommand::StatsSnapshot {
+            reply: reply_tx,
+            include_diagnostics: params.include_diagnostics,
+        },
+        reply_rx,
+        &id,
+    )
+    .await
+    {
+        Ok(stats) => Response::ok(id, stats),
         Err(resp) => resp,
     }
 }

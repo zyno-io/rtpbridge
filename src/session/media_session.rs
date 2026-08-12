@@ -209,6 +209,12 @@ pub enum SessionCommand {
     StatsUnsubscribe {
         reply: oneshot::Sender<anyhow::Result<()>>,
     },
+    /// Read one point-in-time stats payload without modifying a periodic
+    /// subscription or its emission anchor.
+    StatsSnapshot {
+        reply: oneshot::Sender<StatsEvent>,
+        include_diagnostics: bool,
+    },
     GetInfo {
         reply: oneshot::Sender<SessionDetails>,
     },
@@ -669,6 +675,12 @@ impl SessionState {
                 self.stats_interval = None;
                 self.stats_include_diagnostics = false;
                 let _ = reply.send(Ok(()));
+            }
+            SessionCommand::StatsSnapshot {
+                reply,
+                include_diagnostics,
+            } => {
+                let _ = reply.send(self.build_stats(include_diagnostics));
             }
             SessionCommand::GetInfo { reply } => {
                 let _ = reply.send(self.get_info());
@@ -2426,12 +2438,18 @@ impl SessionState {
     }
 
     fn emit_stats(&self) {
+        self.send_event("stats", self.build_stats(self.stats_include_diagnostics));
+    }
+
+    /// Build the common endpoint payload used by both periodic `stats` events
+    /// and synchronous `stats.snapshot` responses. Keeping one builder makes
+    /// the two observations wire-identical at a given session state.
+    fn build_stats(&self, include_diagnostics: bool) -> StatsEvent {
         let ep_stats: Vec<crate::control::protocol::EndpointStats> = self
             .endpoints
             .values()
             .map(|ep| {
                 let stats = ep.stats();
-                let include_diagnostics = self.stats_include_diagnostics;
                 let (local_rtp_addr, remote_rtp_addr, offer_generation) = match ep {
                     Endpoint::WebRtc(w) => {
                         let (local, remote) = w.recording_addrs();
@@ -2448,6 +2466,8 @@ impl SessionState {
                     ),
                     _ => (None, None, None),
                 };
+                let rtt = ep.rtt_observation();
+                let remote_report = ep.remote_receiver_report();
                 crate::control::protocol::EndpointStats {
                     endpoint_id: ep.id(),
                     inbound: InboundStats {
@@ -2519,8 +2539,30 @@ impl SessionState {
                     outbound: OutboundStats {
                         packets: stats.outbound_packets,
                         bytes: stats.outbound_bytes,
+                        remote_packets_lost: remote_report
+                            .as_ref()
+                            .map(|report| report.packets_lost),
+                        remote_highest_sequence: remote_report
+                            .as_ref()
+                            .map(|report| report.highest_sequence),
+                        remote_report_generation: remote_report
+                            .as_ref()
+                            .map(|report| report.generation),
+                        remote_report_count: remote_report.as_ref().map(|report| report.count),
+                        remote_jitter_ms: remote_report
+                            .as_ref()
+                            .and_then(|report| report.jitter_ms),
+                        remote_report_received_ms_ago: remote_report
+                            .as_ref()
+                            .map(|report| report.received_ms_ago),
                     },
-                    rtt_ms: ep.rtt_ms(),
+                    rtt_ms: rtt.as_ref().map(|observation| observation.ms),
+                    rtt_observed_ms_ago: rtt
+                        .as_ref()
+                        .map(|observation| observation.observed_ms_ago),
+                    rtt_source: rtt
+                        .as_ref()
+                        .map(|observation| observation.source.to_string()),
                     codec: ep.codec_name(),
                     state: format!("{:?}", ep.state()),
                     local_rtp_addr,
@@ -2531,12 +2573,9 @@ impl SessionState {
             })
             .collect();
 
-        self.send_event(
-            "stats",
-            StatsEvent {
-                endpoints: ep_stats,
-            },
-        );
+        StatsEvent {
+            endpoints: ep_stats,
+        }
     }
 }
 

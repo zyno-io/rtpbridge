@@ -91,6 +91,87 @@ async fn test_outbound_timeline_reset_clears_source_state() {
     assert!(ep.learned_step.is_none());
 }
 
+#[tokio::test]
+async fn test_webrtc_remote_receiver_report_accepts_initial_audio_egress_stats() {
+    let mut ep = mk_webrtc_ts_endpoint().await;
+    let audio_mid = str0m::media::Mid::from("audio");
+    ep.audio_mid = Some(audio_mid);
+
+    let report = MediaEgressStats {
+        mid: audio_mid,
+        rid: None,
+        bytes: 0,
+        packets: 0,
+        firs: 0,
+        plis: 0,
+        nacks: 0,
+        rtt: None,
+        // str0m requires two receiver reports with a nonzero sequence span to
+        // compute loss, but `remote` is already valid for this first RR.
+        loss: None,
+        timestamp: Instant::now(),
+        remote: Some(str0m::stats::RemoteIngressStats {
+            jitter: 480,
+            maximum_sequence_number: 65_537_u64.into(),
+            packets_lost: 3,
+        }),
+    };
+
+    ep.record_egress_stats(&report);
+    let remote = ep
+        .remote_receiver_report
+        .as_ref()
+        .expect("audio egress remote stats should be preserved");
+    assert_eq!(remote.packets_lost, 3);
+    assert_eq!(remote.highest_sequence, 65_537);
+    assert_eq!(remote.jitter, 480);
+    assert_eq!(remote.generation, 0);
+    assert_eq!(remote.count, 1);
+    assert!(
+        ep.rtt_observation.is_none(),
+        "a receiver report without a usable RTT must not manufacture one"
+    );
+
+    let mut first_usable_rtt = report.clone();
+    first_usable_rtt.rtt = Some(Duration::from_millis(28));
+    ep.record_egress_stats(&first_usable_rtt);
+    let rtt = ep
+        .rtt_observation
+        .expect("an unchanged RR with its first usable RTT should be recorded");
+    assert_eq!(rtt.ms, 28.0);
+    assert_eq!(rtt.source, WebRtcRttSource::MediaEgress);
+
+    let mut negative = first_usable_rtt.clone();
+    negative.loss = Some(0.0);
+    negative.remote.as_mut().unwrap().packets_lost = 0x00ff_fffe;
+    assert!(ep.record_remote_receiver_report(&negative));
+    assert_eq!(
+        ep.remote_receiver_report.as_ref().unwrap().packets_lost,
+        -2,
+        "str0m's unsigned view of RFC 3550 cumulative loss must be sign-extended"
+    );
+
+    let mut changed_without_loss = negative.clone();
+    changed_without_loss.loss = None;
+    changed_without_loss.remote.as_mut().unwrap().jitter = 481;
+    assert!(ep.record_remote_receiver_report(&changed_without_loss));
+    assert_eq!(ep.remote_report_count, 4);
+
+    let mut cached = changed_without_loss.clone();
+    cached.loss = None;
+    assert!(!ep.record_remote_receiver_report(&cached));
+    assert_eq!(
+        ep.remote_report_count, 4,
+        "a periodic stats event with no fresh RR must not refresh cached evidence"
+    );
+
+    ep.reset_remote_receiver_report();
+    assert!(ep.remote_receiver_report.is_none());
+    assert_eq!(ep.remote_report_generation, 1);
+    assert_eq!(ep.remote_report_count, 0);
+    assert!(ep.last_media_egress_rtt.is_none());
+}
+
 /// The recv task starts promptly after creation, signals liveness, and a
 /// healthy task within the grace window is NOT flagged by the liveness sweep.
 /// See docs/incident-research/webrtc-recv-task-wedge.md.
@@ -253,6 +334,52 @@ async fn test_negotiated_codec_reads_from_str0m() {
     assert_eq!(nc.clock_rate, 48000, "Opus RTP clock is 48 kHz");
     // PT comes from str0m's negotiation, not a hardcoded 111.
     assert!(nc.pt > 0, "a real dynamic PT was negotiated");
+}
+
+#[tokio::test]
+async fn test_remote_receiver_report_uses_negotiated_pcmu_clock() {
+    let mut ep = mk_webrtc_ts_endpoint().await;
+    ep.rtc = RtcConfig::new()
+        .clear_codecs()
+        .enable_pcmu(true)
+        .set_rtp_mode(true)
+        .build(Instant::now());
+    ep.add_host_candidates()
+        .expect("host candidate should be accepted");
+
+    let mut peer = RtcConfig::new()
+        .clear_codecs()
+        .enable_pcmu(true)
+        .set_rtp_mode(true)
+        .build(Instant::now());
+    let peer_addr: std::net::SocketAddr = "127.0.0.1:40052".parse().unwrap();
+    peer.add_local_candidate(Candidate::host(peer_addr, "udp").unwrap());
+    let mut api = peer.sdp_api();
+    let audio_mid = api.add_media(MediaKind::Audio, Direction::SendRecv, None, None, None);
+    let (offer, _pending) = api.apply().expect("PCMU offer should be created");
+
+    ep.accept_offer(&offer.to_sdp_string())
+        .expect("PCMU offer should be accepted");
+    ep.audio_mid = Some(audio_mid);
+    assert_eq!(
+        ep.negotiated_codec().map(|codec| codec.clock_rate),
+        Some(8_000)
+    );
+
+    ep.remote_receiver_report = Some(WebRtcRemoteReceiverReport {
+        packets_lost: 0,
+        highest_sequence: 1,
+        jitter: 480,
+        received_at: Instant::now(),
+        generation: 0,
+        count: 1,
+    });
+    let endpoint = crate::session::endpoint_enum::Endpoint::WebRtc(Box::new(ep));
+    let report = endpoint
+        .remote_receiver_report()
+        .expect("remote receiver report should be available");
+
+    assert_eq!(report.jitter_ms, Some(60.0));
 }
 
 /// Diagnostic: verify str0m RTP mode media flow between two instances.

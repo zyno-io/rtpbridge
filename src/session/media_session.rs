@@ -40,6 +40,13 @@ struct CachedTranscode {
 use crate::net::socket_pool::{MediaBinding, MediaBindings};
 use crate::recording::recorder::RecordingManager;
 
+fn epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 /// Bundle of endpoint state for cross-session transfer
 pub struct EndpointTransferBundle {
     // Note: Debug is manually implemented below because Endpoint and AudioDecoder don't derive Debug
@@ -73,6 +80,9 @@ pub enum SessionCommand {
     },
     Detach,
     Destroy,
+    TimelineMark {
+        reply: oneshot::Sender<u64>,
+    },
     CreateFromOffer {
         reply: oneshot::Sender<anyhow::Result<(EndpointId, String)>>,
         sdp: String,
@@ -104,7 +114,7 @@ pub enum SessionCommand {
         sdp: String,
     },
     RemoveEndpoint {
-        reply: oneshot::Sender<anyhow::Result<()>>,
+        reply: oneshot::Sender<anyhow::Result<u64>>,
         endpoint_id: EndpointId,
     },
     DtmfInject {
@@ -120,12 +130,12 @@ pub enum SessionCommand {
         enabled: bool,
     },
     RecordingStart {
-        reply: oneshot::Sender<anyhow::Result<RecordingId>>,
+        reply: oneshot::Sender<anyhow::Result<(RecordingId, u64)>>,
         endpoint_id: Option<EndpointId>,
         file_path: String,
     },
     RecordingStop {
-        reply: oneshot::Sender<anyhow::Result<(String, u64, u64, u64)>>,
+        reply: oneshot::Sender<anyhow::Result<(String, u64, u64, u64, u64)>>,
         recording_id: RecordingId,
     },
     VadStart {
@@ -342,7 +352,11 @@ const CRITICAL_EVENTS: &[&str] = &[
     "endpoint.state_changed",
     "endpoint.ice_state_changed",
     "recording.stopped",
+    "endpoint.file.started",
     "endpoint.file.finished",
+    "endpoint.ws.connected",
+    "endpoint.ws.disconnected",
+    "endpoint.ws.connect_timeout",
     "session.idle_timeout",
     "session.empty_timeout",
 ];
@@ -414,6 +428,9 @@ impl SessionState {
                 info!(session_id = %self.session_id, "destroying session");
                 return false;
             }
+            SessionCommand::TimelineMark { reply } => {
+                let _ = reply.send(epoch_ms());
+            }
             SessionCommand::CreateFromOffer {
                 reply,
                 sdp,
@@ -475,7 +492,8 @@ impl SessionState {
                 let _ = reply.send(self.handle_accept_offer(endpoint_id, &sdp));
             }
             SessionCommand::RemoveEndpoint { reply, endpoint_id } => {
-                let _ = reply.send(self.handle_remove_endpoint(endpoint_id).await);
+                let result = self.handle_remove_endpoint(endpoint_id).await;
+                let _ = reply.send(result);
             }
             SessionCommand::DtmfInject {
                 reply,
@@ -534,13 +552,18 @@ impl SessionState {
                 if result.is_ok() {
                     self.metrics.recordings_active.inc();
                 }
+                let result = result.map(|recording_id| (recording_id, epoch_ms()));
                 let _ = reply.send(result);
             }
             SessionCommand::RecordingStop {
                 reply,
                 recording_id,
             } => {
-                let result = self.recording_mgr.stop(&recording_id);
+                let result = self.recording_mgr.stop(&recording_id).map(
+                    |(file_path, duration_ms, packets, dropped_packets)| {
+                        (file_path, duration_ms, packets, dropped_packets, epoch_ms())
+                    },
+                );
                 if result.is_ok() {
                     self.metrics.recordings_active.dec();
                 }
@@ -1330,7 +1353,14 @@ impl SessionState {
         }
         // Now Connected — include it in routing and notify the controller.
         self.rebuild_routing();
-        self.send_event("endpoint.ws.connected", WsConnectedData { endpoint_id });
+        let connected_at_epoch_ms = epoch_ms();
+        self.send_event(
+            "endpoint.ws.connected",
+            WsConnectedData {
+                endpoint_id,
+                connected_at_epoch_ms,
+            },
+        );
         info!(
             session_id = %self.session_id,
             endpoint_id = %endpoint_id,
@@ -1391,7 +1421,7 @@ impl SessionState {
         }
     }
 
-    async fn handle_remove_endpoint(&mut self, endpoint_id: EndpointId) -> anyhow::Result<()> {
+    async fn handle_remove_endpoint(&mut self, endpoint_id: EndpointId) -> anyhow::Result<u64> {
         if let Some(ep) = self.endpoints.get(&endpoint_id) {
             let ep_type = match ep {
                 Endpoint::WebRtc(_) => "webrtc",
@@ -1409,6 +1439,7 @@ impl SessionState {
             );
         }
         let mut removed = self.endpoints.remove(&endpoint_id);
+        let removed_at_epoch_ms = epoch_ms();
         // Drop any pending WS audio connect token so it can't be claimed after removal.
         if let Some(Endpoint::WebSocket(ref wsep)) = removed {
             self.ws_audio_registry.remove(&wsep.connect_token);
@@ -1453,7 +1484,7 @@ impl SessionState {
             self.metrics.endpoints_active.dec();
         }
         removed
-            .map(|_| ())
+            .map(|_| removed_at_epoch_ms)
             .ok_or_else(|| anyhow::anyhow!("Endpoint not found"))
     }
 
@@ -1797,6 +1828,7 @@ impl SessionState {
                     "endpoint.file.finished",
                     FileFinishedData {
                         endpoint_id,
+                        finished_at_epoch_ms: epoch_ms(),
                         reason: "error".to_string(),
                         error: Some(e.to_string()),
                     },

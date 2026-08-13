@@ -74,7 +74,7 @@ the audio endpoint.
 
 | event                        | data             | when                                       |
 |------------------------------|------------------|--------------------------------------------|
-| `endpoint.ws.connected`      | `{ endpoint_id }`| audio socket attached                      |
+| `endpoint.ws.connected`      | `{ endpoint_id, connected_at_epoch_ms }`| audio socket attached; media-host routing boundary |
 | `endpoint.ws.disconnected`   | `{ endpoint_id }`| audio socket closed / errored              |
 | `endpoint.ws.connect_timeout`| `{ endpoint_id }`| no audio socket dialed in within 30 s; the endpoint is auto-removed |
 

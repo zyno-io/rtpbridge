@@ -17,6 +17,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
+use serde::Serialize;
 
 use rtpbridge::media::codec::{AudioCodec, make_decoder};
 use rtpbridge::media::resample::Resampler;
@@ -47,10 +48,26 @@ struct Args {
     /// Output sample rate (Hz).
     #[arg(long, default_value_t = 48000)]
     rate: u32,
+    /// Write machine-readable decoded-timeline metadata beside the WAV.
+    #[arg(long)]
+    metadata: Option<PathBuf>,
+}
+
+#[derive(Serialize)]
+struct RenderMetadata {
+    /// Epoch of sample zero: the earliest decodable RTP packet, matching decode_channel's origin.
+    audio_origin_epoch_ms: u128,
+    /// Duration of the rendered WAV timeline before any later transcoding.
+    decoded_duration_ms: u128,
+    sample_rate: u32,
+    channels: u16,
 }
 
 /// One recorded RTP packet within a channel.
 struct RtpPacket {
+    /// Incremented on each descriptor for an existing channel. Concatenated recordings replay
+    /// descriptors, so sequence/timestamp origins must never be ordered across this boundary.
+    epoch: u32,
     seq: u16,
     ts: u32,
     /// PCAP capture (wall-clock) time — the timeline anchor, and the only timing
@@ -67,6 +84,7 @@ struct Channel {
     pt: Option<u8>,
     first_capture: Option<Duration>,
     packets: Vec<RtpPacket>,
+    epoch: u32,
 }
 
 fn main() {
@@ -117,8 +135,12 @@ fn run() -> anyhow::Result<()> {
                         pt: None,
                         first_capture: None,
                         packets: Vec::new(),
+                        epoch: 0,
                     }
                 });
+                if !ch.packets.is_empty() {
+                    ch.epoch = ch.epoch.saturating_add(1);
+                }
                 ch.codec = Some(codec);
                 ch.pt = Some(desc.pt);
             }
@@ -145,6 +167,7 @@ fn run() -> anyhow::Result<()> {
                     ch.first_capture = Some(pkt.timestamp);
                 }
                 ch.packets.push(RtpPacket {
+                    epoch: ch.epoch,
                     seq,
                     ts,
                     capture: pkt.timestamp,
@@ -208,6 +231,17 @@ fn run() -> anyhow::Result<()> {
         Mode::Stereo => 2,
     };
     write_wav(&args.output, &interleaved, channels_out, args.rate)?;
+    if let Some(metadata_path) = args.metadata {
+        let frame_count = interleaved.len() / channels_out as usize;
+        let metadata = RenderMetadata {
+            audio_origin_epoch_ms: origin.as_millis(),
+            decoded_duration_ms: (frame_count as u128 * 1000) / args.rate as u128,
+            sample_rate: args.rate,
+            channels: channels_out,
+        };
+        let serialized = serde_json::to_vec(&metadata)?;
+        std::fs::write(metadata_path, serialized)?;
+    }
     eprintln!(
         "pcap2audio: wrote {} ({} ch @ {} Hz)",
         args.output.display(),
@@ -226,55 +260,81 @@ fn decode_channel(ch: &mut Channel, out_rate: u32, origin: Duration) -> anyhow::
     // and stable-sort by it. Degenerate (all-zero) sequence numbers — e.g.
     // bridge/websocket sources whose timeline is synthesized downstream — keep
     // arrival order.
-    let keys = unwrap_sequence(&ch.packets);
-    let mut idx: Vec<usize> = (0..ch.packets.len()).collect();
-    idx.sort_by_key(|&i| keys[i]);
-    let packets: Vec<&RtpPacket> = idx.iter().map(|&i| &ch.packets[i]).collect();
-
     let first_capture = ch.first_capture.unwrap_or(origin);
-    let first_ts = packets.first().map(|p| p.ts).unwrap_or(0);
-
     let lead = first_capture.saturating_sub(origin);
     let lead_samples = (lead.as_secs_f64() * out_rate as f64).round() as usize;
     let mut buf: Vec<i16> = vec![0; lead_samples];
 
-    let mut cur_codec: Option<AudioCodec> = None;
-    let mut decoder: Option<Box<dyn rtpbridge::media::codec::AudioDecoder>> = None;
-    let mut resampler: Option<Resampler> = None;
-    let mut pcm = Vec::new();
-    let mut out = Vec::new();
+    let mut epoch_start = 0;
+    while epoch_start < ch.packets.len() {
+        let epoch = ch.packets[epoch_start].epoch;
+        let epoch_end = ch.packets[epoch_start..]
+            .iter()
+            .position(|packet| packet.epoch != epoch)
+            .map(|offset| epoch_start + offset)
+            .unwrap_or(ch.packets.len());
+        let epoch_packets = &ch.packets[epoch_start..epoch_end];
+        let keys = unwrap_sequence(epoch_packets);
+        let mut idx: Vec<usize> = (0..epoch_packets.len()).collect();
+        idx.sort_by_key(|&i| keys[i]);
+        let first_epoch_capture = epoch_packets
+            .iter()
+            .map(|packet| packet.capture)
+            .min()
+            .unwrap_or(first_capture);
+        let first_ts = idx
+            .first()
+            .map(|&index| epoch_packets[index].ts)
+            .unwrap_or(0);
+        let mut cur_codec: Option<AudioCodec> = None;
+        let mut decoder: Option<Box<dyn rtpbridge::media::codec::AudioDecoder>> = None;
+        let mut resampler: Option<Resampler> = None;
+        let mut pcm = Vec::new();
+        let mut out = Vec::new();
 
-    for p in &packets {
-        // (Re)build the decoder/resampler when the codec changes.
-        if cur_codec != Some(p.codec) {
-            decoder = Some(make_decoder(p.codec)?);
-            resampler = Some(Resampler::new(p.codec.sample_rate(), out_rate));
-            cur_codec = Some(p.codec);
-        }
-        let dec = decoder.as_mut().unwrap();
-        if dec.decode(&p.payload, &mut pcm).is_err() {
-            continue;
-        }
-        resampler.as_mut().unwrap().process(&pcm, &mut out);
+        for index in idx {
+            let p = &epoch_packets[index];
+            // (Re)build the decoder/resampler when the codec changes.
+            if cur_codec != Some(p.codec) {
+                decoder = Some(make_decoder(p.codec)?);
+                resampler = Some(Resampler::new(p.codec.sample_rate(), out_rate));
+                cur_codec = Some(p.codec);
+            }
+            let dec = decoder.as_mut().unwrap();
+            if dec.decode(&p.payload, &mut pcm).is_err() {
+                continue;
+            }
+            resampler.as_mut().unwrap().process(&pcm, &mut out);
 
-        // Position by RTP timestamp at the codec's RTP clock (8 kHz for G.722, not
-        // its 16 kHz audio rate). When the RTP timestamp doesn't advance — sources
-        // recorded before their timeline is stamped (bridge/websocket), or a
-        // duplicate — fall back to PCAP capture wall-clock so real inter-packet gaps
-        // are preserved rather than collapsed. Never goes backwards.
-        let rel_ticks = p.ts.wrapping_sub(first_ts);
-        let target = if rel_ticks != 0 && rel_ticks <= 0x8000_0000 {
-            ((rel_ticks as u64 * out_rate as u64) / p.codec.rtp_clock_rate() as u64) as usize
-                + lead_samples
-        } else {
-            let cap = p.capture.saturating_sub(first_capture);
-            (cap.as_secs_f64() * out_rate as f64).round() as usize + lead_samples
-        };
-        let target = target.max(buf.len());
-        if target > buf.len() {
-            buf.resize(target, 0); // silence across the gap
+            // Position within an independently decoded epoch by RTP timestamp at the codec's RTP clock (8 kHz for G.722, not
+            // its 16 kHz audio rate). When the RTP timestamp doesn't advance — sources
+            // recorded before their timeline is stamped (bridge/websocket), or a
+            // duplicate — fall back to PCAP capture wall-clock so real inter-packet gaps
+            // are preserved rather than collapsed. Never goes backwards.
+            let rel_ticks = p.ts.wrapping_sub(first_ts);
+            let capture_target =
+                (p.capture.saturating_sub(origin).as_secs_f64() * out_rate as f64).round() as usize;
+            let rtp_target = if rel_ticks != 0 && rel_ticks <= 0x8000_0000 {
+                ((rel_ticks as u64 * out_rate as u64) / p.codec.rtp_clock_rate() as u64) as usize
+                    + (first_epoch_capture.saturating_sub(origin).as_secs_f64() * out_rate as f64)
+                        .round() as usize
+            } else {
+                capture_target
+            };
+            // A restarted/foreign RTP epoch must never create an enormous sparse output. Capture time
+            // is authoritative between recording segments; reject timestamp placement that disagrees by >2s.
+            let target = if rtp_target.abs_diff(capture_target) > (out_rate as usize * 2) {
+                capture_target
+            } else {
+                rtp_target
+            };
+            let target = target.max(buf.len());
+            if target > buf.len() {
+                buf.resize(target, 0); // silence across the gap
+            }
+            buf.extend_from_slice(&out);
         }
-        buf.extend_from_slice(&out);
+        epoch_start = epoch_end;
     }
 
     Ok(buf)
@@ -448,6 +508,7 @@ mod tests {
 
     fn pkt(seq: u16) -> RtpPacket {
         RtpPacket {
+            epoch: 0,
             seq,
             ts: 0,
             capture: Duration::ZERO,
@@ -488,6 +549,50 @@ mod tests {
         let pkts: Vec<RtpPacket> = [100u16, 102, 101, 103].iter().map(|&s| pkt(s)).collect();
         let keys = unwrap_sequence(&pkts);
         assert_eq!(keys, vec![100, 102, 101, 103]);
+    }
+
+    #[test]
+    fn decode_concatenated_recording_epochs_keep_capture_gap() {
+        // A second collected PCAP replays descriptors and can restart both RTP sequence and timestamp.
+        // Its capture-time gap must survive without sorting it into the first recording or allocating
+        // based on unrelated timestamp origins.
+        let channel = Channel {
+            codec: Some(AudioCodec::Pcmu),
+            pt: Some(0),
+            first_capture: Some(Duration::ZERO),
+            epoch: 1,
+            packets: vec![
+                RtpPacket {
+                    epoch: 0,
+                    seq: 65_000,
+                    ts: 3_000_000_000,
+                    capture: Duration::ZERO,
+                    codec: AudioCodec::Pcmu,
+                    payload: vec![0xff; 160],
+                },
+                RtpPacket {
+                    epoch: 1,
+                    seq: 7,
+                    ts: 17,
+                    capture: Duration::from_secs(3),
+                    codec: AudioCodec::Pcmu,
+                    payload: vec![0xff; 160],
+                },
+            ],
+        };
+        let mut channel = channel;
+        let decoded =
+            decode_channel(&mut channel, 8000, Duration::ZERO).expect("decodes independent epochs");
+        assert!(
+            decoded.len() >= 24_160,
+            "capture-time gap retained: {} samples",
+            decoded.len()
+        );
+        assert!(
+            decoded.len() < 40_000,
+            "foreign RTP timestamps must not allocate a huge output: {} samples",
+            decoded.len()
+        );
     }
 
     #[test]

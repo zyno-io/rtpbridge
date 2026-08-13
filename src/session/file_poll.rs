@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
 
@@ -14,6 +14,7 @@ pub struct FileRtpState {
     pub timestamp: u32,
     pub ssrc: u32,
     pub last_poll: Instant,
+    pub started_emitted: bool,
 }
 
 /// Poll file endpoints for PCM output. Produces RoutedRtpPackets and emits
@@ -44,6 +45,7 @@ pub fn poll_file_endpoints(
                     timestamp: rand::random(),
                     ssrc: rand::random(),
                     last_poll: Instant::now() - Duration::from_millis(20),
+                    started_emitted: false,
                 });
             while state.last_poll.elapsed() >= Duration::from_millis(20) {
                 state.last_poll += Duration::from_millis(20);
@@ -73,6 +75,24 @@ pub fn poll_file_endpoints(
                         marker: false,
                         payload,
                     });
+                    if !state.started_emitted {
+                        state.started_emitted = true;
+                        super::media_session::emit_event_with_priority(
+                            event_tx,
+                            critical_event_tx,
+                            "endpoint.file.started",
+                            FileStartedData {
+                                endpoint_id: fep.id,
+                                started_at_epoch_ms: SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_millis()
+                                    as u64,
+                            },
+                            dropped_events,
+                            metrics,
+                        );
+                    }
                     state.seq_no = state.seq_no.wrapping_add(1);
                     // L16 RTP clock == sample rate, so advance by the sample count.
                     state.timestamp = state.timestamp.wrapping_add(samples);
@@ -83,6 +103,11 @@ pub fn poll_file_endpoints(
                         "endpoint.file.finished",
                         FileFinishedData {
                             endpoint_id: fep.id,
+                            finished_at_epoch_ms: SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis()
+                                as u64,
                             reason: "completed".to_string(),
                             error: None,
                         },

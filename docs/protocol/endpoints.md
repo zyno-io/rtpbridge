@@ -380,8 +380,11 @@ Remove an endpoint from the session.
 
 **Response:**
 ```json
-{"id":"7","result":{}}
+{"id":"7","result":{"removed_at_epoch_ms":1730000038000}}
 ```
+
+`removed_at_epoch_ms` is captured immediately after the endpoint leaves media routing and uses the
+media-host epoch clock shared with recording PCAP timestamps.
 
 ### endpoint.transfer
 

@@ -312,6 +312,16 @@ pub struct EndpointRemoveParams {
     pub endpoint_id: EndpointId,
 }
 
+#[derive(Debug, Serialize)]
+pub struct EndpointRemoveResult {
+    pub removed_at_epoch_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SessionTimelineMarkResult {
+    pub marked_at_epoch_ms: u64,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct EndpointIceRestartParams {
     pub endpoint_id: EndpointId,
@@ -407,6 +417,7 @@ pub struct RecordingStartParams {
 #[derive(Debug, Serialize)]
 pub struct RecordingStartResult {
     pub recording_id: RecordingId,
+    pub started_at_epoch_ms: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -420,6 +431,7 @@ pub struct RecordingStopResult {
     pub duration_ms: u64,
     pub packets: u64,
     pub dropped_packets: u64,
+    pub stopped_at_epoch_ms: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -782,9 +794,16 @@ pub struct IceStateChangedData {
 #[derive(Debug, Serialize)]
 pub struct FileFinishedData {
     pub endpoint_id: EndpointId,
+    pub finished_at_epoch_ms: u64,
     pub reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FileStartedData {
+    pub endpoint_id: EndpointId,
+    pub started_at_epoch_ms: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -834,6 +853,8 @@ pub struct FaxDetectedData {
 #[derive(Debug, Serialize)]
 pub struct WsConnectedData {
     pub endpoint_id: EndpointId,
+    /// Media-host wall-clock instant at which this endpoint entered routing.
+    pub connected_at_epoch_ms: u64,
 }
 
 /// Payload for `endpoint.ws.disconnected` (audio socket closed).

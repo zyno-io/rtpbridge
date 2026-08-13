@@ -36,6 +36,9 @@ Supported formats: WAV, MP3, OGG/Vorbis, FLAC.
 
 File endpoints are always **send-only** — they produce audio but don't receive it.
 
+The creation response contains only the endpoint ID and does not mean media has started. URL sources can
+still be downloading or buffering. Use `endpoint.file.started` as the authoritative playback boundary.
+
 ## endpoint.file.seek
 
 Seek to a position in the file.
@@ -53,6 +56,21 @@ Seek to a position in the file.
 
 ## Events
 
+### endpoint.file.started
+
+Emitted once, when the first RTP packet from the file enters media routing. `started_at_epoch_ms` uses the
+media-host epoch clock shared by recording PCAP timestamps.
+
+```json
+{
+  "event": "endpoint.file.started",
+  "data": {
+    "endpoint_id": "...",
+    "started_at_epoch_ms": 1730000000000
+  }
+}
+```
+
 ### endpoint.file.finished
 
 Emitted when playback completes (all loops done) or encounters an error.
@@ -62,6 +80,7 @@ Emitted when playback completes (all loops done) or encounters an error.
   "event": "endpoint.file.finished",
   "data": {
     "endpoint_id": "...",
+    "finished_at_epoch_ms": 1730000038000,
     "reason": "completed",
     "error": null
   }
@@ -69,3 +88,4 @@ Emitted when playback completes (all loops done) or encounters an error.
 ```
 
 `reason` is `"completed"` or `"error"`. If `"error"`, the `error` field contains the message.
+`finished_at_epoch_ms` uses the same media-host epoch clock as the start event and recording PCAPs.

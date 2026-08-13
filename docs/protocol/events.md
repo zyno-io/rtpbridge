@@ -26,12 +26,22 @@ WebRTC-only. The endpoint's str0m ICE connection state transitioned. States: `ne
 {"event":"endpoint.ice_state_changed","data":{"endpoint_id":"...","ice_state":"disconnected"}}
 ```
 
-## endpoint.file.finished
+## endpoint.file.started
 
-File playback completed or errored.
+File playback routed its first RTP packet. This is distinct from endpoint creation because URL-backed
+endpoints may remain buffering after `endpoint.create_with_file` returns. The timestamp uses the media-host
+epoch clock shared with PCAP packet capture.
 
 ```json
-{"event":"endpoint.file.finished","data":{"endpoint_id":"...","reason":"completed","error":null}}
+{"event":"endpoint.file.started","data":{"endpoint_id":"...","started_at_epoch_ms":1730000000000}}
+```
+
+## endpoint.file.finished
+
+File playback completed or errored. `finished_at_epoch_ms` is captured on the same media-host clock.
+
+```json
+{"event":"endpoint.file.finished","data":{"endpoint_id":"...","finished_at_epoch_ms":1730000038000,"reason":"completed","error":null}}
 ```
 
 ## endpoint.tone.finished
@@ -44,10 +54,12 @@ Duration-limited tone generation completed.
 
 ## endpoint.ws.connected
 
-WebSocket audio socket attached to an endpoint created by `endpoint.create_websocket`.
+WebSocket audio socket attached to an endpoint created by `endpoint.create_websocket`. `connected_at_epoch_ms`
+is minted by the media host immediately after the endpoint enters routing; consumers that align a
+media timeline must use it rather than a control-plane receipt timestamp.
 
 ```json
-{"event":"endpoint.ws.connected","data":{"endpoint_id":"..."}}
+{"event":"endpoint.ws.connected","data":{"endpoint_id":"...","connected_at_epoch_ms":1723456789012}}
 ```
 
 ## endpoint.ws.disconnected

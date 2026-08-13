@@ -62,7 +62,7 @@ Events are emitted asynchronously and are not correlated to requests.
 - **Ordering**: Events within the same priority tier are delivered in order. Priority events (see below) may be delivered ahead of normal events queued at the same time.
 - **Delivery guarantee**: At-most-once. Under backpressure (slow client), events may be dropped rather than block the media pipeline.
 - **Drop notification**: When events are dropped, the server sends an `events.dropped` notification with a `count` field indicating how many events were lost since the last successful delivery.
-- **Priority events**: Critical events (`endpoint.state_changed`, `endpoint.ice_state_changed`, `recording.stopped`, `endpoint.file.finished`, `session.idle_timeout`, `session.empty_timeout`) are routed through a separate priority channel and are dropped only when both the priority and normal channels are full.
+- **Priority events**: Critical events (`endpoint.state_changed`, `endpoint.ice_state_changed`, `recording.stopped`, `endpoint.file.started`, `endpoint.file.finished`, `session.idle_timeout`, `session.empty_timeout`) are routed through a separate priority channel and are dropped only when both the priority and normal channels are full.
 
 ## Error Codes
 
@@ -101,6 +101,7 @@ Most methods that require a session can return `NO_SESSION` (no session bound), 
 | `session.attach` | `SESSION_ALREADY_BOUND`, `INVALID_PARAMS`, `SESSION_NOT_FOUND`, `SESSION_NOT_ORPHANED`, `SESSION_BUSY` |
 | `session.destroy` | _(none beyond common)_ |
 | `session.info` | _(none beyond common)_ |
+| `session.timeline.mark` | _(none beyond common)_ |
 | `session.list` | _(always succeeds)_ |
 | `server.info` | _(always succeeds)_ |
 
@@ -163,6 +164,25 @@ Most methods that require a session can return `NO_SESSION` (no session bound), 
 | `stats.unsubscribe` | `STATS_ERROR` |
 
 Unknown methods return `UNKNOWN_METHOD`. Invalid JSON returns `PARSE_ERROR`.
+
+## Media-clock timeline marks
+
+`session.timeline.mark` is a read-only ordering primitive for control-plane facts that must align
+with recorded media. It is dispatched through the owning media-session actor, after all commands
+already admitted to that actor and before commands admitted later, and returns the media host's
+current epoch in milliseconds:
+
+```json
+{"id":"mark-1","method":"session.timeline.mark","params":{}}
+```
+
+```json
+{"id":"mark-1","result":{"marked_at_epoch_ms":1730000000123}}
+```
+
+The command does not change endpoints, routing, recording, or media. A caller may use the returned
+value to place an application event on the same wall-clock axis as PCAP capture and recording/file
+acknowledgements.
 
 ## Graceful Shutdown
 

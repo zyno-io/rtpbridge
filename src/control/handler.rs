@@ -121,6 +121,7 @@ pub async fn handle_request(
             .await
         }
         "session.destroy" => handle_session_destroy(id, state, manager).await,
+        "session.timeline.mark" => handle_session_timeline_mark(id, state).await,
         "session.info" => handle_session_info(id, state, manager).await,
         "session.list" => handle_session_list(id, manager),
         "server.info" => handle_server_info(id, manager),
@@ -220,6 +221,27 @@ pub async fn handle_request(
             "UNKNOWN_METHOD",
             format!("Unknown method: {}", req.method),
         ),
+    }
+}
+
+async fn handle_session_timeline_mark(id: String, state: &ConnectionState) -> Response {
+    let cmd_tx = match state.require_session(&id) {
+        Ok(tx) => tx,
+        Err(response) => return response,
+    };
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let result = send_and_recv(
+        cmd_tx,
+        SessionCommand::TimelineMark { reply: reply_tx },
+        reply_rx,
+        &id,
+    )
+    .await;
+    match result {
+        Ok(marked_at_epoch_ms) => {
+            Response::ok(id, SessionTimelineMarkResult { marked_at_epoch_ms })
+        }
+        Err(response) => response,
     }
 }
 
@@ -726,7 +748,12 @@ async fn handle_endpoint_remove(
     )
     .await
     {
-        Ok(Ok(())) => Response::ok(id, serde_json::json!({})),
+        Ok(Ok(removed_at_epoch_ms)) => Response::ok(
+            id,
+            EndpointRemoveResult {
+                removed_at_epoch_ms,
+            },
+        ),
         Ok(Err(e)) => Response::err(id, "ENDPOINT_ERROR", e.to_string()),
         Err(resp) => resp,
     }
@@ -937,7 +964,13 @@ async fn handle_recording_start(
     )
     .await
     {
-        Ok(Ok(recording_id)) => Response::ok(id, RecordingStartResult { recording_id }),
+        Ok(Ok((recording_id, started_at_epoch_ms))) => Response::ok(
+            id,
+            RecordingStartResult {
+                recording_id,
+                started_at_epoch_ms,
+            },
+        ),
         Ok(Err(e)) => Response::err(id, "RECORDING_ERROR", e.to_string()),
         Err(resp) => resp,
     }
@@ -970,15 +1003,18 @@ async fn handle_recording_stop(
     )
     .await
     {
-        Ok(Ok((file_path, duration_ms, packets, dropped_packets))) => Response::ok(
-            id,
-            RecordingStopResult {
-                file_path,
-                duration_ms,
-                packets,
-                dropped_packets,
-            },
-        ),
+        Ok(Ok((file_path, duration_ms, packets, dropped_packets, stopped_at_epoch_ms))) => {
+            Response::ok(
+                id,
+                RecordingStopResult {
+                    file_path,
+                    duration_ms,
+                    packets,
+                    dropped_packets,
+                    stopped_at_epoch_ms,
+                },
+            )
+        }
         Ok(Err(e)) => Response::err(id, "RECORDING_ERROR", e.to_string()),
         Err(resp) => resp,
     }

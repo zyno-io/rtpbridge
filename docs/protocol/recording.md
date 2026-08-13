@@ -34,7 +34,7 @@ playback, tone) are captured too — file playback is recorded as native-rate L1
 
 **Response:**
 ```json
-{"id":"1","result":{"recording_id":"..."}}
+{"id":"1","result":{"recording_id":"...","started_at_epoch_ms":1730000000000}}
 ```
 
 ## recording.stop
@@ -51,10 +51,14 @@ playback, tone) are captured too — file playback is recorded as native-rate L1
     "file_path": "/recordings/call-123.pcap",
     "duration_ms": 30000,
     "packets": 1500,
-    "dropped_packets": 0
+    "dropped_packets": 0,
+    "stopped_at_epoch_ms": 1730000030000
   }
 }
 ```
+
+`started_at_epoch_ms` and `stopped_at_epoch_ms` use the media-host epoch clock. The latter is
+captured at the media-session stop boundary, not after asynchronous cleanup.
 
 ## PCAP Format
 
@@ -103,15 +107,17 @@ framed identically to that endpoint's media, whose payload is the 4-byte magic
 The `pcap2audio` binary decodes a recording into a WAV file:
 
 ```
-pcap2audio <input.pcap> -o <out.wav> [--mode multichannel|stereo] [--rate 48000]
+pcap2audio <input.pcap> -o <out.wav> [--mode multichannel|stereo] [--rate 48000] [--metadata <timeline.json>]
 ```
 
 - `--mode multichannel` — one WAV channel per endpoint (prints a channel→endpoint map)
 - `--mode stereo` (default) — left = first endpoint, right = all others summed
 - Demuxes by the frame `(src,dst)` pair (bound to an endpoint by descriptors),
-  reorders each channel by RTP sequence (wrap-safe) before decoding (stateful
+  treats each repeated descriptor as a new RTP epoch (including concatenated recording
+  segments), reorders each epoch by RTP sequence (wrap-safe) before decoding (stateful
   Opus/G.722), fills timestamp gaps with silence, and aligns channels on the PCAP
-  capture-time origin. Convert to Opus/MP3/etc. with external tooling (e.g. ffmpeg).
+  earliest decodable RTP capture-time origin. `--metadata` writes that exact sample-zero epoch
+  and rendered WAV duration for downstream timeline alignment. Convert to Opus/MP3/etc. with external tooling (e.g. ffmpeg).
 
 ### Timing note: bridge / websocket sources
 

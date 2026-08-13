@@ -126,6 +126,14 @@ All communication uses JSON over WebSocket. Each connection is bound to exactly 
 | `stats.subscribe` | Subscribe to periodic session statistics |
 | `stats.unsubscribe` | Unsubscribe from statistics |
 
+`recording.start`, `recording.stop`, endpoint removal, and the file-playback lifecycle events carry
+media-host epoch milliseconds. These use the same host clock as PCAP packet records, so callers
+can safely align explicitly injected media to a recording without comparing control-plane clocks.
+`endpoint.file.started` is emitted only immediately before the first file RTP is routed and carries
+that same epoch; ledger consumers must use it rather than endpoint creation, which can remain buffering.
+`pcap2audio --metadata <path>` writes its earliest decodable-RTP sample-zero epoch and rendered WAV
+duration as JSON for conversion services.
+
 ### Events
 
 | Event | Description |
@@ -133,6 +141,7 @@ All communication uses JSON over WebSocket. Each connection is bound to exactly 
 | `dtmf` | DTMF digit detected from remote endpoint |
 | `endpoint.state_changed` | Endpoint state transition |
 | `endpoint.ice_state_changed` | WebRTC ICE state transition |
+| `endpoint.file.started` | First file RTP packet entered media routing |
 | `endpoint.file.finished` | File playback completed |
 | `endpoint.tone.finished` | Tone generation completed |
 | `endpoint.ws.connected` | WebSocket audio socket attached |

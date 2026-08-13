@@ -659,6 +659,7 @@ async fn test_cleanup_endpoint_state_removes_all_ancillary() {
             timestamp: 0,
             ssrc: 0,
             last_poll: Instant::now(),
+            started_emitted: false,
         },
     );
     state
@@ -723,6 +724,30 @@ async fn test_handle_command_destroy_returns_false() {
         !cont,
         "Destroy command should return false to break the loop"
     );
+}
+
+#[tokio::test]
+async fn test_timeline_mark_is_actor_ordered_and_uses_epoch_milliseconds() {
+    let mut state = test_session_state();
+    let (packet_tx, _packet_rx) = mpsc::channel(16);
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock")
+        .as_millis() as u64;
+    let (reply_tx, reply_rx) = oneshot::channel();
+
+    let continues = state
+        .handle_command(SessionCommand::TimelineMark { reply: reply_tx }, &packet_tx)
+        .await;
+    let marked_at = reply_rx.await.expect("timeline mark reply");
+    let after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock")
+        .as_millis() as u64;
+
+    assert!(continues);
+    assert!(marked_at >= before);
+    assert!(marked_at <= after);
 }
 
 #[tokio::test]

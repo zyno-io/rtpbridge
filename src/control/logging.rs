@@ -444,7 +444,12 @@ fn request_fields(method: &str) -> &'static [&'static str] {
         "stats.snapshot" => &["include_diagnostics"],
         "endpoint.transfer" => &["endpoint_id", "target_session_id"],
         "session.bridge" => &["target_session_id", "direction"],
-        "session.create" | "session.destroy" | "session.info" | "session.list" | "server.info"
+        "session.create"
+        | "session.destroy"
+        | "session.info"
+        | "session.list"
+        | "session.timeline.mark"
+        | "server.info"
         | "stats.unsubscribe" => &[],
         _ => &[],
     }
@@ -464,6 +469,7 @@ fn response_fields(method: &str) -> &'static [&'static str] {
         ],
         "session.list" => &["sessions"],
         "server.info" => &["hostname", "version", "media_ip"],
+        "session.timeline.mark" => &["marked_at_epoch_ms"],
         "endpoint.create_from_offer"
         | "endpoint.webrtc.create_from_offer"
         | "endpoint.rtp.create_from_offer" => &["endpoint_id", "sdp_answer"],
@@ -491,6 +497,7 @@ fn event_fields(event: &str) -> &'static [&'static str] {
         "dtmf" => &["endpoint_id", "digit", "duration_ms", "sensitive"],
         "endpoint.state_changed" => &["endpoint_id", "old_state", "new_state"],
         "endpoint.ice_state_changed" => &["endpoint_id", "ice_state"],
+        "endpoint.file.started" => &["endpoint_id"],
         "endpoint.file.finished" => &["endpoint_id", "reason", "error"],
         "endpoint.tone.finished" => &["endpoint_id"],
         "recording.stopped" => &[

@@ -1003,18 +1003,7 @@ async fn handle_recording_stop(
     )
     .await
     {
-        Ok(Ok((file_path, duration_ms, packets, dropped_packets, stopped_at_epoch_ms))) => {
-            Response::ok(
-                id,
-                RecordingStopResult {
-                    file_path,
-                    duration_ms,
-                    packets,
-                    dropped_packets,
-                    stopped_at_epoch_ms,
-                },
-            )
-        }
+        Ok(Ok(result)) => Response::ok(id, result),
         Ok(Err(e)) => Response::err(id, "RECORDING_ERROR", e.to_string()),
         Err(resp) => resp,
     }

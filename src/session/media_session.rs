@@ -135,7 +135,7 @@ pub enum SessionCommand {
         file_path: String,
     },
     RecordingStop {
-        reply: oneshot::Sender<anyhow::Result<(String, u64, u64, u64, u64)>>,
+        reply: oneshot::Sender<anyhow::Result<RecordingStopResult>>,
         recording_id: RecordingId,
     },
     VadStart {
@@ -560,8 +560,12 @@ impl SessionState {
                 recording_id,
             } => {
                 let result = self.recording_mgr.stop(&recording_id).map(
-                    |(file_path, duration_ms, packets, dropped_packets)| {
-                        (file_path, duration_ms, packets, dropped_packets, epoch_ms())
+                    |(file_path, duration_ms, packets, dropped_packets)| RecordingStopResult {
+                        file_path,
+                        duration_ms,
+                        packets,
+                        dropped_packets,
+                        stopped_at_epoch_ms: epoch_ms(),
                     },
                 );
                 if result.is_ok() {

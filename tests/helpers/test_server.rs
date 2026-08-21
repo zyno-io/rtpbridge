@@ -4,7 +4,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use rtpbridge::config::Config;
+use rtpbridge::config::{Config, TlsConfig};
+use rtpbridge::control::auth::HmacAuthenticator;
 use rtpbridge::metrics::Metrics;
 use rtpbridge::playback::file_cache::FileCache;
 use rtpbridge::session::SessionManager;
@@ -16,6 +17,10 @@ use tempfile::TempDir;
 /// current tokio runtime. Supports parallel test execution.
 pub struct TestServer {
     pub addr: String,
+    /// PEM server certificate when TLS was enabled for this test server.
+    pub tls_cert_pem: Option<String>,
+    /// Test-only copy of the configured control signing key, if any.
+    pub auth_hmac_secret: Option<Vec<u8>>,
     pub media_dir: Option<String>,
     pub recording_dir: String,
     shutdown: ShutdownCoordinator,
@@ -39,6 +44,8 @@ pub struct TestServerBuilder {
     max_file_download_bytes: u64,
     empty_session_timeout_secs: u64,
     media_ip: Vec<IpAddr>,
+    tls: bool,
+    auth_hmac_secret: Option<Vec<u8>>,
 }
 
 impl Default for TestServerBuilder {
@@ -57,6 +64,8 @@ impl Default for TestServerBuilder {
             max_file_download_bytes: 100 * 1024 * 1024,
             empty_session_timeout_secs: 0,
             media_ip: vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
+            tls: false,
+            auth_hmac_secret: None,
         }
     }
 }
@@ -130,6 +139,19 @@ impl TestServerBuilder {
         self
     }
 
+    /// Serve WSS/HTTPS rather than plaintext WS/HTTP with a generated test
+    /// certificate for `localhost`.
+    pub fn tls(mut self) -> Self {
+        self.tls = true;
+        self
+    }
+
+    /// Enable HMAC authorization with this test-only shared secret.
+    pub fn auth_hmac_secret(mut self, secret: impl Into<Vec<u8>>) -> Self {
+        self.auth_hmac_secret = Some(secret.into());
+        self
+    }
+
     pub async fn start(self) -> TestServer {
         // Extract builder fields so they can be reused across retry attempts
         let media_dir = self.media_dir;
@@ -145,6 +167,8 @@ impl TestServerBuilder {
         let builder_ws_ping_interval_secs = self.ws_ping_interval_secs;
         let builder_max_file_download_bytes = self.max_file_download_bytes;
         let media_ip = self.media_ip;
+        let tls_enabled = self.tls;
+        let auth_hmac_secret = self.auth_hmac_secret;
 
         const MAX_ATTEMPTS: usize = 3;
         for attempt in 0..MAX_ATTEMPTS {
@@ -170,8 +194,43 @@ impl TestServerBuilder {
             let cache_dir = cache_td.path().to_path_buf();
             temp_dirs.push(cache_td);
 
+            let (tls, tls_cert_pem) = if tls_enabled {
+                let tls_dir = TempDir::new().expect("failed to create TLS tempdir");
+                let certificate = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+                    .expect("failed to create test TLS certificate");
+                let cert_pem = certificate.cert.pem();
+                let key_pem = certificate.key_pair.serialize_pem();
+                let cert_path = tls_dir.path().join("tls.crt");
+                let key_path = tls_dir.path().join("tls.key");
+                std::fs::write(&cert_path, &cert_pem).expect("failed to write test certificate");
+                std::fs::write(&key_path, key_pem).expect("failed to write test private key");
+                temp_dirs.push(tls_dir);
+                (
+                    Some(TlsConfig {
+                        cert_path,
+                        key_path,
+                    }),
+                    Some(cert_pem),
+                )
+            } else {
+                (None, None)
+            };
+
+            let auth_hmac_secret_file = if let Some(secret) = &auth_hmac_secret {
+                let auth_dir = TempDir::new().expect("failed to create auth tempdir");
+                let path = auth_dir.path().join("control-hmac");
+                std::fs::write(&path, secret).expect("failed to write test HMAC secret");
+                temp_dirs.push(auth_dir);
+                Some(path)
+            } else {
+                None
+            };
+
             let config = Config {
                 listen: vec![listen_addr],
+                tls,
+                auth_hmac_secret_file,
+                auth_hmac_max_age_secs: 60,
                 media_ip: media_ip.clone(),
                 rtp_port_range,
                 disconnect_timeout_secs,
@@ -231,6 +290,16 @@ impl TestServerBuilder {
             let ws_recording_dir = config.recording_dir.clone();
             let ws_max_message_size_kb = config.ws_max_message_size_kb;
             let server_shutdown = shutdown.clone();
+            let tls_config = config.tls.clone();
+            let authenticator = config
+                .auth_hmac_secret_file
+                .as_deref()
+                .map(|path| {
+                    HmacAuthenticator::from_secret_file(path, config.auth_hmac_max_age_secs)
+                })
+                .transpose()
+                .expect("failed to create test HMAC authenticator")
+                .map(Arc::new);
             let max_connections = config.max_connections;
             let max_recording_download_bytes = config.max_recording_download_bytes;
             let ws_ping_interval_secs = config.ws_ping_interval_secs;
@@ -239,6 +308,8 @@ impl TestServerBuilder {
             let server_task = tokio::spawn(async move {
                 let _ = rtpbridge::control::server::run_websocket_server(
                     vec![listen_addr],
+                    tls_config,
+                    authenticator,
                     manager,
                     server_shutdown,
                     metrics,
@@ -253,13 +324,13 @@ impl TestServerBuilder {
                 .await;
             });
 
-            // Wait for the server to be listening (poll connect instead of fixed sleep)
-            let url = format!("ws://127.0.0.1:{port}");
+            // Wait for the listener rather than performing a protocol handshake;
+            // the latter differs between plaintext and generated-cert TLS tests.
             let mut started = false;
             for i in 0..40 {
-                match tokio_tungstenite::connect_async(&url).await {
-                    Ok((ws, _)) => {
-                        drop(ws);
+                match tokio::net::TcpStream::connect(&addr).await {
+                    Ok(stream) => {
+                        drop(stream);
                         started = true;
                         break;
                     }
@@ -273,6 +344,8 @@ impl TestServerBuilder {
             if started {
                 return TestServer {
                     addr,
+                    tls_cert_pem,
+                    auth_hmac_secret: auth_hmac_secret.clone(),
                     media_dir: media_dir.clone(),
                     recording_dir,
                     shutdown,

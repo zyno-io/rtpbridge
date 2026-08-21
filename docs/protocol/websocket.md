@@ -15,7 +15,7 @@ per-edge resampling converts directly to each peer (e.g. an 8 kHz PCMU leg goes
    `connect_token` is returned.
 2. **Dial in (audio plane).** The audio peer opens a WebSocket to
    `ws://<host>:<port>/audio/<connect_token>` on the same port as the control/HTTP
-   server. On success the endpoint transitions to `connected`, joins the routing
+   server, or `wss://` when rtpbridge TLS is enabled. On success the endpoint transitions to `connected`, joins the routing
    table, and an `endpoint.ws.connected` event is emitted.
 3. **Stream.** Binary WebSocket frames carry raw audio (see Wire format). Audio
    routes to/from other endpoints in the session per the endpoint's direction.
@@ -82,6 +82,9 @@ the audio endpoint.
 
 - The `connect_token` is a single-use secret; reusing it (or presenting an unknown
   or malformed token) closes the audio socket with a 1008 (policy) close.
+- A configured control-plane HMAC secret does **not** apply to this route. The
+  single-use server-minted token is the audio capability; audio consumers must
+  not receive the control HMAC signing key.
 - A created endpoint that is never dialed into is auto-removed after 30 s
   (`endpoint.ws.connect_timeout`), reclaiming its endpoint slot and token.
 - WebSocket endpoints cannot be transferred between sessions (`endpoint.transfer`).

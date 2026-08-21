@@ -16,6 +16,7 @@ use tracing_subscriber::EnvFilter;
 use std::sync::Arc;
 
 use config::{Cli, Config};
+use control::auth::HmacAuthenticator;
 use metrics::Metrics;
 use playback::file_cache::FileCache;
 use session::SessionManager;
@@ -49,6 +50,18 @@ async fn main() -> anyhow::Result<()> {
     }
     if config.max_endpoints_per_session == 0 {
         warn!("max_endpoints_per_session is 0 (unlimited) — consider setting a limit");
+    }
+    let authenticator = config
+        .auth_hmac_secret_file
+        .as_deref()
+        .map(|path| HmacAuthenticator::from_secret_file(path, config.auth_hmac_max_age_secs))
+        .transpose()?
+        .map(Arc::new);
+    if config.tls.is_some() {
+        info!("control listener TLS enabled");
+    }
+    if authenticator.is_some() {
+        info!("control HMAC authorization enabled");
     }
 
     let shutdown = ShutdownCoordinator::new();
@@ -143,6 +156,8 @@ async fn main() -> anyhow::Result<()> {
         let shutdown = shutdown.clone();
         let metrics = Arc::clone(&metrics);
         let listen_addrs = config.listen.clone();
+        let tls_config = config.tls.clone();
+        let authenticator = authenticator.clone();
         let recording_dir = config.recording_dir.clone();
         let ws_max_message_size_kb = config.ws_max_message_size_kb;
         let max_connections = config.max_connections;
@@ -153,6 +168,8 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move {
             if let Err(e) = control::server::run_websocket_server(
                 listen_addrs,
+                tls_config,
+                authenticator,
                 manager,
                 shutdown,
                 metrics,

@@ -18,6 +18,7 @@ rtpbridge sits between VoIP endpoints, routing audio between them with support f
 - **Session management** with orphan timeout, reconnection (`session.attach`), and empty session auto-destroy
 - **Graceful shutdown** with configurable drain wait (k8s compatible)
 - **Split interface binding** for separate control and media networks
+- **Native TLS/WSS control listener** on the existing control port, with optional HMAC authorization for privileged control operations
 - **Symmetric RTP** with time-windowed address learning for NAT traversal
 
 ## Quick Start
@@ -83,6 +84,16 @@ ws_ping_interval_secs = 30
 log_level = "info"
 # See rtpbridge.toml.example for all available options
 ```
+
+### Control-plane security
+
+Set `[tls]` to serve HTTPS/WSS on the existing `listen` port; rtpbridge does
+not mix plaintext and TLS on that port. Set `auth_hmac_secret_file` to require
+short-lived HMAC-SHA256 signatures for control WebSocket upgrades and sensitive
+HTTP routes. `/audio/<connect_token>` remains a separate single-use audio
+capability, so AI/media consumers do not receive the control signing key. See
+the [configuration guide](docs/guide/configuration.md#tls-and-hmac-authorization)
+for the exact configuration and wire format.
 
 ## Control Protocol
 

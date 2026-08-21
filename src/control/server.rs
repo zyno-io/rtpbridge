@@ -1,23 +1,59 @@
+use std::fs::File;
+use std::io::BufReader;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
+use rustls::ServerConfig;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::accept_async_with_config;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tracing::{debug, error, info};
 use uuid::Uuid;
 
+use super::auth::HmacAuthenticator;
 use super::connection::handle_connection;
+use super::transport::{BoxedServerIo, PrefixedIo};
+use crate::config::TlsConfig;
 use crate::metrics::Metrics;
 use crate::session::SessionManager;
 use crate::shutdown::ShutdownCoordinator;
 
+/// Build the single TLS mode used by every configured control listener.
+pub fn build_tls_acceptor(tls: &TlsConfig) -> anyhow::Result<TlsAcceptor> {
+    let cert_file = File::open(&tls.cert_path)
+        .with_context(|| format!("open TLS certificate {:?}", tls.cert_path))?;
+    let mut cert_reader = BufReader::new(cert_file);
+    let certificates = rustls_pemfile::certs(&mut cert_reader)
+        .collect::<Result<Vec<_>, _>>()
+        .context("parse TLS certificate PEM")?;
+    if certificates.is_empty() {
+        anyhow::bail!("TLS certificate PEM contains no certificates");
+    }
+
+    let key_file = File::open(&tls.key_path)
+        .with_context(|| format!("open TLS private key {:?}", tls.key_path))?;
+    let mut key_reader = BufReader::new(key_file);
+    let private_key = rustls_pemfile::private_key(&mut key_reader)
+        .context("parse TLS private-key PEM")?
+        .context("TLS private-key PEM contains no supported private key")?;
+
+    let config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certificates, private_key)
+        .context("build TLS server configuration")?;
+    Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_websocket_server(
     listen_addrs: Vec<SocketAddr>,
+    tls_config: Option<TlsConfig>,
+    authenticator: Option<Arc<HmacAuthenticator>>,
     manager: Arc<SessionManager>,
     shutdown: ShutdownCoordinator,
     metrics: Arc<Metrics>,
@@ -29,10 +65,15 @@ pub async fn run_websocket_server(
     event_channel_size: usize,
     critical_event_channel_size: usize,
 ) -> anyhow::Result<()> {
+    let tls_acceptor = tls_config.as_ref().map(build_tls_acceptor).transpose()?;
     let mut listeners = Vec::with_capacity(listen_addrs.len());
     for addr in &listen_addrs {
         let listener = TcpListener::bind(addr).await?;
-        info!(addr = %addr, "Control server listening (WS + HTTP)");
+        if tls_acceptor.is_some() {
+            info!(addr = %addr, "Control server listening (WSS + HTTPS)");
+        } else {
+            info!(addr = %addr, "Control server listening (WS + HTTP)");
+        }
         listeners.push(listener);
     }
 
@@ -44,6 +85,7 @@ pub async fn run_websocket_server(
         max_connections
     };
     let connection_semaphore = Arc::new(tokio::sync::Semaphore::new(max_connections));
+    let tls_enabled = tls_acceptor.is_some();
 
     loop {
         tokio::select! {
@@ -57,10 +99,12 @@ pub async fn run_websocket_server(
                 };
 
                 if shutdown.is_shutting_down() {
-                    let _ = tokio::time::timeout(
-                        Duration::from_secs(1),
-                        stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
-                    ).await;
+                    if !tls_enabled {
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(1),
+                            stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+                        ).await;
+                    }
                     drop(stream);
                     continue;
                 }
@@ -69,10 +113,12 @@ pub async fn run_websocket_server(
                     Ok(permit) => permit,
                     Err(_) => {
                         debug!(peer = %peer_addr, "connection rejected: max connections reached");
-                        let _ = tokio::time::timeout(
-                            Duration::from_secs(1),
-                            stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
-                        ).await;
+                        if !tls_enabled {
+                            let _ = tokio::time::timeout(
+                                Duration::from_secs(1),
+                                stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+                            ).await;
+                        }
                         drop(stream);
                         continue;
                     }
@@ -83,12 +129,21 @@ pub async fn run_websocket_server(
                 let metrics = Arc::clone(&metrics);
                 let recording_dir = recording_dir.clone();
                 let ws_max_size = ws_max_message_size_kb;
+                let tls_acceptor = tls_acceptor.clone();
+                let authenticator = authenticator.clone();
 
                 tokio::spawn(async move {
                     // The permit travels with the connection: for control/HTTP it drops
                     // when handle_incoming returns; for an audio WS it is handed to the
                     // endpoint's IO task and held for the audio socket's lifetime.
-                    handle_incoming(stream, peer_addr, manager, shutdown, metrics, recording_dir, ws_max_size, max_recording_download_bytes, ws_ping_interval_secs, event_channel_size, critical_event_channel_size, permit).await;
+                    let stream = match accept_transport(stream, tls_acceptor).await {
+                        Ok(stream) => stream,
+                        Err(e) => {
+                            debug!(peer = %peer_addr, error = %e, "control TLS handshake failed");
+                            return;
+                        }
+                    };
+                    handle_incoming(stream, peer_addr, authenticator, manager, shutdown, metrics, recording_dir, ws_max_size, max_recording_download_bytes, ws_ping_interval_secs, event_channel_size, critical_event_channel_size, permit).await;
                 });
             }
             _ = shutdown.wait_for_shutdown() => {
@@ -115,11 +170,38 @@ async fn accept_any(listeners: &[TcpListener]) -> std::io::Result<(TcpStream, So
     .await
 }
 
-/// Handle an incoming TCP connection: either HTTP REST or WebSocket upgrade
+/// Upgrade a TCP stream when the listener is in TLS mode. The boxed transport
+/// gives the following HTTP/WebSocket code one concrete stream type.
+async fn accept_transport(
+    stream: TcpStream,
+    tls_acceptor: Option<TlsAcceptor>,
+) -> anyhow::Result<BoxedServerIo> {
+    match tls_acceptor {
+        Some(acceptor) => {
+            let stream = tokio::time::timeout(Duration::from_secs(10), acceptor.accept(stream))
+                .await
+                .context("TLS handshake timed out")??;
+            Ok(Box::new(stream))
+        }
+        None => Ok(Box::new(stream)),
+    }
+}
+
+/// Parsed HTTP request metadata used to authorize a request before handing a
+/// WebSocket upgrade to tungstenite.
+struct RequestHead {
+    method: String,
+    target: String,
+    authorization: Option<String>,
+    is_websocket_upgrade: bool,
+}
+
+/// Handle an incoming TLS or plaintext connection: HTTP REST or WebSocket.
 #[allow(clippy::too_many_arguments)]
 async fn handle_incoming(
-    mut stream: TcpStream,
+    mut stream: BoxedServerIo,
     peer_addr: SocketAddr,
+    authenticator: Option<Arc<HmacAuthenticator>>,
     manager: Arc<SessionManager>,
     shutdown: ShutdownCoordinator,
     metrics: Arc<Metrics>,
@@ -131,104 +213,95 @@ async fn handle_incoming(
     critical_event_channel_size: usize,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) {
-    // Classify the connection as HTTP or WebSocket within 5 seconds.
-    // Only the peek/classification is time-bounded; HTTP handlers run without timeout.
-    enum Classification {
-        Http(String, String),
-        /// Not an HTTP REST request (WebSocket upgrade or unknown). Carries the
-        /// request target path if one could be parsed, for audio-plane routing.
-        NotHttp(Option<String>),
-        PeekFailed,
-    }
-
-    let classification = tokio::time::timeout(Duration::from_secs(5), async {
-        let mut peek_buf = [0u8; 8192];
-        let n = match stream.peek(&mut peek_buf).await {
-            Ok(n) => n,
-            Err(_) => return Classification::PeekFailed,
+    let prefetched =
+        match tokio::time::timeout(Duration::from_secs(5), read_request_head(&mut stream)).await {
+            Ok(Ok(value)) => value,
+            Ok(Err(e)) => {
+                debug!(peer = %peer_addr, error = %e, "request header read failed");
+                return;
+            }
+            Err(_) => {
+                debug!(peer = %peer_addr, "connection timed out during request-header read");
+                return;
+            }
         };
-
-        let request_line = String::from_utf8_lossy(&peek_buf[..n]);
-        match extract_http_request(&request_line) {
-            Some((method, path)) => Classification::Http(method, path),
-            None => Classification::NotHttp(extract_request_path(&request_line)),
+    let request = match parse_request_head(&prefetched) {
+        Some(request) => request,
+        None => {
+            debug!(peer = %peer_addr, "invalid HTTP request header");
+            return;
         }
-    })
-    .await;
+    };
 
-    // Request path for an inbound WebSocket, captured during classification and
-    // used to route audio-plane connections (`/audio/<token>`) vs control. The
-    // HTTP / failure arms diverge (return); only the WebSocket arm assigns it,
-    // so the late init can't be folded into the match expression.
-    #[allow(clippy::needless_late_init)]
-    let ws_path: Option<String>;
-    match classification {
-        Ok(Classification::Http(method, path)) => {
-            // HTTP route — consume the peeked request, handle it, and respond.
-            let mut buf = vec![0u8; 4096];
-            let _n = match stream.read(&mut buf).await {
-                Ok(n) => n,
-                Err(e) => {
-                    debug!(peer = %peer_addr, error = %e, "HTTP request read failed");
-                    return;
-                }
-            };
-
-            let response = handle_http_request(
-                &method,
-                &path,
-                &manager,
-                &metrics,
-                &recording_dir,
-                max_recording_download_bytes,
+    let audio = classify_audio_path(&request.target);
+    if !request.is_websocket_upgrade {
+        if request_requires_hmac(&request.target)
+            && !is_authorized(
+                &authenticator,
+                request.authorization.as_deref(),
+                &request.method,
+                &request.target,
             )
-            .await;
-            let _ = stream.write_all(&response).await;
+        {
+            let _ = stream.write_all(&http_unauthorized_response()).await;
             return;
         }
-        Ok(Classification::PeekFailed) => return,
-        Err(_) => {
-            debug!(peer = %peer_addr, "connection timed out during HTTP classification");
-            return;
-        }
-        // Fall through to WebSocket upgrade, remembering the request path.
-        Ok(Classification::NotHttp(path)) => ws_path = path,
+        let response = handle_http_request(
+            &request.method,
+            &request.target,
+            &manager,
+            &metrics,
+            &recording_dir,
+            max_recording_download_bytes,
+        )
+        .await;
+        let _ = stream.write_all(&response).await;
+        return;
     }
 
-    // WebSocket upgrade with timeout to prevent slowloris-style DoS on the handshake.
+    // WebSocket audio connections retain their server-minted single-use token
+    // capability. All other upgrades are privileged control connections.
+    if audio.is_none()
+        && !is_authorized(
+            &authenticator,
+            request.authorization.as_deref(),
+            &request.method,
+            &request.target,
+        )
+    {
+        let _ = stream.write_all(&http_unauthorized_response()).await;
+        return;
+    }
+
     let ws_max_bytes = ws_max_message_size_kb.saturating_mul(1024);
     let ws_config = WebSocketConfig::default()
         .max_message_size(Some(ws_max_bytes))
         .max_frame_size(Some(ws_max_bytes));
+    let stream = PrefixedIo::new(prefetched, stream);
     let ws_result = tokio::time::timeout(
         Duration::from_secs(10),
         accept_async_with_config(stream, Some(ws_config)),
     )
     .await;
     match ws_result {
-        Ok(Ok(ws)) => {
-            // Any `/audio/...` path is an audio-plane connection (handed to the owning
-            // session, or rejected if the token is malformed/unknown). Everything else
-            // is a control connection.
-            match ws_path.as_deref().and_then(classify_audio_path) {
-                Some(token) => {
-                    crate::control::ws_audio::handle_audio_connection(ws, token, permit, &manager)
-                        .await;
-                }
-                None => {
-                    handle_connection(
-                        ws,
-                        peer_addr,
-                        manager,
-                        shutdown,
-                        ws_ping_interval_secs,
-                        event_channel_size,
-                        critical_event_channel_size,
-                    )
+        Ok(Ok(ws)) => match audio {
+            Some(token) => {
+                crate::control::ws_audio::handle_audio_connection(ws, token, permit, &manager)
                     .await;
-                }
             }
-        }
+            None => {
+                handle_connection(
+                    ws,
+                    peer_addr,
+                    manager,
+                    shutdown,
+                    ws_ping_interval_secs,
+                    event_channel_size,
+                    critical_event_channel_size,
+                )
+                .await;
+            }
+        },
         Ok(Err(e)) => {
             debug!(peer = %peer_addr, error = %e, "WebSocket handshake failed");
         }
@@ -240,16 +313,33 @@ async fn handle_incoming(
 
 /// Path prefix for WebSocket audio-plane connections.
 const AUDIO_PATH_PREFIX: &str = "/audio/";
+const MAX_REQUEST_HEADER_BYTES: usize = 8192;
 
-/// Extract the request-target path from an HTTP/WS request's first line.
-fn extract_request_path(data: &str) -> Option<String> {
-    let first_line = data.lines().next()?;
-    let mut parts = first_line.split_whitespace();
-    let method = parts.next()?;
-    if method != "GET" {
-        return None;
+/// Read and retain a complete HTTP request header. The retained bytes are
+/// replayed to tungstenite after classification, including a pipelined first
+/// WebSocket frame that arrived in the same read.
+async fn read_request_head(stream: &mut BoxedServerIo) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(1024);
+    loop {
+        let mut buffer = [0_u8; 1024];
+        let read = stream.read(&mut buffer).await?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "connection closed before HTTP headers completed",
+            ));
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+        if bytes.len() > MAX_REQUEST_HEADER_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "HTTP request headers exceed limit",
+            ));
+        }
+        if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+            return Ok(bytes);
+        }
     }
-    parts.next().map(|target| target.to_string())
 }
 
 /// Classify a WS request path. Returns `None` for non-audio (control) paths;
@@ -262,28 +352,63 @@ fn classify_audio_path(path: &str) -> Option<Option<Uuid>> {
     Some(Uuid::parse_str(rest).ok())
 }
 
-/// Extract the method and path from an HTTP request line, if not a WS upgrade
-fn extract_http_request(data: &str) -> Option<(String, String)> {
-    let first_line = data.lines().next()?;
-    let parts: Vec<&str> = first_line.split_whitespace().collect();
-    if parts.len() < 2 {
+fn parse_request_head(data: &[u8]) -> Option<RequestHead> {
+    let end = data.windows(4).position(|window| window == b"\r\n\r\n")?;
+    let header = std::str::from_utf8(&data[..end]).ok()?;
+    let mut lines = header.split("\r\n");
+    let request_line = lines.next()?;
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next()?.to_string();
+    let target = parts.next()?.to_string();
+    if parts.next()? != "HTTP/1.1" || parts.next().is_some() {
         return None;
     }
 
-    let method = parts[0];
-    if !matches!(method, "GET" | "DELETE") {
-        return None;
-    }
-
-    // Check if this has an Upgrade header (WebSocket)
-    if method == "GET" {
-        let lower = data.to_ascii_lowercase();
-        if lower.contains("upgrade: websocket") {
-            return None;
+    let mut authorization = None;
+    let mut is_websocket_upgrade = false;
+    for line in lines {
+        let (name, value) = line.split_once(':')?;
+        if name.eq_ignore_ascii_case("authorization") {
+            authorization = Some(value.trim().to_string());
+        } else if name.eq_ignore_ascii_case("upgrade")
+            && value.trim().eq_ignore_ascii_case("websocket")
+        {
+            is_websocket_upgrade = true;
         }
     }
+    Some(RequestHead {
+        method,
+        target,
+        authorization,
+        is_websocket_upgrade,
+    })
+}
 
-    Some((method.to_string(), parts[1].to_string()))
+fn request_requires_hmac(target: &str) -> bool {
+    let path = target.split('?').next().unwrap_or(target);
+    !matches!(path, "/health" | "/metrics")
+}
+
+fn is_authorized(
+    authenticator: &Option<Arc<HmacAuthenticator>>,
+    authorization: Option<&str>,
+    method: &str,
+    target: &str,
+) -> bool {
+    authenticator
+        .as_ref()
+        .is_none_or(|auth| auth.authorize(authorization, method, target).is_ok())
+}
+
+fn http_unauthorized_response() -> Vec<u8> {
+    b"HTTP/1.1 401 Unauthorized\r\n\
+      WWW-Authenticate: HMAC-SHA256\r\n\
+      Content-Type: application/json\r\n\
+      Content-Length: 24\r\n\
+      Connection: close\r\n\
+      \r\n\
+      {\"error\":\"unauthorized\"}"
+        .to_vec()
 }
 
 fn http_json_response(status: &str, body: &str) -> Vec<u8> {
@@ -635,60 +760,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_extract_http_request_get() {
-        let input = "GET /sessions HTTP/1.1\r\nHost: localhost\r\n";
-        let result = extract_http_request(input);
-        assert_eq!(result, Some(("GET".to_string(), "/sessions".to_string())));
+    fn parses_http_request_head() {
+        let input = b"GET /sessions?detail=1 HTTP/1.1\r\nHost: localhost\r\nAuthorization: HMAC-SHA256 1:sig\r\n\r\n";
+        let result = parse_request_head(input).expect("request should parse");
+        assert_eq!(result.method, "GET");
+        assert_eq!(result.target, "/sessions?detail=1");
+        assert_eq!(result.authorization.as_deref(), Some("HMAC-SHA256 1:sig"));
+        assert!(!result.is_websocket_upgrade);
     }
 
     #[test]
-    fn test_extract_http_request_delete() {
-        let input = "DELETE /recordings/test.pcap HTTP/1.1\r\nHost: localhost\r\n";
-        let result = extract_http_request(input);
-        assert_eq!(
-            result,
-            Some(("DELETE".to_string(), "/recordings/test.pcap".to_string()))
-        );
+    fn detects_websocket_upgrade_and_audio_capability_path() {
+        let input = b"GET /audio/550e8400-e29b-41d4-a716-446655440000 HTTP/1.1\r\nUpgrade: websocket\r\n\r\n";
+        let request = parse_request_head(input).expect("request should parse");
+        assert!(request.is_websocket_upgrade);
+        assert!(matches!(
+            classify_audio_path(&request.target),
+            Some(Some(_))
+        ));
     }
 
     #[test]
-    fn test_extract_http_request_websocket_upgrade_excluded() {
-        let input =
-            "GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n";
-        let result = extract_http_request(input);
-        assert_eq!(result, None, "WebSocket upgrade should be excluded");
+    fn leaves_only_observability_routes_unauthenticated() {
+        assert!(!request_requires_hmac("/health"));
+        assert!(!request_requires_hmac("/metrics?format=prometheus"));
+        assert!(request_requires_hmac("/sessions"));
+        assert!(request_requires_hmac("/recordings?limit=1"));
     }
 
     #[test]
-    fn test_extract_http_request_post_rejected() {
-        let input = "POST /sessions HTTP/1.1\r\nHost: localhost\r\n";
-        let result = extract_http_request(input);
-        assert_eq!(result, None, "POST should be rejected");
-    }
-
-    #[test]
-    fn test_extract_http_request_empty_input() {
-        let result = extract_http_request("");
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn test_extract_http_request_garbage() {
-        let result = extract_http_request("not http at all");
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn test_extract_http_request_path_with_query() {
-        let input = "GET /recordings?startsWith=test&limit=10 HTTP/1.1\r\n";
-        let result = extract_http_request(input);
-        assert_eq!(
-            result,
-            Some((
-                "GET".to_string(),
-                "/recordings?startsWith=test&limit=10".to_string()
-            ))
-        );
+    fn rejects_incomplete_or_non_http_request_headers() {
+        assert!(parse_request_head(b"GET / HTTP/1.1\r\n").is_none());
+        assert!(parse_request_head(b"not http at all\r\n\r\n").is_none());
     }
 
     #[test]

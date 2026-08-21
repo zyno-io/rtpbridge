@@ -5,6 +5,16 @@ use clap::parser::ValueSource;
 use clap::{CommandFactory, Parser};
 use serde::Deserialize;
 
+/// TLS material for the combined HTTP/WebSocket listener. When configured, all
+/// listener addresses use TLS; plaintext and TLS are never mixed on one port.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TlsConfig {
+    /// PEM certificate chain presented by the control/HTTP listener.
+    pub cert_path: PathBuf,
+    /// PEM private key matching [`cert_path`](Self::cert_path).
+    pub key_path: PathBuf,
+}
+
 /// Parse a comma-separated list of socket addresses.
 fn parse_listen_addrs(s: &str) -> Result<Vec<SocketAddr>, String> {
     s.split(',')
@@ -79,6 +89,19 @@ pub struct Config {
     /// WebSocket control plane listen addresses (comma-separated ip:port)
     #[serde(deserialize_with = "deserialize_listen_addrs")]
     pub listen: Vec<SocketAddr>,
+
+    /// Optional TLS configuration for every HTTP/WebSocket listener. Omit to
+    /// retain the legacy plaintext `ws://` / `http://` listener.
+    pub tls: Option<TlsConfig>,
+
+    /// Optional path to shared HMAC key material. When set, control WebSocket
+    /// upgrades and sensitive HTTP routes require signed Authorization headers.
+    /// The audio plane deliberately remains authorized by its single-use token.
+    pub auth_hmac_secret_file: Option<PathBuf>,
+
+    /// Maximum accepted age for a signed HMAC request. Bounds signature replay.
+    #[serde(default = "default_auth_hmac_max_age_secs")]
+    pub auth_hmac_max_age_secs: u64,
 
     /// Media plane bind IPs for all RTP/WebRTC UDP sockets (at most one IPv4 and
     /// one IPv6). Used in SDP c= lines and ICE host candidates. Plain RTP picks
@@ -184,6 +207,10 @@ fn default_recording_dir() -> PathBuf {
     PathBuf::from("/var/lib/rtpbridge/recordings")
 }
 
+fn default_auth_hmac_max_age_secs() -> u64 {
+    60
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -192,6 +219,9 @@ impl Default for Config {
                     .parse()
                     .expect("hardcoded default listen address must parse"),
             ],
+            tls: None,
+            auth_hmac_secret_file: None,
+            auth_hmac_max_age_secs: default_auth_hmac_max_age_secs(),
             media_ip: default_media_ip(),
             // rtp_port_range applies per family — each media IP gets its own pool.
             rtp_port_range: (30000, 39999),
@@ -266,6 +296,25 @@ impl Config {
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.listen.is_empty() {
             anyhow::bail!("listen must contain at least one address");
+        }
+        if let Some(tls) = &self.tls {
+            if !tls.cert_path.is_file() {
+                anyhow::bail!("tls.cert_path {:?} is not a readable file", tls.cert_path);
+            }
+            if !tls.key_path.is_file() {
+                anyhow::bail!("tls.key_path {:?} is not a readable file", tls.key_path);
+            }
+        }
+        if let Some(secret_file) = &self.auth_hmac_secret_file
+            && !secret_file.is_file()
+        {
+            anyhow::bail!(
+                "auth_hmac_secret_file {:?} is not a readable file",
+                secret_file
+            );
+        }
+        if self.auth_hmac_max_age_secs == 0 || self.auth_hmac_max_age_secs > 300 {
+            anyhow::bail!("auth_hmac_max_age_secs must be between 1 and 300");
         }
         if self.rtp_port_range.0 > self.rtp_port_range.1 {
             anyhow::bail!(

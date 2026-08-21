@@ -2,9 +2,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Instant;
 
 use futures_util::{SinkExt, StreamExt};
-use tokio::net::TcpStream;
 use tokio::sync::{OwnedSemaphorePermit, mpsc};
-use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace};
@@ -16,10 +14,11 @@ use super::stats::EndpointStats;
 use crate::control::protocol::{
     EndpointDirection, EndpointDirectionUpdate, EndpointId, EndpointState,
 };
+use crate::control::transport::ServerWebSocket;
 
 /// The concrete WebSocket type handed to a WS audio endpoint after the
 /// HTTP upgrade completes on the control/HTTP listener.
-pub type AudioWsStream = WebSocketStream<TcpStream>;
+pub type AudioWsStream = ServerWebSocket;
 
 /// L16 payload type used internally (matches bridge endpoints).
 const L16_PT: u8 = 127;

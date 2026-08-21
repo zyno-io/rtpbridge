@@ -17,6 +17,13 @@
 # Clients connect here to create sessions, add endpoints, and control routing.
 # listen = "0.0.0.0:9100"
 
+# Optional shared HMAC key for privileged control WebSocket upgrades and
+# session/recording HTTP routes. Keep this in a mounted secret file; never put
+# the key itself in this TOML. `/audio/<connect_token>` remains authorized by
+# its single-use token, so audio consumers do not receive this key.
+# auth_hmac_secret_file = "/etc/rtpbridge/auth/control-hmac"
+# auth_hmac_max_age_secs = 60
+
 # ---------------------------------------------------------------------------
 # Media Plane
 # ---------------------------------------------------------------------------
@@ -155,6 +162,19 @@ recording_flush_timeout_secs = 10
 # Log level: trace, debug, info, warn, error.
 # Can also be set via --log-level on the command line (CLI wins).
 # log_level = "info"
+
+# ---------------------------------------------------------------------------
+# Native TLS (optional; must be the final TOML table)
+# ---------------------------------------------------------------------------
+#
+# When enabled, the ordinary control port (9100) serves HTTPS/WSS only. It
+# cannot also serve plaintext HTTP/WS. Mount PEM files from your certificate
+# provider and use `wss://` / `https://` clients. These settings are commented
+# out together because TOML table syntax scopes all following keys.
+#
+# [tls]
+# cert_path = "/etc/rtpbridge/tls/tls.crt"
+# key_path = "/etc/rtpbridge/tls/tls.key"
 
 # ---------------------------------------------------------------------------
 # Kubernetes Deployment Notes

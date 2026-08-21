@@ -21,6 +21,14 @@ rtpbridge [OPTIONS]
 # WebSocket/HTTP control plane (comma-separated addresses accepted)
 listen = "0.0.0.0:9100"
 
+# Optional HMAC control-plane authorization. The value is read from a mounted
+# file, never written inline in this config. When configured, control WebSocket
+# upgrades and sensitive HTTP routes require the signed Authorization header
+# documented below. `/health`, `/metrics`, and single-use `/audio/<token>`
+# connections intentionally remain separate capabilities.
+auth_hmac_secret_file = "/etc/rtpbridge/auth/control-hmac"
+auth_hmac_max_age_secs = 60
+
 # Media plane IP(s) — used for RTP sockets and SDP/ICE candidates.
 # A single address, or a comma-separated IPv4+IPv6 pair for dual-stack.
 media_ip = "203.0.113.5"
@@ -94,6 +102,15 @@ max_recording_download_bytes = 536870912  # 512 MB
 
 # Log level
 log_level = "info"
+
+# Optional: enable TLS for every HTTP/WebSocket connection on `listen`. When
+# configured, the same port serves HTTPS/WSS rather than plaintext HTTP/WS.
+# Both files must be PEM encoded. Omit the whole table to keep the legacy
+# plaintext listener for local development. This table is last because TOML
+# keys that follow it would otherwise belong to the `tls` table.
+[tls]
+cert_path = "/etc/rtpbridge/tls/tls.crt"
+key_path = "/etc/rtpbridge/tls/tls.key"
 ```
 
 ## Split Interface Binding
@@ -142,6 +159,34 @@ In addition to the WebSocket control protocol, rtpbridge serves HTTP endpoints o
 | `/recordings/{path}` | DELETE | Delete a specific PCAP recording file |
 
 All HTTP responses include `Connection: close`. Recording file paths are validated against the configured `recording_dir` to prevent path traversal.
+
+## TLS and HMAC authorization
+
+`[tls]` is all-or-nothing: when it is present, **every** address in `listen`
+serves TLS on the same configured port. The control WebSocket becomes `wss://`
+and the HTTP endpoints become `https://`; rtpbridge does not multiplex plaintext
+and TLS on one port. The server authenticates its certificate but does not
+request client certificates.
+
+Set `auth_hmac_secret_file` to enable application authorization. It must point
+to a readable file containing at least 32 bytes of shared key material. The
+secret is intentionally read from a file so it can be mounted from a secret
+manager rather than committed to TOML. A protected request must include:
+
+```text
+Authorization: HMAC-SHA256 <unix-seconds>:<base64url-no-padding-signature>
+```
+
+The signature is `HMAC-SHA256(secret, "rtpbridge-auth-v1\\n<unix-seconds>\\n<METHOD>\\n<request-target>")`.
+`request-target` includes the path and query string exactly as sent. The server
+rejects a missing, malformed, expired, future-dated, or invalid signature with
+`401`; `auth_hmac_max_age_secs` limits replay time (default 60 seconds).
+
+When HMAC authorization is enabled it protects control WebSocket upgrades and
+the session/recording HTTP surfaces. `/health` and `/metrics` remain unauthenticated
+for orchestration and Prometheus. The `/audio/<connect_token>` WebSocket remains
+authorized by rtpbridge's existing server-minted, single-use opaque token; do
+not give an AI/media consumer the HMAC signing key merely to stream PCM.
 
 ## Security
 
@@ -251,6 +296,10 @@ All configuration options with their types, defaults, and descriptions. All chan
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `listen` | `ip:port[,ip:port...]` | `0.0.0.0:9100` | WebSocket/HTTP control plane listen address(es), comma-separated |
+| `tls.cert_path` | path | — | Optional PEM server certificate. With `tls.key_path`, changes every control listener to HTTPS/WSS. |
+| `tls.key_path` | path | — | Optional PEM private key; must be supplied with `tls.cert_path`. |
+| `auth_hmac_secret_file` | path | — | Optional mounted HMAC key file (minimum 32 bytes) for control-plane authorization. |
+| `auth_hmac_max_age_secs` | `u64` | `60` | Accepted signature age; must be 1–300 seconds. |
 | `media_ip` | `ip[,ip]` | `127.0.0.1` | IP(s) for RTP/WebRTC UDP sockets; appears in SDP and ICE candidates. Comma-separated for dual-stack (≤1 IPv4, ≤1 IPv6) |
 | `rtp_port_range` | `[u16, u16]` | `[30000, 39999]` | UDP port range for plain RTP endpoints (must start even, >= 1024) |
 | `disconnect_timeout_secs` | `u64` | `30` | Seconds to keep orphaned sessions alive after WebSocket disconnect |

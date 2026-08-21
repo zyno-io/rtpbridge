@@ -53,10 +53,27 @@ spec:
       volumeMounts:
         - name: config
           mountPath: /etc/rtpbridge
+        # When `[tls]` is configured, mount the PEM certificate/key read-only.
+        - name: control-tls
+          mountPath: /etc/rtpbridge/tls
+          readOnly: true
+        # Mount the HMAC key separately from the config file. Give this only to
+        # rtpbridge and trusted control clients, never audio-only consumers.
+        - name: control-auth
+          mountPath: /etc/rtpbridge/auth
+          readOnly: true
   volumes:
     - name: config
       configMap:
         name: rtpbridge-config
+    - name: control-tls
+      secret:
+        secretName: rtpbridge-control-tls
+        optional: true
+    - name: control-auth
+      secret:
+        secretName: rtpbridge-control-auth
+        optional: true
 ```
 
 Resource requirements depend on workload — transcoding (especially Opus) is CPU-intensive. Monitor actual usage and adjust accordingly.
@@ -91,6 +108,11 @@ readinessProbe:
   initialDelaySeconds: 2
   periodSeconds: 5
 ```
+
+When `[tls]` is configured, add `scheme: HTTPS` to both probe `httpGet`
+blocks. Configure Prometheus to use an HTTPS target too, and provide its trust
+store for the issuing CA. Health and metrics do not need HMAC authorization;
+they still need surrounding network-policy or firewall restrictions.
 
 ## Prometheus Metrics
 
@@ -169,42 +191,25 @@ groups:
         for: 5m
 ```
 
-## Reverse Proxy / TLS
+## TLS and control authorization
 
-The control plane serves plain WebSocket and HTTP. To add TLS, place a reverse proxy in front of rtpbridge.
+rtpbridge can serve TLS itself on its ordinary control port: configure `[tls]`
+with PEM certificate and key paths and use `wss://<host>:9100` / `https://<host>:9100`.
+It does not mix TLS and plaintext on one listener. A reverse proxy remains
+optional when it provides a separate operational benefit, but is not required
+for WSS.
 
-### nginx
+Set `auth_hmac_secret_file` to require HMAC-SHA256 Authorization signatures for
+control WebSocket upgrades and session/recording HTTP routes. The secret belongs
+only to rtpbridge and trusted control issuers such as Nexus or the legacy bridge;
+mount it as a file from your secret manager. AI agents retain only their
+server-minted single-use `/audio/<token>` capability, never the HMAC key. See
+[configuration](./configuration.md#tls-and-hmac-authorization) for the exact
+signature format.
 
-```nginx
-upstream rtpbridge {
-    server 127.0.0.1:9100;
-}
-
-server {
-    listen 443 ssl;
-    server_name rtpbridge.example.com;
-
-    ssl_certificate     /etc/ssl/certs/rtpbridge.crt;
-    ssl_certificate_key /etc/ssl/private/rtpbridge.key;
-
-    location / {
-        proxy_pass http://rtpbridge;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host $host;
-        proxy_read_timeout 86400s;
-    }
-}
-```
-
-Set `proxy_read_timeout` high enough to cover long-lived WebSocket sessions. The media plane (RTP/UDP) is not proxied — it must be directly reachable.
-
-## Security
-
-The WebSocket control plane does not implement authentication or encryption. It is expected to be secured at the infrastructure level — for example, via an mTLS service mesh (Istio, Linkerd), a reverse proxy with client certificate verification, or network policies that restrict access to trusted services only.
-
-Do not expose the control plane port directly to untrusted networks.
+`/health` and `/metrics` deliberately remain unauthenticated so Kubernetes and
+Prometheus can scrape them; restrict those paths with the surrounding network
+policy. Do not expose the control port directly to an untrusted network.
 
 ## Systemd
 

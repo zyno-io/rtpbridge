@@ -3,9 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{Instrument, debug, debug_span, info, info_span, trace, warn};
 
@@ -14,6 +12,7 @@ use super::logging::{
     error_message_summary, event_body, request_body, response_body, safe_protocol_name,
 };
 use super::protocol::{Event, Request, Response};
+use super::transport::ServerWebSocket;
 use crate::session::SessionManager;
 use crate::shutdown::ShutdownCoordinator;
 
@@ -22,7 +21,7 @@ use crate::shutdown::ShutdownCoordinator;
 const MAX_REQUEST_ID_LEN: usize = 1024;
 
 pub async fn handle_connection(
-    ws: WebSocketStream<TcpStream>,
+    ws: ServerWebSocket,
     peer_addr: std::net::SocketAddr,
     manager: Arc<SessionManager>,
     shutdown: ShutdownCoordinator,
@@ -45,7 +44,7 @@ pub async fn handle_connection(
 }
 
 async fn handle_connection_inner(
-    ws: WebSocketStream<TcpStream>,
+    ws: ServerWebSocket,
     peer_addr: std::net::SocketAddr,
     manager: Arc<SessionManager>,
     shutdown: ShutdownCoordinator,
@@ -75,7 +74,7 @@ async fn handle_connection_inner(
     /// Send the session.orphaned event directly on the WebSocket.
     /// Best-effort: errors are silently ignored since the connection is closing.
     async fn send_orphan_event(
-        ws_tx: &mut futures_util::stream::SplitSink<WebSocketStream<TcpStream>, Message>,
+        ws_tx: &mut futures_util::stream::SplitSink<ServerWebSocket, Message>,
         state: &ConnectionState,
         manager: &SessionManager,
     ) {
@@ -270,7 +269,7 @@ async fn handle_connection_inner(
 }
 
 async fn send_ws_response(
-    ws_tx: &mut SplitSink<WebSocketStream<TcpStream>, Message>,
+    ws_tx: &mut SplitSink<ServerWebSocket, Message>,
     method: &str,
     resp: Response,
 ) -> bool {
@@ -368,7 +367,7 @@ fn log_ws_response_sent(method: &str, resp: &Response) {
 /// learns about drops immediately after the request that caused them.
 /// Returns `false` if a WebSocket send failed (connection is dead).
 async fn drain_pending_events(
-    ws_tx: &mut futures_util::stream::SplitSink<WebSocketStream<TcpStream>, Message>,
+    ws_tx: &mut futures_util::stream::SplitSink<ServerWebSocket, Message>,
     critical_rx: &mut mpsc::Receiver<Event>,
     event_rx: &mut mpsc::Receiver<Event>,
     dropped_events: &AtomicU64,

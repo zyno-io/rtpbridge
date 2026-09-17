@@ -75,6 +75,7 @@ pub struct SessionManager {
     session_idle_timeout_secs: u64,
     empty_session_timeout_secs: u64,
     media_timeout_secs: u64,
+    legacy_ice_renomination: bool,
     transcode_cache_size: usize,
     media_dir: Option<PathBuf>,
     file_cache: Arc<FileCache>,
@@ -103,6 +104,7 @@ impl SessionManager {
         session_idle_timeout_secs: u64,
         empty_session_timeout_secs: u64,
         media_timeout_secs: u64,
+        legacy_ice_renomination: bool,
         transcode_cache_size: usize,
         media_dir: Option<PathBuf>,
         file_cache: Arc<FileCache>,
@@ -130,6 +132,7 @@ impl SessionManager {
             session_idle_timeout_secs,
             empty_session_timeout_secs,
             media_timeout_secs,
+            legacy_ice_renomination,
             transcode_cache_size,
             media_dir,
             file_cache,
@@ -200,6 +203,7 @@ impl SessionManager {
         let idle_timeout_secs = self.session_idle_timeout_secs;
         let empty_timeout_secs = self.empty_session_timeout_secs;
         let media_timeout_secs = self.media_timeout_secs;
+        let legacy_ice_renomination = self.legacy_ice_renomination;
         let transcode_cache_size = self.transcode_cache_size;
         let metrics = Arc::clone(&self.metrics);
         let shared_playback = Arc::clone(&self.shared_playback);
@@ -245,6 +249,7 @@ impl SessionManager {
                     idle_timeout_secs,
                     empty_timeout_secs,
                     media_timeout_secs,
+                    legacy_ice_renomination,
                     transcode_cache_size,
                     Arc::clone(&metrics),
                     shared_playback,
@@ -492,6 +497,7 @@ mod tests {
             session_idle_timeout_secs: 0,
             empty_session_timeout_secs: 0,
             media_timeout_secs: 5,
+            legacy_ice_renomination: false,
             transcode_cache_size: 64,
             media_dir: None,
             file_cache,

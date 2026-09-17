@@ -18,6 +18,7 @@ fn test_session_state() -> SessionState {
         ),
         endpoint_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         max_endpoints: 100,
+        legacy_ice_renomination: false,
         metrics: Arc::new(crate::metrics::Metrics::new()),
         cmd_tx,
         event_tx: None,

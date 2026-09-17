@@ -187,6 +187,7 @@ pub fn parse_sdp(sdp: &str) -> ParsedSdp {
     // Some(false) = inside a non-audio m= section (e.g. m=video)
     // Attributes from non-audio sections are ignored to prevent cross-section PT collisions.
     let mut media_section: Option<bool> = None;
+    let mut selected_active_audio = false;
 
     for line in sdp.lines() {
         let line = line.trim();
@@ -206,11 +207,22 @@ pub fn parse_sdp(sdp: &str) -> ParsedSdp {
             media_section = Some(false);
             continue;
         } else if let Some(rest) = line.strip_prefix("m=audio ") {
-            media_section = Some(true);
             let parts: Vec<&str> = rest.split_whitespace().collect();
-            if let Some(port_str) = parts.first() {
-                m_port = port_str.parse().ok();
+            let active_port = parts
+                .first()
+                .and_then(|port| port.parse::<u16>().ok())
+                .filter(|port| *port > 0);
+            if active_port.is_none() || selected_active_audio {
+                // RFC 3264 rejects a media stream with port zero. Ignore rejected
+                // and additional audio sections so they cannot overwrite the
+                // first active RTP target selected for this endpoint.
+                media_section = Some(false);
+                continue;
             }
+
+            selected_active_audio = true;
+            media_section = Some(true);
+            m_port = active_port;
             // Capture media protocol (e.g., "RTP/AVP", "RTP/SAVP")
             if parts.len() >= 2 {
                 result.media_protocol = Some(parts[1].to_string());

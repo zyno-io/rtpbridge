@@ -529,7 +529,7 @@ fn test_parse_sdp_duplicate_codec_definitions() {
 
 #[test]
 fn test_parse_sdp_two_audio_m_lines() {
-    // Two m=audio lines — codecs from both should be merged
+    // One endpoint selects the first active m=audio section.
     let sdp = "v=0\r\n\
         o=- 600 1 IN IP4 10.0.0.1\r\n\
         s=-\r\n\
@@ -543,11 +543,12 @@ fn test_parse_sdp_two_audio_m_lines() {
         a=sendrecv\r\n";
 
     let parsed = parse_sdp(sdp);
-    // Both codecs should be present (merged from both m= lines)
+    // Preserve the first section and ignore attributes from the second.
     let has_pcmu = parsed.codecs.iter().any(|c| c.name == "PCMU");
     let has_g722 = parsed.codecs.iter().any(|c| c.name == "G722");
     assert!(has_pcmu, "should have PCMU from first m=audio line");
-    assert!(has_g722, "should have G722 from second m=audio line");
+    assert!(!has_g722, "should not merge G722 from second m=audio line");
+    assert_eq!(parsed.remote_addr.unwrap().port(), 30000);
 }
 
 #[test]
@@ -618,9 +619,42 @@ fn test_parse_sdp_port_zero_rejected() {
         parsed.remote_addr.is_none(),
         "port 0 should result in no remote_addr (stream rejected)"
     );
-    // Codecs should still be parsed (the SDP is structurally valid)
     assert!(
-        !parsed.codecs.is_empty(),
-        "codecs should still be parsed even with port 0"
+        parsed.codecs.is_empty(),
+        "codecs from a rejected section should be ignored"
     );
+}
+
+#[test]
+fn test_rejected_audio_section_does_not_overwrite_active_session_level_connection() {
+    // FreeSWITCH can append a rejected codec/media alternative after the active
+    // stream. The later port-zero section must not erase the usable RTP target.
+    let sdp = "v=0\r\n\
+        o=FreeSWITCH 1756857494 1756857495 IN IP4 135.148.37.93\r\n\
+        s=FreeSWITCH\r\n\
+        c=IN IP4 135.148.37.93\r\n\
+        t=0 0\r\n\
+        m=audio 17826 RTP/SAVP 9 101\r\n\
+        a=rtpmap:9 G722/8000\r\n\
+        a=rtpmap:101 telephone-event/8000\r\n\
+        a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\n\
+        a=sendrecv\r\n\
+        m=audio 0 RTP/AVP 19\r\n\
+        a=rtpmap:19 CN/8000\r\n";
+
+    let parsed = parse_sdp(sdp);
+    assert_eq!(
+        parsed.remote_addr,
+        Some("135.148.37.93:17826".parse().unwrap())
+    );
+    assert_eq!(parsed.media_protocol.as_deref(), Some("RTP/SAVP"));
+    assert_eq!(
+        parsed
+            .codecs
+            .iter()
+            .map(|codec| codec.name)
+            .collect::<Vec<_>>(),
+        vec!["G722", "telephone-event"]
+    );
+    assert!(parsed.crypto.is_some());
 }

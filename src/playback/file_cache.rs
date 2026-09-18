@@ -242,6 +242,19 @@ impl FileCache {
         timeout_ms: u32,
         headers: Option<&HashMap<String, String>>,
     ) -> anyhow::Result<DownloadRequest> {
+        self.start_download_with_cache_key(url, None, cache_ttl_secs, timeout_ms, headers)
+    }
+
+    /// Starts a URL download keyed by `cache_key` when supplied, otherwise by its source URL.
+    /// Headers always remain part of the cache identity.
+    pub fn start_download_with_cache_key(
+        &self,
+        url: &str,
+        cache_key: Option<&str>,
+        cache_ttl_secs: u32,
+        timeout_ms: u32,
+        headers: Option<&HashMap<String, String>>,
+    ) -> anyhow::Result<DownloadRequest> {
         self.policy.validate(url)?;
         if timeout_ms == 0 || timeout_ms > 60_000 {
             anyhow::bail!("download timeout must be 1..60000 ms");
@@ -250,7 +263,7 @@ impl FileCache {
         let permit = Arc::clone(&self.owners)
             .try_acquire_owned()
             .map_err(|_| anyhow::anyhow!("DOWNLOAD_BUSY"))?;
-        let key = cache_key_hash(url, headers);
+        let key = cache_key_hash(url, cache_key, headers);
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = state.entries.get_mut(&key) {
             entry.expires_at = Instant::now() + Duration::from_secs(u64::from(cache_ttl_secs));
@@ -562,11 +575,7 @@ pub fn is_url(source: &str) -> bool {
 
 /// Returns a deterministic cache key for a URL (used for shared playback IDs).
 pub fn cache_key(url: &str) -> String {
-    url_hash(url)
-}
-
-fn url_hash(url: &str) -> String {
-    cache_key_hash(url, None)
+    cache_key_hash(url, None, None)
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -578,17 +587,24 @@ fn hex_lower(bytes: &[u8]) -> String {
     s
 }
 
-/// Cache key that incorporates both URL and optional headers.
+/// Cache key that incorporates a caller-supplied logical key or URL and optional headers.
 /// When headers are present (e.g. Authorization), requests with different
 /// headers are cached separately to avoid serving wrong content.
 fn cache_key_hash(
     url: &str,
+    cache_key: Option<&str>,
     headers: Option<&std::collections::HashMap<String, String>>,
 ) -> String {
     use sha2::Digest;
     let mut hasher = sha2::Sha256::new();
-    hasher.update((url.len() as u64).to_be_bytes());
-    hasher.update(url.as_bytes());
+    let (identity_kind, identity) = match cache_key {
+        Some(cache_key) => (b"cache-key".as_slice(), cache_key),
+        None => (b"source-url".as_slice(), url),
+    };
+    hasher.update((identity_kind.len() as u64).to_be_bytes());
+    hasher.update(identity_kind);
+    hasher.update((identity.len() as u64).to_be_bytes());
+    hasher.update(identity.as_bytes());
     hasher.update((headers.map_or(0, |headers| headers.len()) as u64).to_be_bytes());
     if let Some(hdrs) = headers {
         // Sort keys for deterministic hashing
@@ -700,8 +716,35 @@ mod tests {
     fn cache_key_fields_have_unambiguous_boundaries() {
         let headers = HashMap::from([("Authorization".into(), "secret".into())]);
         assert_ne!(
-            cache_key_hash("https://media.test/file", Some(&headers)),
-            cache_key_hash("https://media.test/file\0Authorization\0secret", None)
+            cache_key_hash("https://media.test/file", None, Some(&headers)),
+            cache_key_hash("https://media.test/file\0Authorization\0secret", None, None)
+        );
+    }
+
+    #[test]
+    fn explicit_cache_key_reuses_media_across_signed_source_urls() {
+        let first = cache_key_hash(
+            "https://talk.example/playback?capability=first",
+            Some("prompt:42:v1"),
+            None,
+        );
+        let second = cache_key_hash(
+            "https://talk.example/playback?capability=second",
+            Some("prompt:42:v1"),
+            None,
+        );
+        let changed = cache_key_hash(
+            "https://talk.example/playback?capability=third",
+            Some("prompt:42:v2"),
+            None,
+        );
+
+        assert_eq!(first, second);
+        assert_ne!(first, changed);
+        assert_ne!(
+            first,
+            cache_key_hash("prompt:42:v1", None, None),
+            "explicit keys and source URLs are separate namespaces"
         );
     }
 
@@ -725,16 +768,16 @@ mod tests {
 
     #[test]
     fn test_url_hash_deterministic() {
-        let h1 = url_hash("https://example.com/test.wav");
-        let h2 = url_hash("https://example.com/test.wav");
+        let h1 = cache_key("https://example.com/test.wav");
+        let h2 = cache_key("https://example.com/test.wav");
         assert_eq!(h1, h2);
         assert_eq!(h1.len(), 64);
     }
 
     #[test]
     fn test_url_hash_unique_per_url() {
-        let h1 = url_hash("https://example.com/a.wav");
-        let h2 = url_hash("https://example.com/b.wav");
+        let h1 = cache_key("https://example.com/a.wav");
+        let h2 = cache_key("https://example.com/b.wav");
         assert_ne!(h1, h2, "different URLs should produce different hashes");
     }
 
@@ -913,7 +956,7 @@ mod tests {
     fn test_url_with_path_traversal() {
         // A malicious URL with path traversal should produce a safe filename
         let url = "http://evil.com/../../../etc/passwd";
-        let hash = url_hash(url);
+        let hash = cache_key(url);
         let ext = url_extension(url);
         let filename = format!("{hash}{ext}");
 
@@ -1126,7 +1169,7 @@ mod tests {
     fn test_url_with_no_extension() {
         // A URL with no file extension should get a default extension
         let url = "http://example.com/audio";
-        let hash = url_hash(url);
+        let hash = cache_key(url);
         let ext = url_extension(url);
         let filename = format!("{hash}{ext}");
 
@@ -1162,6 +1205,34 @@ mod tests {
             }
         });
         (format!("http://{address}/audio.wav"), requests, task)
+    }
+
+    #[tokio::test]
+    async fn explicit_cache_key_reuses_a_download_across_signed_source_urls() {
+        let (url, requests, server) = fixture_server().await;
+        let directory = tempfile::tempdir().unwrap();
+        let cache = FileCache::new(directory.path().into())
+            .unwrap()
+            .with_policy(DownloadPolicy::loopback_only());
+
+        let first_url = format!("{url}?capability=first");
+        let first = cache
+            .start_download_with_cache_key(&first_url, Some("prompt:42:v1"), 60, 5000, None)
+            .unwrap()
+            .wait()
+            .await;
+        drop(first.unwrap());
+
+        let second_url = format!("{url}?capability=second");
+        let second = cache
+            .start_download_with_cache_key(&second_url, Some("prompt:42:v1"), 60, 5000, None)
+            .unwrap()
+            .wait()
+            .await;
+        drop(second.unwrap());
+
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+        server.abort();
     }
 
     #[tokio::test]

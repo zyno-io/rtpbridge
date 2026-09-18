@@ -241,6 +241,8 @@ pub struct EndpointCreateWithFileParams {
     #[serde(default = "default_cache_ttl")]
     pub cache_ttl_secs: u32,
     #[serde(default)]
+    pub cache_key: Option<String>,
+    #[serde(default)]
     pub shared: bool,
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u32,
@@ -1012,6 +1014,13 @@ mod tests {
     }
 
     #[test]
+    fn file_params_default_cache_key() {
+        let json = r#"{"source":"test.wav"}"#;
+        let params: EndpointCreateWithFileParams = serde_json::from_str(json).unwrap();
+        assert!(params.cache_key.is_none());
+    }
+
+    #[test]
     fn file_params_default_timeout_ms() {
         let json = r#"{"source":"test.wav"}"#;
         let params: EndpointCreateWithFileParams = serde_json::from_str(json).unwrap();
@@ -1058,9 +1067,10 @@ mod tests {
 
     #[test]
     fn file_params_custom_values_override_defaults() {
-        let json = r#"{"source":"test.wav","cache_ttl_secs":60,"timeout_ms":5000,"loop_count":3,"start_ms":100,"shared":true}"#;
+        let json = r#"{"source":"test.wav","cache_ttl_secs":60,"cache_key":"prompt:version-2","timeout_ms":5000,"loop_count":3,"start_ms":100,"shared":true}"#;
         let params: EndpointCreateWithFileParams = serde_json::from_str(json).unwrap();
         assert_eq!(params.cache_ttl_secs, 60);
+        assert_eq!(params.cache_key.as_deref(), Some("prompt:version-2"));
         assert_eq!(params.timeout_ms, 5000);
         assert_eq!(params.loop_count, Some(3));
         assert_eq!(params.start_ms, 100);

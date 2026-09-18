@@ -13,6 +13,7 @@ Create a send-only endpoint that plays audio from a local file or URL.
     "start_ms": 0,
     "loop_count": 0,
     "cache_ttl_secs": 300,
+    "cache_key": "prompt:3d644a34-65e8-4f8f-b31c-42b7c71b4553",
     "shared": false,
     "timeout_ms": 10000,
     "headers": { "Authorization": "Bearer ..." },
@@ -27,6 +28,7 @@ Create a send-only endpoint that plays audio from a local file or URL.
 | `start_ms` | u64 | `0` | Start playback at this position |
 | `loop_count` | u32 or null | `0` | Number of additional replays: `0` = play once, `1` = play twice, `null` = loop infinitely. Maximum: 10000 |
 | `cache_ttl_secs` | u32 | `300` | For URLs: cache lifetime in seconds. `0` = delete after use |
+| `cache_key` | string or null | `null` | Optional logical cache identity for URL sources. When set, it replaces the source URL portion of the cache key; request headers remain included. It is local to rtpbridge and is never sent in the download request. Reuse it only for immutable bytes; change it when the media changes. |
 | `shared` | bool | `false` | Share decode pipeline across sessions |
 | `timeout_ms` | u32 | `10000` | Max milliseconds to wait for download (URL sources only; ignored for local files). Min: 1, max: 60000 |
 | `headers` | object or null | `null` | Optional HTTP headers for URL sources. Header values are included in the cache key so authenticated URLs do not share cached content across different headers |

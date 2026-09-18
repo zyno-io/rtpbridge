@@ -1213,6 +1213,7 @@ async fn handle_create_with_file(
             start_ms: params.start_ms,
             loop_count: params.loop_count,
             cache_ttl_secs: params.cache_ttl_secs,
+            cache_key: params.cache_key,
             timeout_ms: params.timeout_ms,
             shared: params.shared,
             headers: params.headers,

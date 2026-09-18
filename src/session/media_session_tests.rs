@@ -943,6 +943,7 @@ async fn test_create_with_file_passes_cache_params() {
                 start_ms: 0,
                 loop_count: None,
                 cache_ttl_secs: 600,
+                cache_key: None,
                 timeout_ms: 15000,
                 shared: false,
                 headers: None,

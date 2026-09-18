@@ -170,6 +170,7 @@ pub enum SessionCommand {
         start_ms: u64,
         loop_count: Option<u32>,
         cache_ttl_secs: u32,
+        cache_key: Option<String>,
         timeout_ms: u32,
         shared: bool,
         headers: Option<std::collections::HashMap<String, String>>,
@@ -658,6 +659,7 @@ impl SessionState {
                 start_ms,
                 loop_count,
                 cache_ttl_secs,
+                cache_key,
                 timeout_ms,
                 shared,
                 headers,
@@ -710,6 +712,7 @@ impl SessionState {
                         start_ms,
                         loop_count,
                         cache_ttl_secs,
+                        cache_key,
                         timeout_ms,
                         shared,
                         headers,
@@ -1151,6 +1154,7 @@ impl SessionState {
         start_ms: u64,
         loop_count: Option<u32>,
         cache_ttl_secs: u32,
+        cache_key: Option<String>,
         timeout_ms: u32,
         shared: bool,
         headers: Option<std::collections::HashMap<String, String>>,
@@ -1171,8 +1175,9 @@ impl SessionState {
                 .clone()
                 .try_reserve_owned()
                 .map_err(|_| anyhow::anyhow!("DOWNLOAD_BUSY"))?;
-            let request = self.file_cache.start_download(
+            let request = self.file_cache.start_download_with_cache_key(
                 source,
+                cache_key.as_deref(),
                 cache_ttl_secs,
                 timeout_ms,
                 headers.as_ref(),

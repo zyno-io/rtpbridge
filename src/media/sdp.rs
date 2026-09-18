@@ -172,8 +172,13 @@ impl ParsedSdp {
             anyhow::bail!("SDP media security requires a supported valid SDES crypto attribute");
         }
         if let Some(crypto) = &self.crypto {
-            crate::media::srtp::SrtpContext::from_sdes_key(&crypto.key_b64)
-                .map_err(|_| anyhow::anyhow!("SDP media security has invalid key material"))?;
+            crate::media::srtp::SrtpContext::from_sdes_key_with_lifetime(
+                &crypto.key_b64,
+                crypto
+                    .key_lifetime_packets
+                    .unwrap_or(crate::media::srtp::MAX_SRTP_PACKETS_PER_MASTER_KEY),
+            )
+            .map_err(|_| anyhow::anyhow!("SDP media security has invalid key material"))?;
         }
         if self.invalid_rtcp {
             anyhow::bail!("invalid SDP RTCP destination");
@@ -196,6 +201,48 @@ pub struct SdpCrypto {
     pub tag: u32,
     pub suite: String,
     pub key_b64: String,
+    /// Optional RFC 4568 inline-key lifetime, measured as a maximum packet
+    /// count for each SRTP and SRTCP stream using the master key.
+    pub key_lifetime_packets: Option<u64>,
+}
+
+fn parse_sdes_lifetime(value: &str) -> Option<u64> {
+    let lifetime = if let Some(exponent) = value.strip_prefix("2^") {
+        if exponent.is_empty()
+            || !exponent.bytes().all(|byte| byte.is_ascii_digit())
+            || (exponent.len() > 1 && exponent.starts_with('0'))
+        {
+            return None;
+        }
+        let exponent = exponent.parse::<u32>().ok()?;
+        1u64.checked_shl(exponent)?
+    } else {
+        if value.is_empty()
+            || !value.bytes().all(|byte| byte.is_ascii_digit())
+            || (value.len() > 1 && value.starts_with('0'))
+        {
+            return None;
+        }
+        value.parse::<u64>().ok()?
+    };
+    (1..=crate::media::srtp::MAX_SRTP_PACKETS_PER_MASTER_KEY)
+        .contains(&lifetime)
+        .then_some(lifetime)
+}
+
+/// Parse RFC 4568's supported subset of an inline SDES key. We support an
+/// optional key lifetime and reject MKIs and session parameters, whose packet
+/// framing and security semantics rtpbridge does not implement.
+fn parse_sdes_inline_key(value: &str) -> Option<(String, Option<u64>)> {
+    let value = value.strip_prefix("inline:")?;
+    let mut fields = value.split('|');
+    let key_b64 = fields.next()?;
+    let lifetime = match (fields.next(), fields.next()) {
+        (None, None) => None,
+        (Some(lifetime), None) => Some(parse_sdes_lifetime(lifetime)?),
+        _ => return None,
+    };
+    Some((key_b64.to_string(), lifetime))
 }
 
 /// Parse relevant fields from an SDP string
@@ -325,19 +372,17 @@ pub fn parse_sdp(sdp: &str) -> ParsedSdp {
         } else if let Some(rest) = line.strip_prefix("a=crypto:") {
             result.crypto_present = true;
             let parts: Vec<_> = rest.split_whitespace().collect();
-            // Lifetime/MKI/session parameters are not implemented. Do not claim
-            // a secure negotiation while ignoring their security semantics.
             if parts.len() == 3
                 && let Ok(tag) = parts[0].parse::<u32>()
                 && tag > 0
                 && parts[1] == "AES_CM_128_HMAC_SHA1_80"
-                && let Some(key) = parts[2].strip_prefix("inline:")
-                && !key.contains('|')
+                && let Some((key_b64, key_lifetime_packets)) = parse_sdes_inline_key(parts[2])
             {
                 result.crypto = Some(SdpCrypto {
                     tag,
                     suite: parts[1].into(),
-                    key_b64: key.into(),
+                    key_b64,
+                    key_lifetime_packets,
                 });
             }
         } else if line.starts_with("a=fingerprint:") || line.starts_with("a=ice-ufrag:") {
@@ -540,9 +585,13 @@ fn generate_sdp(
 
     // Crypto
     if let Some(c) = crypto {
+        let lifetime = c
+            .key_lifetime_packets
+            .map(|packets| format!("|{packets}"))
+            .unwrap_or_default();
         sdp.push_str(&format!(
-            "a=crypto:{} {} inline:{}\r\n",
-            c.tag, c.suite, c.key_b64
+            "a=crypto:{} {} inline:{}{}\r\n",
+            c.tag, c.suite, c.key_b64, lifetime
         ));
     }
 

@@ -955,6 +955,31 @@ fn make_savp_sdp(port: u16, key_b64: &str) -> String {
 }
 
 #[tokio::test]
+async fn test_from_offer_accepts_srtp_sdes_lifetime() {
+    let pool = crate::net::socket_pool::SocketPool::new("127.0.0.1".parse().unwrap(), 54100, 54200)
+        .unwrap();
+    let pair = pool.allocate_pair().await.unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    let key = "E4peZWnTvtquGbT3QN3ZJOM8i0Q2zNLc55bTN2VW";
+    let offer =
+        make_savp_sdp(30000, key).replace(&format!("inline:{key}"), &format!("inline:{key}|2^32"));
+
+    let (endpoint, answer) = RtpEndpoint::from_offer(
+        EndpointId::new_v4(),
+        EndpointDirection::SendRecv,
+        &offer,
+        pair,
+        "127.0.0.1".parse().unwrap(),
+        tx,
+    )
+    .expect("a standard SDES lifetime should not reject the call");
+
+    assert!(endpoint.srtp_rx.is_some());
+    assert!(endpoint.srtcp_rx.is_some());
+    assert!(answer.contains("a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:"));
+}
+
+#[tokio::test]
 async fn test_accept_answer_rejects_plain_rtp_downgrade_from_srtp_offer() {
     let pool = crate::net::socket_pool::SocketPool::new("127.0.0.1".parse().unwrap(), 51600, 51700)
         .unwrap();
@@ -1176,6 +1201,44 @@ async fn mk_ts_endpoint(start: u16, end: u16) -> RtpEndpoint {
     let mut ep = RtpEndpoint::new(EndpointId::new_v4(), EndpointDirection::SendRecv, pair);
     ep.send_codec = Some(crate::media::sdp::CODEC_PCMU); // 8000Hz → 160 step
     ep
+}
+
+#[tokio::test]
+async fn test_same_srtp_key_can_tighten_but_not_expand_lifetime() {
+    let mut ep = mk_ts_endpoint(55500, 55600).await;
+    let key = base64_encode(&[0x5A; 30]);
+    let offer = make_savp_sdp(30000, &key);
+    ep.update_remote_sdp(&offer).unwrap();
+
+    let mut remote_tx = SrtpContext::from_sdes_key(&key).unwrap();
+    let first = remote_tx
+        .protect(&RtpHeader::build(0, 1, 160, 0x1234, false, &[0x11; 80]))
+        .unwrap();
+    let source = "10.0.0.1:30000".parse().unwrap();
+    assert!(ep.handle_rtp(&first, source).is_some());
+
+    let tightened = offer.replace(&format!("inline:{key}"), &format!("inline:{key}|1"));
+    ep.update_remote_sdp(&tightened).unwrap();
+    assert!(
+        ep.srtp_rx_new.is_none(),
+        "tightening a same-key policy must preserve the live context"
+    );
+
+    let second = remote_tx
+        .protect(&RtpHeader::build(0, 2, 320, 0x1234, false, &[0x22; 80]))
+        .unwrap();
+    assert!(
+        ep.handle_rtp(&second, source).is_none(),
+        "the packet accepted before renegotiation must still count toward the tightened lifetime"
+    );
+
+    let previous_addr = ep.remote_rtp_addr;
+    let expanded = make_savp_sdp(40000, &key);
+    assert!(ep.update_remote_sdp(&expanded).is_err());
+    assert_eq!(
+        ep.remote_rtp_addr, previous_addr,
+        "an invalid same-key expansion must be rejected transactionally"
+    );
 }
 
 #[tokio::test]

@@ -182,6 +182,75 @@ fn test_parse_srtp_sdp() {
 }
 
 #[test]
+fn test_parse_srtp_sdp_with_lifetime() {
+    let sdp = "v=0\r\n\
+        o=- 123 1 IN IP4 10.0.0.1\r\n\
+        s=-\r\n\
+        c=IN IP4 10.0.0.1\r\n\
+        t=0 0\r\n\
+        m=audio 20000 RTP/SAVP 0 101\r\n\
+        a=rtpmap:0 PCMU/8000\r\n\
+        a=rtpmap:101 telephone-event/8000\r\n\
+        a=fmtp:101 0-16\r\n\
+        a=crypto:6 AES_CM_128_HMAC_SHA1_80 inline:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA|2^32\r\n\
+        a=sendrecv\r\n";
+
+    let parsed = parse_sdp(sdp);
+    let crypto = parsed
+        .crypto
+        .as_ref()
+        .expect("valid SDES crypto should parse");
+    assert_eq!(crypto.tag, 6);
+    assert_eq!(crypto.key_lifetime_packets, Some(1 << 32));
+    parsed
+        .validate_plain_transport()
+        .expect("a valid SDES key lifetime should be supported");
+}
+
+#[test]
+fn test_parse_srtp_sdp_rejects_signed_lifetime() {
+    for lifetime in ["+10", "2^+10"] {
+        let sdp = format!(
+            "v=0\r\n\
+             o=- 123 1 IN IP4 10.0.0.1\r\n\
+             s=-\r\n\
+             c=IN IP4 10.0.0.1\r\n\
+             t=0 0\r\n\
+             m=audio 20000 RTP/SAVP 0\r\n\
+             a=rtpmap:0 PCMU/8000\r\n\
+             a=crypto:6 AES_CM_128_HMAC_SHA1_80 inline:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA|{lifetime}\r\n\
+             a=sendrecv\r\n"
+        );
+
+        let parsed = parse_sdp(&sdp);
+        assert!(parsed.crypto_present);
+        assert!(
+            parsed.crypto.is_none(),
+            "signed lifetime {lifetime} is outside RFC 4568's DIGIT grammar"
+        );
+        assert!(parsed.validate_plain_transport().is_err());
+    }
+}
+
+#[test]
+fn test_parse_srtp_sdp_rejects_mki_with_lifetime() {
+    let sdp = "v=0\r\n\
+        o=- 123 1 IN IP4 10.0.0.1\r\n\
+        s=-\r\n\
+        c=IN IP4 10.0.0.1\r\n\
+        t=0 0\r\n\
+        m=audio 20000 RTP/SAVP 0\r\n\
+        a=rtpmap:0 PCMU/8000\r\n\
+        a=crypto:6 AES_CM_128_HMAC_SHA1_80 inline:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA|2^32|1:4\r\n\
+        a=sendrecv\r\n";
+
+    let parsed = parse_sdp(sdp);
+    assert!(parsed.crypto_present);
+    assert!(parsed.crypto.is_none(), "MKI support is not implemented");
+    assert!(parsed.validate_plain_transport().is_err());
+}
+
+#[test]
 fn test_detect_webrtc() {
     let sdp = "v=0\r\n\
         o=- 123 1 IN IP4 10.0.0.1\r\n\

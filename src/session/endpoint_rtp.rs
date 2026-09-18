@@ -24,9 +24,26 @@ use crate::control::protocol::{
 use crate::media::rtcp::{self, RtcpStats};
 use crate::media::rtp::RtpHeader;
 use crate::media::sdp::{self, SdpCodec, SdpCrypto};
-use crate::media::srtp::{SrtcpContext, SrtpContext};
+use crate::media::srtp::{MAX_SRTP_PACKETS_PER_MASTER_KEY, SrtcpContext, SrtpContext};
 use crate::metrics::Metrics;
 use crate::net::socket_pool::SocketPair;
+
+/// Build inbound SRTP and SRTCP contexts from a remote SDES attribute.
+///
+/// RFC 4568 uses one lifetime value for both media types. SRTCP applies its
+/// stricter 2^31 packet limit inside `SrtcpContext`.
+fn remote_srtp_contexts(crypto: &SdpCrypto) -> anyhow::Result<(SrtpContext, SrtcpContext)> {
+    let packet_lifetime = remote_srtp_packet_lifetime(crypto);
+    let srtp = SrtpContext::from_sdes_key_with_lifetime(&crypto.key_b64, packet_lifetime)?;
+    let srtcp = SrtcpContext::from_sdes_key_with_lifetime(&crypto.key_b64, packet_lifetime)?;
+    Ok((srtp, srtcp))
+}
+
+fn remote_srtp_packet_lifetime(crypto: &SdpCrypto) -> u64 {
+    crypto
+        .key_lifetime_packets
+        .unwrap_or(MAX_SRTP_PACKETS_PER_MASTER_KEY)
+}
 
 /// A plain RTP (optionally SRTP) endpoint
 pub struct RtpEndpoint {
@@ -250,12 +267,12 @@ impl RtpEndpoint {
         // counters across the fresh stream we are about to advertise.
         self.rtcp_stats.reset_remote_receiver_report();
 
-        // A new SSRC starts a fresh SRTP cryptographic context on the wire: the
+        // A new SSRC starts a fresh SRTP stream on the wire: the
         // peer (re-)initialises its per-SSRC rollover counter (ROC) at 0 when it
-        // first sees the new SSRC. With per-SSRC TX state (RFC 3711 §3.2.1) our
-        // new SSRC already starts at ROC 0 on its own; we still clear the TX map
-        // here so the retired SSRC's now-unused state doesn't accumulate across
-        // repeated rotations. Receive replay history is never reset for a live key.
+        // first sees the new SSRC. Per-SSRC TX state (RFC 3711 §3.2.1) makes the
+        // new SSRC start at ROC 0 on its own. Retired stream state stays tracked
+        // for this key so an SSRC cannot regain packet lifetime by rotating away
+        // and later returning; the context bounds the number of tracked SSRCs.
         //
         // (Historically this was load-bearing: when ROC was keyed globally, the
         // stale `highest_seq` could spuriously bump ROC on the new SSRC's first
@@ -263,16 +280,12 @@ impl RtpEndpoint {
         // making EVERY outbound SRTP packet drop. That was the one-way-audio seen
         // after a hold long enough to drive the direction back through
         // recvonly→sendrecv. Per-SSRC state removes that failure mode; this reset
-        // is now hygiene, not correctness.)
+        // is now unnecessary.)
         //
         // SRTCP TX index is intentionally NOT reset: the index travels on the
         // wire and the IV is keyed by (ssrc, wire-index), so a new SSRC stays
         // decryptable, and keeping the index monotonic avoids tripping the
         // peer's SRTCP replay window.
-        if let Some(ref mut tx) = self.srtp_tx {
-            tx.reset_sequence_state();
-        }
-
         debug!(
             endpoint_id = %self.id,
             prev_ssrc = prev,
@@ -476,14 +489,10 @@ impl RtpEndpoint {
         // RX uses the offerer's key; TX uses an independently generated key
         // to prevent keystream reuse between directions.
         let answer_crypto = if let Some(ref crypto) = parsed.crypto {
-            endpoint.srtp_rx = Some(
-                SrtpContext::from_sdes_key(&crypto.key_b64)
-                    .map_err(|e| anyhow::anyhow!("SRTP RX init failed: {e}"))?,
-            );
-            endpoint.srtcp_rx = Some(
-                SrtcpContext::from_sdes_key(&crypto.key_b64)
-                    .map_err(|e| anyhow::anyhow!("SRTCP RX init failed: {e}"))?,
-            );
+            let (srtp_rx, srtcp_rx) = remote_srtp_contexts(crypto)
+                .map_err(|e| anyhow::anyhow!("SRTP RX init failed: {e}"))?;
+            endpoint.srtp_rx = Some(srtp_rx);
+            endpoint.srtcp_rx = Some(srtcp_rx);
             endpoint.srtp_rx_key_b64 = Some(crypto.key_b64.clone());
 
             // Generate independent TX key
@@ -507,6 +516,7 @@ impl RtpEndpoint {
                 tag: crypto.tag,
                 suite: crypto.suite.clone(),
                 key_b64: answer_key_b64,
+                key_lifetime_packets: None,
             })
         } else {
             None
@@ -582,6 +592,7 @@ impl RtpEndpoint {
                 tag: 1,
                 suite: "AES_CM_128_HMAC_SHA1_80".to_string(),
                 key_b64: b64_encoded,
+                key_lifetime_packets: None,
             })
         } else {
             None
@@ -633,6 +644,44 @@ impl RtpEndpoint {
             }
         }
         Ok(())
+    }
+
+    /// Validate a same-key SDES policy update before any SDP state is mutated.
+    /// Tightening a lifetime is safe while preserving ROC/replay state; expanding
+    /// it would renew an already-used master key and therefore requires a rekey.
+    fn validate_remote_srtp_lifetime_update(&self, crypto: &SdpCrypto) -> anyhow::Result<()> {
+        if self.srtp_rx_key_b64.as_deref() != Some(crypto.key_b64.as_str()) {
+            return Ok(());
+        }
+
+        let requested_lifetime = remote_srtp_packet_lifetime(crypto);
+        let current_lifetime = self
+            .srtp_rx_new
+            .as_ref()
+            .or(self.srtp_rx.as_ref())
+            .map(SrtpContext::packet_lifetime)
+            .ok_or_else(|| anyhow::anyhow!("tracked SRTP RX key has no receive context"))?;
+        if requested_lifetime > current_lifetime {
+            anyhow::bail!(
+                "SDES lifetime cannot be expanded from {current_lifetime} to \
+                 {requested_lifetime} packets without a new master key"
+            );
+        }
+        Ok(())
+    }
+
+    /// Apply a validated same-key lifetime reduction to whichever contexts hold
+    /// the tracked key, including independently promoted RTP/RTCP rekey contexts.
+    fn tighten_remote_srtp_lifetime(&mut self, crypto: &SdpCrypto) {
+        let packet_lifetime = remote_srtp_packet_lifetime(crypto);
+        let srtp = self.srtp_rx_new.as_mut().or(self.srtp_rx.as_mut());
+        if let Some(srtp) = srtp {
+            srtp.tighten_packet_lifetime(packet_lifetime);
+        }
+        let srtcp = self.srtcp_rx_new.as_mut().or(self.srtcp_rx.as_mut());
+        if let Some(srtcp) = srtcp {
+            srtcp.tighten_packet_lifetime(packet_lifetime);
+        }
     }
 
     pub fn accept_answer(&mut self, answer_sdp: &str) -> anyhow::Result<()> {
@@ -690,6 +739,10 @@ impl RtpEndpoint {
             }
             Some(valid)
         };
+
+        if let Some(ref crypto) = parsed.crypto {
+            self.validate_remote_srtp_lifetime_update(crypto)?;
+        }
 
         if selected_plain_rtp {
             self.srtp_tx = None;
@@ -758,30 +811,23 @@ impl RtpEndpoint {
         if let Some(ref crypto) = parsed.crypto {
             if self.srtp_rx.is_none() {
                 // Initial setup: set RX directly
-                self.srtp_rx = Some(
-                    SrtpContext::from_sdes_key(&crypto.key_b64)
-                        .map_err(|e| anyhow::anyhow!("SRTP RX init failed: {e}"))?,
-                );
-                self.srtcp_rx = Some(
-                    SrtcpContext::from_sdes_key(&crypto.key_b64)
-                        .map_err(|e| anyhow::anyhow!("SRTCP RX init failed: {e}"))?,
-                );
+                let (srtp_rx, srtcp_rx) = remote_srtp_contexts(crypto)
+                    .map_err(|e| anyhow::anyhow!("SRTP RX init failed: {e}"))?;
+                self.srtp_rx = Some(srtp_rx);
+                self.srtcp_rx = Some(srtcp_rx);
                 self.srtp_rx_key_b64 = Some(crypto.key_b64.clone());
             } else if self.srtp_rx_key_b64.as_deref() != Some(crypto.key_b64.as_str()) {
                 // Rekey: key actually changed, set as pending RX with dual-context switchover
-                self.srtp_rx_new = Some(
-                    SrtpContext::from_sdes_key(&crypto.key_b64)
-                        .map_err(|e| anyhow::anyhow!("SRTP RX rekey failed: {e}"))?,
-                );
-                self.srtcp_rx_new = Some(
-                    SrtcpContext::from_sdes_key(&crypto.key_b64)
-                        .map_err(|e| anyhow::anyhow!("SRTCP RX rekey failed: {e}"))?,
-                );
+                let (srtp_rx, srtcp_rx) = remote_srtp_contexts(crypto)
+                    .map_err(|e| anyhow::anyhow!("SRTP RX rekey failed: {e}"))?;
+                self.srtp_rx_new = Some(srtp_rx);
+                self.srtcp_rx_new = Some(srtcp_rx);
                 self.rekey_switchover = Some(Instant::now() + Duration::from_secs(5));
                 self.srtp_rx_key_b64 = Some(crypto.key_b64.clone());
                 debug!(endpoint_id = %self.id, "SRTP RX rekey: dual-context transition started (5s)");
+            } else {
+                self.tighten_remote_srtp_lifetime(crypto);
             }
-            // else: same key as before — don't touch the live SRTP context (would wipe ROC state)
 
             if self.srtp_tx.is_none() {
                 // Edge case: offer had no SRTP but answer provides crypto.
@@ -845,6 +891,9 @@ impl RtpEndpoint {
         // mutating any state — the bound socket can't reach the other family and
         // we don't migrate sockets. Bail cleanly instead of half-applying.
         self.reject_family_change(parsed.remote_addr)?;
+        if let Some(ref crypto) = parsed.crypto {
+            self.validate_remote_srtp_lifetime_update(crypto)?;
+        }
 
         // Apply remote SDP direction by default unless an explicit manual
         // override is active via endpoint.update_direction.
@@ -876,27 +925,21 @@ impl RtpEndpoint {
         // Handle SRTP rekey if crypto changed
         if let Some(ref crypto) = parsed.crypto {
             if self.srtp_rx.is_none() {
-                self.srtp_rx = Some(
-                    SrtpContext::from_sdes_key(&crypto.key_b64)
-                        .map_err(|e| anyhow::anyhow!("SRTP RX init failed: {e}"))?,
-                );
-                self.srtcp_rx = Some(
-                    SrtcpContext::from_sdes_key(&crypto.key_b64)
-                        .map_err(|e| anyhow::anyhow!("SRTCP RX init failed: {e}"))?,
-                );
+                let (srtp_rx, srtcp_rx) = remote_srtp_contexts(crypto)
+                    .map_err(|e| anyhow::anyhow!("SRTP RX init failed: {e}"))?;
+                self.srtp_rx = Some(srtp_rx);
+                self.srtcp_rx = Some(srtcp_rx);
                 self.srtp_rx_key_b64 = Some(crypto.key_b64.clone());
             } else if self.srtp_rx_key_b64.as_deref() != Some(crypto.key_b64.as_str()) {
-                self.srtp_rx_new = Some(
-                    SrtpContext::from_sdes_key(&crypto.key_b64)
-                        .map_err(|e| anyhow::anyhow!("SRTP RX rekey failed: {e}"))?,
-                );
-                self.srtcp_rx_new = Some(
-                    SrtcpContext::from_sdes_key(&crypto.key_b64)
-                        .map_err(|e| anyhow::anyhow!("SRTCP RX rekey failed: {e}"))?,
-                );
+                let (srtp_rx, srtcp_rx) = remote_srtp_contexts(crypto)
+                    .map_err(|e| anyhow::anyhow!("SRTP RX rekey failed: {e}"))?;
+                self.srtp_rx_new = Some(srtp_rx);
+                self.srtcp_rx_new = Some(srtcp_rx);
                 self.rekey_switchover = Some(Instant::now() + Duration::from_secs(5));
                 self.srtp_rx_key_b64 = Some(crypto.key_b64.clone());
                 debug!(endpoint_id = %self.id, "SRTP RX rekey via update_remote_sdp: dual-context transition started (5s)");
+            } else {
+                self.tighten_remote_srtp_lifetime(crypto);
             }
             // Unchanged keys retain all per-SSRC ROC and replay history.
 
@@ -960,6 +1003,7 @@ impl RtpEndpoint {
                 tag,
                 suite,
                 key_b64: key.clone(),
+                key_lifetime_packets: None,
             }
         });
 
@@ -1554,6 +1598,7 @@ impl RtpEndpoint {
             tag: 1,
             suite: "AES_CM_128_HMAC_SHA1_80".to_string(),
             key_b64: b64_encoded,
+            key_lifetime_packets: None,
         };
 
         let bind_ip = self.local_rtp_addr.ip();

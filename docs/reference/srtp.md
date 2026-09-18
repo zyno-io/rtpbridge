@@ -12,6 +12,8 @@ a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:<base64-key>
 
 When accepting an offer with `a=crypto`, rtpbridge generates an independent TX key for the SDP answer. The offerer's key is used only for the RX (decrypt) direction to prevent keystream reuse between directions.
 
+rtpbridge accepts an optional RFC 4568 SDES lifetime (`inline:<key>|<lifetime>`), including the compact power-of-two form such as `|2^32`. It enforces that policy independently for each SRTP and SRTCP SSRC stream: no stream can protect or accept another packet once its master-key lifetime is exhausted. A same-key renegotiation may tighten the lifetime without resetting packet counts or replay state; expanding it requires a new master key. An offered lifetime cannot exceed the AES_CM_128_HMAC_SHA1_80 maximum of 2^48 SRTP packets; SRTCP also remains capped at its RFC 3711 maximum of 2^31 packets. MKIs and SDES session parameters remain unsupported and cause the crypto attribute to be rejected rather than silently ignored.
+
 For carrier trunks where encryption is preferred but not universally supported, `srtp_optional: true` generates an RFC 8643 opportunistic-SRTP offer: `RTP/AVP` with an `a=crypto` attribute. An answer that returns crypto uses SRTP; an answer that omits crypto selects plain RTP and rtpbridge removes the provisional transmit crypto context. A strict `srtp: true` offer rejects a plaintext answer instead of establishing one-way media. `srtp` and `srtp_optional` are mutually exclusive.
 
 ## Cipher Suite

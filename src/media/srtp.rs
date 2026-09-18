@@ -18,10 +18,20 @@ const SRTP_AUTH_TAG_LEN: usize = 10; // 80 bits
 const SRTP_MASTER_KEY_LEN: usize = 16; // 128 bits
 const SRTP_MASTER_SALT_LEN: usize = 14; // 112 bits
 
+/// RFC 3711's maximum lifetime for an AES_CM_128_HMAC_SHA1_80 master key.
+/// A master key may protect at most 2^48 packets in each SRTP stream.
+pub const MAX_SRTP_PACKETS_PER_MASTER_KEY: u64 = 1 << 48;
+/// RFC 3711's maximum lifetime for an AES_CM_128_HMAC_SHA1_80 master key.
+/// A master key may protect at most 2^31 packets in each SRTCP stream.
+pub const MAX_SRTCP_PACKETS_PER_MASTER_KEY: u64 = 1 << 31;
+
 /// Maximum distinct inbound SSRCs tracked per SRTP/SRTCP receive context. Bounds
 /// memory against an authenticated peer spraying SSRCs; new SSRCs beyond this are
 /// rejected — we never evict live replay state (RFC 3711 §3.3.2).
 const MAX_RECV_SSRCS: usize = 64;
+/// Bound per-key transmit state as well. An endpoint that rotates through this
+/// many local SSRCs must rekey before introducing another stream.
+const MAX_SEND_SSRCS: usize = 64;
 
 /// Per-SSRC SRTP rollover counter + replay window. RFC 3711 §3.2.1/§3.3 keeps
 /// this state per SSRC; sharing it across SSRCs corrupts both when a peer
@@ -37,9 +47,21 @@ struct SrtpStreamState {
     /// Sliding replay window bitmap (64 packets behind highest_seq).
     /// Bit i is set if packet (highest_seq - i) has been seen; bit 0 = highest_seq.
     replay_window: u64,
+    /// RFC 3711 key-lifetime accounting is per SRTP stream (SSRC), not
+    /// aggregated across every stream that shares this master key.
+    protected_packets: u64,
+    accepted_packets: u64,
 }
 
 impl SrtpStreamState {
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn reset_sequence_state(&mut self) {
+        self.roc = 0;
+        self.highest_seq = 0;
+        self.seq_initialized = false;
+        self.replay_window = 0;
+    }
+
     /// Update ROC for outbound (protect) — no replay check needed.
     fn update_roc(&mut self, seq: u16) {
         if !self.seq_initialized {
@@ -138,12 +160,28 @@ pub struct SrtpContext {
     /// authenticates (bounded by `MAX_RECV_SSRCS`); a transmit context holds one
     /// entry per local SSRC we send.
     streams: HashMap<u32, SrtpStreamState>,
+    /// Maximum packets each SRTP stream may protect or accept. This is the
+    /// lifetime from the SDES inline key, bounded by RFC 3711's 2^48 limit.
+    packet_lifetime: u64,
 }
 
 impl SrtpContext {
     /// Create an SRTP context from a base64-encoded SDES key.
     /// The key material is: master_key (16 bytes) || master_salt (14 bytes) = 30 bytes.
     pub fn from_sdes_key(key_b64: &str) -> anyhow::Result<Self> {
+        Self::from_sdes_key_with_lifetime(key_b64, MAX_SRTP_PACKETS_PER_MASTER_KEY)
+    }
+
+    /// Create an SRTP context with an SDES-signaled master-key lifetime.
+    pub fn from_sdes_key_with_lifetime(
+        key_b64: &str,
+        packet_lifetime: u64,
+    ) -> anyhow::Result<Self> {
+        if packet_lifetime == 0 || packet_lifetime > MAX_SRTP_PACKETS_PER_MASTER_KEY {
+            anyhow::bail!(
+                "SRTP master key lifetime must be between 1 and {MAX_SRTP_PACKETS_PER_MASTER_KEY} packets"
+            );
+        }
         let mut key_material = base64_decode(key_b64)?;
         if key_material.len() != SRTP_MASTER_KEY_LEN + SRTP_MASTER_SALT_LEN {
             anyhow::bail!(
@@ -190,7 +228,19 @@ impl SrtpContext {
             cipher_salt: cs,
             auth_key: ak,
             streams: HashMap::new(),
+            packet_lifetime,
         })
+    }
+
+    pub(crate) fn packet_lifetime(&self) -> u64 {
+        self.packet_lifetime
+    }
+
+    /// Tighten the policy for a live key without discarding its ROC, replay,
+    /// or packet-count state. Expanding a live key's lifetime requires a rekey.
+    pub(crate) fn tighten_packet_lifetime(&mut self, packet_lifetime: u64) {
+        debug_assert!(packet_lifetime <= self.packet_lifetime);
+        self.packet_lifetime = packet_lifetime;
     }
 
     /// Encrypt an RTP packet in-place, appending the auth tag.
@@ -199,12 +249,20 @@ impl SrtpContext {
         if rtp_packet.len() < 12 {
             anyhow::bail!("RTP packet too short");
         }
-
         let ssrc =
             u32::from_be_bytes([rtp_packet[8], rtp_packet[9], rtp_packet[10], rtp_packet[11]]);
         let seq = u16::from_be_bytes([rtp_packet[2], rtp_packet[3]]);
 
+        if !self.streams.contains_key(&ssrc) && self.streams.len() >= MAX_SEND_SSRCS {
+            anyhow::bail!(
+                "SRTP: too many distinct outbound SSRCs for one master key ({}), rekey required",
+                self.streams.len()
+            );
+        }
         let st = self.streams.entry(ssrc).or_default();
+        if st.protected_packets >= self.packet_lifetime {
+            anyhow::bail!("SRTP master key lifetime exhausted");
+        }
         st.update_roc(seq);
         let roc = st.roc;
         let index = ((roc as u64) << 16) | seq as u64;
@@ -229,6 +287,8 @@ impl SrtpContext {
         let tag = mac.finalize().into_bytes();
         output.extend_from_slice(&tag[..SRTP_AUTH_TAG_LEN]);
 
+        st.protected_packets += 1;
+
         Ok(output)
     }
 
@@ -240,12 +300,14 @@ impl SrtpContext {
     /// `highest_seq` would reject the peer's fresh low-seq packets as "too old"
     /// and decrypt would silently drop every packet until the sequence climbed
     /// back into range.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn reset_sequence_state(&mut self) {
-        // Drop all per-SSRC state so any SSRC — the same one restarting with a
-        // low sequence after a hold, or a fresh one — re-baselines on its next
-        // packet. Called at a trusted SDP-renegotiation boundary; the derived
-        // session keys are preserved.
-        self.streams.clear();
+        // Re-baseline ROC/replay state while retaining each stream's packet
+        // count. Resetting sequence state must not renew a live master key's
+        // negotiated lifetime.
+        for stream in self.streams.values_mut() {
+            stream.reset_sequence_state();
+        }
     }
 
     /// Decrypt an SRTP packet, verifying the auth tag, checking for replay,
@@ -289,7 +351,6 @@ impl SrtpContext {
         {
             anyhow::bail!("SRTP auth tag mismatch (ssrc={ssrc:#x}, seq={seq})");
         }
-
         // Auth passed — commit replay state for this SSRC, creating the entry on
         // first sight. Bounded: reject a brand-new SSRC over the cap rather than
         // evicting a live stream's replay window.
@@ -299,7 +360,11 @@ impl SrtpContext {
                 self.streams.len()
             );
         }
-        let (_roc, index) = self.streams.entry(ssrc).or_default().check_replay(seq)?;
+        let st = self.streams.entry(ssrc).or_default();
+        if st.accepted_packets >= self.packet_lifetime {
+            anyhow::bail!("SRTP master key lifetime exhausted");
+        }
+        let (_roc, index) = st.check_replay(seq)?;
 
         // Decrypt payload
         let header_len = rtp_header_len(auth_portion)
@@ -309,6 +374,8 @@ impl SrtpContext {
         let iv = compute_iv(&self.cipher_salt, ssrc, index);
         let mut cipher = Aes128Ctr::new((&self.cipher_key).into(), (&iv).into());
         cipher.apply_keystream(&mut output[header_len..]);
+
+        st.accepted_packets += 1;
 
         Ok(output)
     }
@@ -330,6 +397,7 @@ struct SrtcpRecvState {
     recv_index_initialized: bool,
     /// Sliding replay window bitmap (64 indices behind highest_recv_index)
     replay_window: u64,
+    accepted_packets: u64,
 }
 
 impl SrtcpRecvState {
@@ -382,11 +450,37 @@ pub struct SrtcpContext {
     /// Per-SSRC inbound SRTCP replay state, keyed by RTCP sender SSRC. Inserted
     /// only after a packet authenticates (bounded by `MAX_RECV_SSRCS`).
     recv_streams: HashMap<u32, SrtcpRecvState>,
+    /// Per-SSRC outbound key-lifetime counts. The wire index remains global,
+    /// but RFC 3711's packet bound applies independently to each RTCP stream.
+    send_streams: HashMap<u32, u64>,
+    /// The sender uses one global 31-bit wire index for compatibility. Even
+    /// when several SSRC streams share this context, stop before that index
+    /// wraps so no returning SSRC can reuse an IV under the same key.
+    protected_packets_total: u64,
+    /// The effective master-key lifetime. An SDES value may be larger than
+    /// SRTCP's fixed 2^31 packet limit, in which case the RFC 3711 limit wins.
+    packet_lifetime: u64,
 }
 
 impl SrtcpContext {
     /// Create an SRTCP context from a base64-encoded SDES key (same key as SRTP).
     pub fn from_sdes_key(key_b64: &str) -> anyhow::Result<Self> {
+        Self::from_sdes_key_with_lifetime(key_b64, MAX_SRTCP_PACKETS_PER_MASTER_KEY)
+    }
+
+    /// Create an SRTCP context with an SDES-signaled master-key lifetime.
+    ///
+    /// A shared SDES lifetime is valid up to SRTP's 2^48 limit. SRTCP itself
+    /// still cannot exceed its RFC 3711 2^31 packet limit.
+    pub fn from_sdes_key_with_lifetime(
+        key_b64: &str,
+        packet_lifetime: u64,
+    ) -> anyhow::Result<Self> {
+        if packet_lifetime == 0 || packet_lifetime > MAX_SRTP_PACKETS_PER_MASTER_KEY {
+            anyhow::bail!(
+                "SRTCP master key lifetime must be between 1 and {MAX_SRTP_PACKETS_PER_MASTER_KEY} packets"
+            );
+        }
         let mut key_material = base64_decode(key_b64)?;
         if key_material.len() != SRTP_MASTER_KEY_LEN + SRTP_MASTER_SALT_LEN {
             anyhow::bail!(
@@ -428,7 +522,16 @@ impl SrtcpContext {
             auth_key: ak,
             srtcp_index: 0,
             recv_streams: HashMap::new(),
+            send_streams: HashMap::new(),
+            protected_packets_total: 0,
+            packet_lifetime: packet_lifetime.min(MAX_SRTCP_PACKETS_PER_MASTER_KEY),
         })
+    }
+
+    pub(crate) fn tighten_packet_lifetime(&mut self, packet_lifetime: u64) {
+        let packet_lifetime = packet_lifetime.min(MAX_SRTCP_PACKETS_PER_MASTER_KEY);
+        debug_assert!(packet_lifetime <= self.packet_lifetime);
+        self.packet_lifetime = packet_lifetime;
     }
 
     /// Encrypt an RTCP compound packet (RFC 3711 §3.4).
@@ -437,7 +540,9 @@ impl SrtcpContext {
         if rtcp_packet.len() < 8 {
             anyhow::bail!("RTCP packet too short");
         }
-
+        if self.protected_packets_total >= MAX_SRTCP_PACKETS_PER_MASTER_KEY {
+            anyhow::bail!("SRTCP global packet index exhausted; rekey required");
+        }
         // SSRC from first sub-packet header (bytes 4-7)
         let ssrc = u32::from_be_bytes([
             rtcp_packet[4],
@@ -445,6 +550,16 @@ impl SrtcpContext {
             rtcp_packet[6],
             rtcp_packet[7],
         ]);
+        if !self.send_streams.contains_key(&ssrc) && self.send_streams.len() >= MAX_SEND_SSRCS {
+            anyhow::bail!(
+                "SRTCP: too many distinct outbound SSRCs for one master key ({}), rekey required",
+                self.send_streams.len()
+            );
+        }
+        let protected_packets = self.send_streams.entry(ssrc).or_default();
+        if *protected_packets >= self.packet_lifetime {
+            anyhow::bail!("SRTCP master key lifetime exhausted");
+        }
 
         let index = self.srtcp_index;
         self.srtcp_index = (self.srtcp_index + 1) & 0x7FFFFFFF;
@@ -471,6 +586,9 @@ impl SrtcpContext {
         mac.update(&output);
         let tag = mac.finalize().into_bytes();
         output.extend_from_slice(&tag[..SRTP_AUTH_TAG_LEN]);
+
+        *protected_packets += 1;
+        self.protected_packets_total += 1;
 
         Ok(output)
     }
@@ -500,7 +618,6 @@ impl SrtcpContext {
         {
             anyhow::bail!("SRTCP auth tag mismatch");
         }
-
         // Extract E-flag and index
         let e_and_index = u32::from_be_bytes([
             srtcp_packet[index_start],
@@ -528,10 +645,11 @@ impl SrtcpContext {
                 self.recv_streams.len()
             );
         }
-        self.recv_streams
-            .entry(ssrc)
-            .or_default()
-            .check_replay(recv_index)?;
+        let recv_state = self.recv_streams.entry(ssrc).or_default();
+        if recv_state.accepted_packets >= self.packet_lifetime {
+            anyhow::bail!("SRTCP master key lifetime exhausted");
+        }
+        recv_state.check_replay(recv_index)?;
 
         // Strip E+index and auth tag to get the RTCP compound packet
         let mut output = srtcp_packet[..index_start].to_vec();
@@ -542,6 +660,8 @@ impl SrtcpContext {
             let mut cipher = Aes128Ctr::new((&self.cipher_key).into(), (&iv).into());
             cipher.apply_keystream(&mut output[8..]);
         }
+
+        recv_state.accepted_packets += 1;
 
         Ok(output)
     }

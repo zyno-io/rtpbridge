@@ -71,6 +71,52 @@ fn test_srtp_multiple_packets() {
 }
 
 #[test]
+fn test_srtp_key_lifetime_is_enforced_for_protect_and_unprotect() {
+    let key = make_test_key();
+    let first_rtp = crate::media::rtp::RtpHeader::build(0, 1, 160, 0x12345678, false, &[0xAA; 80]);
+    let second_rtp = crate::media::rtp::RtpHeader::build(0, 2, 320, 0x12345678, false, &[0xBB; 80]);
+
+    let mut limited_protector = SrtpContext::from_sdes_key_with_lifetime(&key, 1).unwrap();
+    limited_protector.protect(&first_rtp).unwrap();
+    let protect_error = limited_protector.protect(&second_rtp).unwrap_err();
+    assert!(protect_error.to_string().contains("lifetime exhausted"));
+
+    let mut normal_protector = SrtpContext::from_sdes_key(&key).unwrap();
+    let first_srtp = normal_protector.protect(&first_rtp).unwrap();
+    let second_srtp = normal_protector.protect(&second_rtp).unwrap();
+    let mut limited_receiver = SrtpContext::from_sdes_key_with_lifetime(&key, 1).unwrap();
+    assert_eq!(limited_receiver.unprotect(&first_srtp).unwrap(), first_rtp);
+    let unprotect_error = limited_receiver.unprotect(&second_srtp).unwrap_err();
+    assert!(unprotect_error.to_string().contains("lifetime exhausted"));
+}
+
+#[test]
+fn test_srtp_key_lifetime_is_per_ssrc_stream() {
+    let key = make_test_key();
+    let a1 = crate::media::rtp::RtpHeader::build(0, 1, 160, 0xAAAA, false, &[0x11; 80]);
+    let a2 = crate::media::rtp::RtpHeader::build(0, 2, 320, 0xAAAA, false, &[0x22; 80]);
+    let b1 = crate::media::rtp::RtpHeader::build(0, 1, 160, 0xBBBB, false, &[0x33; 80]);
+    let b2 = crate::media::rtp::RtpHeader::build(0, 2, 320, 0xBBBB, false, &[0x44; 80]);
+
+    let mut limited_protector = SrtpContext::from_sdes_key_with_lifetime(&key, 1).unwrap();
+    limited_protector.protect(&a1).unwrap();
+    limited_protector.protect(&b1).unwrap();
+    assert!(limited_protector.protect(&a2).is_err());
+    assert!(limited_protector.protect(&b2).is_err());
+
+    let mut normal_protector = SrtpContext::from_sdes_key(&key).unwrap();
+    let a1 = normal_protector.protect(&a1).unwrap();
+    let b1 = normal_protector.protect(&b1).unwrap();
+    let a2 = normal_protector.protect(&a2).unwrap();
+    let b2 = normal_protector.protect(&b2).unwrap();
+    let mut limited_receiver = SrtpContext::from_sdes_key_with_lifetime(&key, 1).unwrap();
+    limited_receiver.unprotect(&a1).unwrap();
+    limited_receiver.unprotect(&b1).unwrap();
+    assert!(limited_receiver.unprotect(&a2).is_err());
+    assert!(limited_receiver.unprotect(&b2).is_err());
+}
+
+#[test]
 fn test_srtp_replay_rejected() {
     let key = make_test_key();
     let mut protect_ctx = SrtpContext::from_sdes_key(&key).unwrap();
@@ -198,9 +244,15 @@ fn test_srtp_reset_sequence_state_preserves_keys() {
         "cipher_salt must be preserved"
     );
     assert_eq!(ctx.auth_key, auth_before, "auth_key must be preserved");
-    assert!(
-        ctx.streams.is_empty(),
-        "reset must drop all per-SSRC sequence/replay state"
+    let stream = ctx
+        .streams
+        .get(&0x11223344)
+        .expect("reset must retain per-SSRC lifetime accounting");
+    assert!(!stream.seq_initialized, "sequence state must be reset");
+    assert_eq!(stream.replay_window, 0, "replay state must be reset");
+    assert_eq!(
+        stream.accepted_packets, 1,
+        "reset must not renew the master-key lifetime"
     );
 }
 
@@ -291,6 +343,55 @@ fn test_srtcp_roundtrip() {
 
     let decrypted = unprotect_ctx.unprotect_rtcp(&srtcp).unwrap();
     assert_eq!(decrypted, rtcp);
+}
+
+#[test]
+fn test_srtcp_key_lifetime_is_enforced_for_protect_and_unprotect() {
+    let key = make_test_key();
+    let mut stats = crate::media::rtcp::RtcpStats::new();
+    let first_rtcp = crate::media::rtcp::build_sr_rr(0x12345678, 0xAABBCCDD, &mut stats, 0, 8000);
+    let second_rtcp =
+        crate::media::rtcp::build_sr_rr(0x12345678, 0xAABBCCDD, &mut stats, 160, 8000);
+
+    let mut limited_protector = SrtcpContext::from_sdes_key_with_lifetime(&key, 1).unwrap();
+    limited_protector.protect_rtcp(&first_rtcp).unwrap();
+    let protect_error = limited_protector.protect_rtcp(&second_rtcp).unwrap_err();
+    assert!(protect_error.to_string().contains("lifetime exhausted"));
+
+    let mut normal_protector = SrtcpContext::from_sdes_key(&key).unwrap();
+    let first_srtcp = normal_protector.protect_rtcp(&first_rtcp).unwrap();
+    let second_srtcp = normal_protector.protect_rtcp(&second_rtcp).unwrap();
+    let mut limited_receiver = SrtcpContext::from_sdes_key_with_lifetime(&key, 1).unwrap();
+    assert_eq!(
+        limited_receiver.unprotect_rtcp(&first_srtcp).unwrap(),
+        first_rtcp
+    );
+    let unprotect_error = limited_receiver.unprotect_rtcp(&second_srtcp).unwrap_err();
+    assert!(unprotect_error.to_string().contains("lifetime exhausted"));
+}
+
+#[test]
+fn test_srtcp_key_lifetime_is_per_ssrc_stream() {
+    let key = make_test_key();
+    let a = [0x80, 201, 0, 1, 0, 0, 0xAA, 0xAA];
+    let b = [0x80, 201, 0, 1, 0, 0, 0xBB, 0xBB];
+
+    let mut limited_protector = SrtcpContext::from_sdes_key_with_lifetime(&key, 1).unwrap();
+    limited_protector.protect_rtcp(&a).unwrap();
+    limited_protector.protect_rtcp(&b).unwrap();
+    assert!(limited_protector.protect_rtcp(&a).is_err());
+    assert!(limited_protector.protect_rtcp(&b).is_err());
+
+    let mut normal_protector = SrtcpContext::from_sdes_key(&key).unwrap();
+    let a1 = normal_protector.protect_rtcp(&a).unwrap();
+    let b1 = normal_protector.protect_rtcp(&b).unwrap();
+    let a2 = normal_protector.protect_rtcp(&a).unwrap();
+    let b2 = normal_protector.protect_rtcp(&b).unwrap();
+    let mut limited_receiver = SrtcpContext::from_sdes_key_with_lifetime(&key, 1).unwrap();
+    limited_receiver.unprotect_rtcp(&a1).unwrap();
+    limited_receiver.unprotect_rtcp(&b1).unwrap();
+    assert!(limited_receiver.unprotect_rtcp(&a2).is_err());
+    assert!(limited_receiver.unprotect_rtcp(&b2).is_err());
 }
 
 #[test]
@@ -945,22 +1046,24 @@ fn test_srtp_recv_ssrc_cap_rejects_excess() {
     // The receive context bounds distinct SSRCs to MAX_RECV_SSRCS; one more
     // authenticated SSRC is rejected rather than evicting a live stream.
     let key = make_test_key();
-    let mut tx = SrtpContext::from_sdes_key(&key).unwrap();
     let mut rx = SrtpContext::from_sdes_key(&key).unwrap();
 
     for i in 0..MAX_RECV_SSRCS as u32 {
+        let mut tx = SrtpContext::from_sdes_key(&key).unwrap();
         let rtp =
             crate::media::rtp::RtpHeader::build(0, 0, 0, 0x1000_0000 + i, false, &[i as u8; 80]);
         let srtp = tx.protect(&rtp).unwrap();
         rx.unprotect(&srtp).unwrap();
     }
 
+    let mut tx = SrtpContext::from_sdes_key(&key).unwrap();
     let rtp = crate::media::rtp::RtpHeader::build(0, 0, 0, 0x2000_0000, false, &[0u8; 80]);
     let srtp = tx.protect(&rtp).unwrap();
     let err = rx.unprotect(&srtp).unwrap_err().to_string();
     assert!(err.contains("too many"), "expected cap error, got: {err}");
 
     // An already-tracked SSRC keeps working (not locked out by the cap).
+    let mut tx = SrtpContext::from_sdes_key(&key).unwrap();
     let rtp = crate::media::rtp::RtpHeader::build(0, 1, 160, 0x1000_0000, false, &[7u8; 80]);
     let srtp = tx.protect(&rtp).unwrap();
     rx.unprotect(&srtp)

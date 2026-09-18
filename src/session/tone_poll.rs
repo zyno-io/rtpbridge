@@ -18,6 +18,7 @@ pub struct ToneRtpState {
 
 /// Poll tone endpoints for PCM output. Produces RoutedRtpPackets and emits
 /// endpoint.tone.finished events when a duration-limited tone completes.
+/// Returns whether routes changed.
 pub fn poll_tone_endpoints(
     endpoints: &mut HashMap<EndpointId, Endpoint>,
     tone_rtp_states: &mut HashMap<EndpointId, ToneRtpState>,
@@ -26,7 +27,8 @@ pub fn poll_tone_endpoints(
     dropped_events: &AtomicU64,
     metrics: &crate::metrics::Metrics,
     packets_out: &mut Vec<RoutedRtpPacket>,
-) {
+) -> bool {
+    let mut finished = false;
     for ep in endpoints.values_mut() {
         if let Endpoint::Tone(tep) = ep {
             if tep.state != EndpointState::Playing {
@@ -64,6 +66,7 @@ pub fn poll_tone_endpoints(
                     state.seq_no = state.seq_no.wrapping_add(1);
                     state.timestamp = state.timestamp.wrapping_add(160);
                 } else if was_playing && tep.state == EndpointState::Finished {
+                    finished = true;
                     super::media_session::emit_event_with_priority(
                         event_tx,
                         critical_event_tx,
@@ -81,4 +84,5 @@ pub fn poll_tone_endpoints(
             }
         }
     }
+    finished
 }

@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -56,7 +57,7 @@ pub struct EndpointTransferBundle {
     pub sensitive_dtmf: bool,
     pub vad_monitor: Option<VadMonitor>,
     pub fax_detector: Option<FaxDetector>,
-    pub analysis_decoder: Option<Box<dyn crate::media::codec::AudioDecoder>>,
+    pub analysis_decoder: Option<super::source_audio::SourceAudio>,
     pub file_rtp_state: Option<FileRtpState>,
     pub url_source: Option<String>,
     pub media_timeout_was_emitted: bool,
@@ -132,7 +133,14 @@ pub enum SessionCommand {
     RecordingStart {
         reply: oneshot::Sender<anyhow::Result<(RecordingId, u64)>>,
         endpoint_id: Option<EndpointId>,
-        file_path: String,
+        recording_base: PathBuf,
+        recording_relative: PathBuf,
+        file_path: PathBuf,
+    },
+    RecordingPrepared {
+        reply: oneshot::Sender<anyhow::Result<(RecordingId, u64)>>,
+        endpoint_id: Option<EndpointId>,
+        prepared: anyhow::Result<crate::recording::recorder::PreparedRecording>,
     },
     RecordingStop {
         reply: oneshot::Sender<anyhow::Result<RecordingStopResult>>,
@@ -175,10 +183,15 @@ pub enum SessionCommand {
     },
     FileReady {
         endpoint_id: EndpointId,
-        result: anyhow::Result<std::path::PathBuf>,
+        result: anyhow::Result<crate::playback::file_cache::CacheLease>,
         start_ms: u64,
         loop_count: Option<u32>,
         url: String,
+    },
+    FileInitialized {
+        endpoint_id: EndpointId,
+        result: anyhow::Result<Box<FileEndpoint>>,
+        reply: Option<oneshot::Sender<anyhow::Result<EndpointId>>>,
     },
     FileSeek {
         reply: oneshot::Sender<anyhow::Result<()>>,
@@ -228,15 +241,18 @@ pub enum SessionCommand {
     GetInfo {
         reply: oneshot::Sender<SessionDetails>,
     },
-    /// Extract an endpoint for transfer to another session
-    ExtractEndpoint {
-        reply: oneshot::Sender<anyhow::Result<EndpointTransferBundle>>,
+    PrepareTransfer {
+        slot: super::transfer::TransferSlot,
         endpoint_id: EndpointId,
+        reply: oneshot::Sender<anyhow::Result<()>>,
     },
-    /// Insert a transferred endpoint into this session
-    InsertEndpoint {
-        reply: oneshot::Sender<Result<(), (anyhow::Error, EndpointTransferBundle)>>,
-        bundle: Box<EndpointTransferBundle>,
+    CommitTransfer {
+        slot: super::transfer::TransferSlot,
+        reply: oneshot::Sender<anyhow::Result<()>>,
+    },
+    FinishTransfer {
+        slot: super::transfer::TransferSlot,
+        endpoint_id: EndpointId,
     },
     /// Get a clone of the session's inbound packet channel sender
     GetPacketTx {
@@ -311,11 +327,12 @@ struct SessionState {
     tone_rtp_states: HashMap<EndpointId, super::tone_poll::ToneRtpState>,
     transcode_cache: HashMap<(EndpointId, EndpointId), CachedTranscode>,
     url_sources: HashMap<EndpointId, String>,
+    reserved_transfers: HashSet<EndpointId>,
     fax_detectors: HashMap<EndpointId, FaxDetector>,
     /// Per-endpoint audio decoders shared by VAD and fax detection. Inbound RTP
     /// is decoded to PCM once per packet (needed for G.722/Opus stateful
     /// decoding) and fed to whichever analysers are active.
-    analysis_decoders: HashMap<EndpointId, Box<dyn crate::media::codec::AudioDecoder>>,
+    analysis_decoders: HashMap<EndpointId, super::source_audio::SourceAudio>,
     /// Tracks endpoints that have already emitted a media_timeout event.
     /// Cleared when the endpoint receives a packet again.
     media_timeout_emitted: std::collections::HashSet<EndpointId>,
@@ -515,7 +532,48 @@ impl SessionState {
             SessionCommand::RecordingStart {
                 reply,
                 endpoint_id,
+                recording_base,
+                recording_relative,
                 file_path,
+            } => {
+                let completion = self.cmd_tx.clone().try_reserve_owned();
+                if endpoint_id.is_some_and(|id| !self.endpoints.contains_key(&id)) {
+                    let _ = reply.send(Err(anyhow::anyhow!("Endpoint not found")));
+                } else if let Ok(completion) = completion {
+                    match self.recording_mgr.begin_start() {
+                        Err(error) => {
+                            let _ = reply.send(Err(error));
+                        }
+                        Ok(()) => {
+                            tokio::spawn(async move {
+                                let opened = tokio::time::timeout(
+                                    Duration::from_secs(10),
+                                    crate::recording::recorder::prepare(
+                                        recording_base,
+                                        recording_relative,
+                                        file_path,
+                                    ),
+                                )
+                                .await;
+                                let prepared = opened.unwrap_or_else(|_| {
+                                    Err(anyhow::anyhow!("recording initialization timeout"))
+                                });
+                                completion.send(SessionCommand::RecordingPrepared {
+                                    reply,
+                                    endpoint_id,
+                                    prepared,
+                                });
+                            });
+                        }
+                    }
+                } else {
+                    let _ = reply.send(Err(anyhow::anyhow!("RECORDING_BUSY")));
+                }
+            }
+            SessionCommand::RecordingPrepared {
+                reply,
+                endpoint_id,
+                prepared,
             } => {
                 // Seed descriptors for already-negotiated endpoints so the new
                 // recording is self-describing from byte 0 (start() replays the
@@ -539,16 +597,16 @@ impl SessionState {
                     self.recording_mgr.note_descriptor(id, d, *local, *remote);
                 }
 
-                // Validate that the endpoint exists before starting a recording
-                let result = if let Some(eid) = endpoint_id {
-                    if self.endpoints.contains_key(&eid) {
-                        self.recording_mgr.start(Some(eid), file_path).await
-                    } else {
-                        Err(anyhow::anyhow!("Endpoint not found"))
-                    }
+                let prepared = if reply.is_closed()
+                    || endpoint_id.is_some_and(|id| !self.endpoints.contains_key(&id))
+                {
+                    Err(anyhow::anyhow!(
+                        "recording request or endpoint ended during initialization"
+                    ))
                 } else {
-                    self.recording_mgr.start(None, file_path).await
+                    prepared
                 };
+                let result = self.recording_mgr.complete_start(endpoint_id, prepared);
                 if result.is_ok() {
                     self.metrics.recordings_active.inc();
                 }
@@ -605,6 +663,47 @@ impl SessionState {
                 headers,
                 gain_db,
             } => {
+                if !crate::playback::file_cache::is_url(&source) {
+                    if self.max_endpoints > 0
+                        && self.endpoints.len() + self.reserved_transfers.len()
+                            >= self.max_endpoints
+                    {
+                        let _ = reply.send(Err(anyhow::anyhow!("MAX_ENDPOINTS_REACHED")));
+                        return true;
+                    }
+                    let completion = match self.cmd_tx.clone().try_reserve_owned() {
+                        Ok(completion) => completion,
+                        Err(_) => {
+                            let _ = reply.send(Err(anyhow::anyhow!("PLAYBACK_BUSY")));
+                            return true;
+                        }
+                    };
+                    let id = EndpointId::new_v4();
+                    let endpoint = FileEndpoint::new_buffering(id, gain_db);
+                    let cancel = endpoint.download_cancel.clone();
+                    self.endpoints
+                        .insert(id, Endpoint::File(Box::new(endpoint)));
+                    self.metrics.endpoints_total.inc();
+                    self.metrics.endpoints_active.inc();
+                    let media_dir = self.media_dir.clone();
+                    let manager = self.shared_playback.clone();
+                    tokio::spawn(async move {
+                        let work = FileEndpoint::prepare(
+                            id, source, media_dir, None, manager, shared, start_ms, loop_count,
+                            gain_db,
+                        );
+                        let result = tokio::select! {
+                            _ = cancel.cancelled() => return,
+                            result = tokio::time::timeout(std::time::Duration::from_secs(10), work) => result.map_err(anyhow::Error::from).and_then(|r| r).map(Box::new),
+                        };
+                        completion.send(SessionCommand::FileInitialized {
+                            endpoint_id: id,
+                            result,
+                            reply: Some(reply),
+                        });
+                    });
+                    return true;
+                }
                 let result = self
                     .handle_create_with_file(
                         &source,
@@ -646,13 +745,24 @@ impl SessionState {
                 self.handle_file_ready(endpoint_id, result, start_ms, loop_count, &url)
                     .await;
             }
+            SessionCommand::FileInitialized {
+                endpoint_id,
+                result,
+                reply,
+            } => {
+                self.handle_file_initialized(endpoint_id, result, reply)
+                    .await;
+            }
             SessionCommand::FileSeek {
                 reply,
                 endpoint_id,
                 position_ms,
-            } => {
-                let _ = reply.send(self.handle_file_seek(endpoint_id, position_ms));
-            }
+            } => match self.endpoints.get_mut(&endpoint_id) {
+                Some(Endpoint::File(endpoint)) => endpoint.request_seek(position_ms, reply),
+                _ => {
+                    let _ = reply.send(Err(anyhow::anyhow!("File endpoint not found")));
+                }
+            },
             SessionCommand::FilePause { reply, endpoint_id } => {
                 let _ = reply.send(self.handle_file_pause(endpoint_id));
             }
@@ -712,25 +822,66 @@ impl SessionState {
             SessionCommand::GetInfo { reply } => {
                 let _ = reply.send(self.get_info());
             }
-            SessionCommand::ExtractEndpoint { reply, endpoint_id } => {
-                let result = self.handle_extract_endpoint(endpoint_id).await;
+            SessionCommand::PrepareTransfer {
+                slot,
+                endpoint_id,
+                reply,
+            } => {
+                let cancelled = slot.lock().unwrap_or_else(|e| e.into_inner()).cancelled;
+                if cancelled {
+                    let _ = reply.send(Err(anyhow::anyhow!("transfer cancelled")));
+                } else if !self.reserved_transfers.insert(endpoint_id) {
+                    let _ = reply.send(Err(anyhow::anyhow!("endpoint transfer already pending")));
+                } else {
+                    slot.lock().unwrap_or_else(|e| e.into_inner()).reserved = true;
+                    let result = self.handle_extract_endpoint(endpoint_id).await;
+                    match result {
+                        Ok(bundle) => {
+                            self.metrics.endpoints_active.dec();
+                            // FinishTransfer follows us on the source queue and
+                            // will restore this bundle if cancellation won the race.
+                            slot.lock().unwrap_or_else(|e| e.into_inner()).bundle =
+                                Some(Box::new(bundle));
+                            let _ = reply.send(Ok(()));
+                        }
+                        Err(e) => {
+                            self.reserved_transfers.remove(&endpoint_id);
+                            slot.lock().unwrap_or_else(|e| e.into_inner()).reserved = false;
+                            let _ = reply.send(Err(e));
+                        }
+                    }
+                }
+            }
+            SessionCommand::CommitTransfer { slot, reply } => {
+                let mut transfer = slot.lock().unwrap_or_else(|e| e.into_inner());
+                let result = if transfer.cancelled {
+                    Err(anyhow::anyhow!("transfer cancelled"))
+                } else if let Some(bundle) = transfer.bundle.as_mut() {
+                    self.handle_insert_endpoint(bundle, packet_tx)
+                } else {
+                    Err(anyhow::anyhow!("transfer has no endpoint"))
+                };
                 if result.is_ok() {
-                    self.metrics.endpoints_active.dec();
+                    transfer.committed = true;
+                    transfer.bundle = None;
+                    self.metrics.endpoints_active.inc();
+                    self.metrics.endpoints_total.inc();
                 }
                 let _ = reply.send(result);
             }
-            SessionCommand::InsertEndpoint { reply, mut bundle } => {
-                let result = self.handle_insert_endpoint(&mut bundle, packet_tx).await;
-                match result {
-                    Ok(()) => {
-                        self.metrics.endpoints_total.inc();
-                        self.metrics.endpoints_active.inc();
-                        let _ = reply.send(Ok(()));
-                    }
-                    Err(e) => {
-                        let _ = reply.send(Err((e, *bundle)));
-                    }
+            SessionCommand::FinishTransfer { slot, endpoint_id } => {
+                let mut transfer = slot.lock().unwrap_or_else(|e| e.into_inner());
+                if !transfer.reserved {
+                    return true;
                 }
+                if !transfer.committed
+                    && let Some(mut bundle) = transfer.bundle.take()
+                    && self.handle_insert_endpoint(&mut bundle, packet_tx).is_ok()
+                {
+                    self.metrics.endpoints_active.inc();
+                }
+                self.reserved_transfers.remove(&endpoint_id);
+                transfer.reserved = false;
             }
             SessionCommand::GetPacketTx { reply } => {
                 let _ = reply.send(packet_tx.clone());
@@ -805,7 +956,9 @@ impl SessionState {
         direction: EndpointDirection,
         expected_type: Option<EndpointType>,
     ) -> anyhow::Result<(EndpointId, String)> {
-        if self.max_endpoints > 0 && self.endpoints.len() >= self.max_endpoints {
+        if self.max_endpoints > 0
+            && self.endpoints.len() + self.reserved_transfers.len() >= self.max_endpoints
+        {
             anyhow::bail!("MAX_ENDPOINTS_REACHED");
         }
         let id = EndpointId::new_v4();
@@ -854,13 +1007,15 @@ impl SessionState {
             self.endpoints.insert(id, Endpoint::WebRtc(Box::new(ep)));
             (answer, Some(101u8))
         } else {
+            parsed.validate_plain_transport()?;
             // Match the remote SDP's address family; reject if we didn't bind it.
             let binding = self.select_rtp_binding(parsed.remote_addr)?;
             let bind_ip = binding.ip;
             let pool = Arc::clone(&binding.pool);
             let pair = pool.allocate_pair().await?;
-            let (ep, answer) =
+            let (mut ep, answer) =
                 RtpEndpoint::from_offer(id, direction, sdp_str, pair, bind_ip, packet_tx.clone())?;
+            ep.source_networks = Arc::clone(&self.media_bindings.source_networks);
             let te = ep.telephone_event_pt;
             info!(
                 session_id = %self.session_id,
@@ -897,7 +1052,9 @@ impl SessionState {
         srtp_optional: bool,
         codecs: Option<Vec<String>>,
     ) -> anyhow::Result<(EndpointId, String)> {
-        if self.max_endpoints > 0 && self.endpoints.len() >= self.max_endpoints {
+        if self.max_endpoints > 0
+            && self.endpoints.len() + self.reserved_transfers.len() >= self.max_endpoints
+        {
             anyhow::bail!("MAX_ENDPOINTS_REACHED");
         }
         let id = EndpointId::new_v4();
@@ -948,7 +1105,7 @@ impl SessionState {
                 } else {
                     RtpMediaSecurity::PlainRtp
                 };
-                let (ep, offer) = RtpEndpoint::create_offer(
+                let (mut ep, offer) = RtpEndpoint::create_offer(
                     id,
                     direction,
                     pair,
@@ -957,6 +1114,7 @@ impl SessionState {
                     media_security,
                     packet_tx.clone(),
                 )?;
+                ep.source_networks = Arc::clone(&self.media_bindings.source_networks);
                 let te = ep.telephone_event_pt;
                 let codec_names: Vec<&str> = ep.codecs.iter().map(|c| c.name).collect();
                 info!(
@@ -998,15 +1156,30 @@ impl SessionState {
         headers: Option<std::collections::HashMap<String, String>>,
         gain_db: f32,
     ) -> anyhow::Result<EndpointId> {
-        if self.max_endpoints > 0 && self.endpoints.len() >= self.max_endpoints {
+        if self.max_endpoints > 0
+            && self.endpoints.len() + self.reserved_transfers.len() >= self.max_endpoints
+        {
             anyhow::bail!("MAX_ENDPOINTS_REACHED");
         }
 
         let id = EndpointId::new_v4();
 
         if crate::playback::file_cache::is_url(source) {
+            // Reserve completion delivery before creating the endpoint or task.
+            let completion = self
+                .cmd_tx
+                .clone()
+                .try_reserve_owned()
+                .map_err(|_| anyhow::anyhow!("DOWNLOAD_BUSY"))?;
+            let request = self.file_cache.start_download(
+                source,
+                cache_ttl_secs,
+                timeout_ms,
+                headers.as_ref(),
+            )?;
             let mut ep = FileEndpoint::new_buffering(id, gain_db);
             ep.shared = shared;
+            let cancel = ep.download_cancel.clone();
             self.endpoints.insert(id, Endpoint::File(Box::new(ep)));
             self.rebuild_routing();
             info!(
@@ -1021,66 +1194,36 @@ impl SessionState {
 
             let url = source.to_string();
             self.url_sources.insert(id, url.clone());
-            let cmd_tx = self.cmd_tx.clone();
-            let cache = Arc::clone(&self.file_cache);
-            let ttl = cache_ttl_secs;
-            let timeout = timeout_ms;
             tokio::spawn(async move {
-                let result = cache
-                    .get_or_download(&url, ttl, timeout, headers.as_ref())
-                    .await;
-                let download_ok = result.is_ok();
-                if cmd_tx
-                    .send(SessionCommand::FileReady {
-                        endpoint_id: id,
-                        result,
-                        start_ms,
-                        loop_count,
-                        url: url.clone(),
-                    })
-                    .await
-                    .is_err()
-                {
-                    // Session died before download completed. Release the cache
-                    // ref that get_or_download() acquired, otherwise the entry
-                    // stays at ref_count=1 forever and can never be evicted.
-                    if download_ok {
-                        cache.release(&url).await;
-                    }
-                }
+                let result = tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    result = request.wait() => result,
+                };
+                completion.send(SessionCommand::FileReady {
+                    endpoint_id: id,
+                    result,
+                    start_ms,
+                    loop_count,
+                    url,
+                });
             });
 
             Ok(id)
         } else {
-            let media_dir = self.media_dir.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("Local file playback is disabled (no media_dir configured)")
-            })?;
-            let canonical_dir = media_dir.canonicalize().map_err(|e| {
-                anyhow::anyhow!(
-                    "media_dir '{}' is not accessible: {}",
-                    media_dir.display(),
-                    e
-                )
-            })?;
-            let requested = std::path::Path::new(source);
-            let canonical_path = requested
-                .canonicalize()
-                .map_err(|e| anyhow::anyhow!("File path '{source}' is not accessible: {e}"))?;
-            if !canonical_path.starts_with(&canonical_dir) {
-                anyhow::bail!("File path is outside the allowed media directory");
-            }
-
-            if shared {
-                let sub = self
-                    .shared_playback
-                    .subscribe(source, 8000, start_ms, loop_count)
-                    .await?;
-                let ep = FileEndpoint::new_shared(id, source, sub, gain_db);
-                self.endpoints.insert(id, Endpoint::File(Box::new(ep)));
-            } else {
-                let ep = FileEndpoint::open(id, source, start_ms, loop_count, gain_db)?;
-                self.endpoints.insert(id, Endpoint::File(Box::new(ep)));
-            }
+            let endpoint = FileEndpoint::prepare(
+                id,
+                source.to_owned(),
+                self.media_dir.clone(),
+                None,
+                self.shared_playback.clone(),
+                shared,
+                start_ms,
+                loop_count,
+                gain_db,
+            )
+            .await?;
+            self.endpoints
+                .insert(id, Endpoint::File(Box::new(endpoint)));
             self.rebuild_routing();
             info!(
                 session_id = %self.session_id,
@@ -1285,7 +1428,9 @@ impl SessionState {
         frequency: Option<f64>,
         duration_ms: Option<u64>,
     ) -> anyhow::Result<EndpointId> {
-        if self.max_endpoints > 0 && self.endpoints.len() >= self.max_endpoints {
+        if self.max_endpoints > 0
+            && self.endpoints.len() + self.reserved_transfers.len() >= self.max_endpoints
+        {
             anyhow::bail!("max endpoints reached");
         }
         let id = EndpointId::new_v4();
@@ -1310,7 +1455,9 @@ impl SessionState {
         sample_rate: u32,
         flush_ms: u32,
     ) -> anyhow::Result<(EndpointId, uuid::Uuid)> {
-        if self.max_endpoints > 0 && self.endpoints.len() >= self.max_endpoints {
+        if self.max_endpoints > 0
+            && self.endpoints.len() + self.reserved_transfers.len() >= self.max_endpoints
+        {
             anyhow::bail!("max endpoints reached");
         }
         let id = EndpointId::new_v4();
@@ -1598,16 +1745,22 @@ impl SessionState {
         })
     }
 
-    async fn handle_insert_endpoint(
+    fn handle_insert_endpoint(
         &mut self,
         bundle: &mut EndpointTransferBundle,
         packet_tx: &mpsc::Sender<InboundPacket>,
     ) -> anyhow::Result<()> {
         // Check capacity
-        if self.max_endpoints > 0 && self.endpoints.len() >= self.max_endpoints {
+        if !self.reserved_transfers.contains(&bundle.endpoint.id())
+            && self.max_endpoints > 0
+            && self.endpoints.len() + self.reserved_transfers.len() >= self.max_endpoints
+        {
             anyhow::bail!("Maximum endpoints per session reached");
         }
 
+        if self.endpoints.contains_key(&bundle.endpoint.id()) {
+            anyhow::bail!("endpoint already exists in target session");
+        }
         let endpoint_id = bundle.endpoint.id();
         let direction = bundle.endpoint.direction();
         let state = bundle.endpoint.state();
@@ -1706,7 +1859,9 @@ impl SessionState {
         bridge: super::endpoint_bridge::BridgeEndpoint,
     ) -> anyhow::Result<EndpointId> {
         // Check capacity
-        if self.max_endpoints > 0 && self.endpoints.len() >= self.max_endpoints {
+        if self.max_endpoints > 0
+            && self.endpoints.len() + self.reserved_transfers.len() >= self.max_endpoints
+        {
             anyhow::bail!("Maximum endpoints per session reached");
         }
 
@@ -1747,72 +1902,102 @@ impl SessionState {
     async fn handle_file_ready(
         &mut self,
         endpoint_id: EndpointId,
-        result: anyhow::Result<std::path::PathBuf>,
+        result: anyhow::Result<crate::playback::file_cache::CacheLease>,
         start_ms: u64,
         loop_count: Option<u32>,
         _url: &str,
     ) {
-        let init_err = match result {
-            Ok(path) => {
-                if let Some(Endpoint::File(fep)) = self.endpoints.get_mut(&endpoint_id) {
-                    let old_state = fep.state;
-                    let path_str = path.to_string_lossy().to_string();
-                    let is_shared = fep.shared;
-
-                    let gain_db = fep.gain_db();
-
-                    let init_result = if is_shared {
-                        // Shared playback: subscribe to the shared decode task
-                        // instead of initializing a local decoder.
-                        match self
-                            .shared_playback
-                            .subscribe(&path_str, 8000, start_ms, loop_count)
-                            .await
-                        {
-                            Ok(sub) => {
-                                let new_ep =
-                                    FileEndpoint::new_shared(endpoint_id, &path_str, sub, gain_db);
-                                **fep = new_ep;
-                                Ok(())
-                            }
-                            Err(e) => Err(e),
-                        }
-                    } else {
-                        fep.initialize(&path_str, start_ms, loop_count)
-                    };
-
-                    match init_result {
-                        Ok(()) => {
-                            info!(
-                                session_id = %self.session_id,
-                                endpoint_id = %endpoint_id,
-                                source = %crate::control::logging::source_summary(&path_str),
-                                shared = is_shared,
-                                "file endpoint playback started"
-                            );
-                            self.send_event(
-                                "endpoint.state_changed",
-                                EndpointStateChangedData {
-                                    endpoint_id,
-                                    old_state,
-                                    new_state: EndpointState::Playing,
-                                },
-                            );
-                            // Rebuild routing now that file endpoint is Playing
-                            self.rebuild_routing();
-                            None
-                        }
-                        Err(e) => Some(e),
+        let result = match result {
+            Ok(lease) => {
+                let Some(Endpoint::File(endpoint)) = self.endpoints.get(&endpoint_id) else {
+                    return;
+                };
+                let completion = match self.cmd_tx.clone().try_reserve_owned() {
+                    Ok(completion) => completion,
+                    Err(_) => {
+                        self.handle_file_initialized(
+                            endpoint_id,
+                            Err(anyhow::anyhow!("PLAYBACK_BUSY")),
+                            None,
+                        )
+                        .await;
+                        return;
                     }
-                } else {
-                    // Endpoint was removed during the download. cleanup_endpoint_state
-                    // already released the cache ref via url_sources removal.
-                    None
-                }
+                };
+                let cancel = endpoint.download_cancel.clone();
+                let shared = endpoint.shared;
+                let gain_db = endpoint.gain_db();
+                let manager = self.shared_playback.clone();
+                let path = lease.to_string_lossy().into_owned();
+                tokio::spawn(async move {
+                    let work = FileEndpoint::prepare(
+                        endpoint_id,
+                        path,
+                        None,
+                        Some(lease),
+                        manager,
+                        shared,
+                        start_ms,
+                        loop_count,
+                        gain_db,
+                    );
+                    let result = tokio::select! {
+                        _ = cancel.cancelled() => return,
+                        result = tokio::time::timeout(std::time::Duration::from_secs(10), work) => result.map_err(anyhow::Error::from).and_then(|r| r).map(Box::new),
+                    };
+                    completion.send(SessionCommand::FileInitialized {
+                        endpoint_id,
+                        result,
+                        reply: None,
+                    });
+                });
+                return;
             }
-            Err(e) => {
-                warn!(endpoint_id = %endpoint_id, error = %e, "file download failed");
-                Some(e)
+            Err(error) => Err(error),
+        };
+        self.handle_file_initialized(endpoint_id, result, None)
+            .await;
+    }
+
+    async fn handle_file_initialized(
+        &mut self,
+        endpoint_id: EndpointId,
+        result: anyhow::Result<Box<FileEndpoint>>,
+        reply: Option<oneshot::Sender<anyhow::Result<EndpointId>>>,
+    ) {
+        let result = if reply.as_ref().is_some_and(oneshot::Sender::is_closed) {
+            Err(anyhow::anyhow!("playback creation cancelled"))
+        } else {
+            result
+        };
+        let init_err = match result {
+            Ok(endpoint) if self.endpoints.contains_key(&endpoint_id) => {
+                self.endpoints.insert(endpoint_id, Endpoint::File(endpoint));
+                self.rebuild_routing();
+                if let Some(reply) = reply {
+                    let _ = reply.send(Ok(endpoint_id));
+                }
+                self.send_event(
+                    "endpoint.state_changed",
+                    EndpointStateChangedData {
+                        endpoint_id,
+                        old_state: EndpointState::Buffering,
+                        new_state: EndpointState::Playing,
+                    },
+                );
+                None
+            }
+            Ok(_) => {
+                if let Some(reply) = reply {
+                    let _ = reply.send(Err(anyhow::anyhow!("Endpoint removed")));
+                }
+                None
+            }
+            Err(error) => {
+                if let Some(reply) = reply {
+                    let _ = reply.send(Err(anyhow::anyhow!(error.to_string())));
+                }
+                Some(error)
             }
         };
 
@@ -1841,6 +2026,7 @@ impl SessionState {
         }
     }
 
+    #[cfg(test)]
     fn handle_file_seek(
         &mut self,
         endpoint_id: EndpointId,
@@ -2013,18 +2199,31 @@ impl SessionState {
         result
     }
 
-    /// Drop the shared analysis decoder once no analyser (VAD or fax) remains
-    /// on the endpoint. The decoder is stateful (G.722/Opus) and is not fed
-    /// while no analyser is active, so a stale instance must not survive to be
-    /// reused by a later `vad.start`/`fax_detect.start` — that would decode a
-    /// discontinuous bitstream and corrupt the PCM. While one analyser is still
-    /// active the decoder keeps being fed, so it stays valid and is retained.
+    /// Analysis and routed media share decoder, resampler and partial-frame state.
+    /// Retain that state while any consumer still needs decoded audio.
     fn prune_analysis_decoder(&mut self, endpoint_id: EndpointId) {
-        if !self.vad_monitors.contains_key(&endpoint_id)
-            && !self.fax_detectors.contains_key(&endpoint_id)
-        {
+        if !self.source_needs_pcm(endpoint_id) {
             self.analysis_decoders.remove(&endpoint_id);
         }
+    }
+
+    fn source_needs_pcm(&self, endpoint_id: EndpointId) -> bool {
+        if self.vad_monitors.contains_key(&endpoint_id)
+            || self.fax_detectors.contains_key(&endpoint_id)
+        {
+            return true;
+        }
+        let source = self
+            .endpoints
+            .get(&endpoint_id)
+            .and_then(endpoint_audio_codec);
+        self.routing.destinations(&endpoint_id).is_some_and(|destinations| {
+            destinations.iter().any(|destination| {
+                let codec = self.endpoints.get(destination).and_then(endpoint_audio_codec);
+                self.mixers.contains_key(destination)
+                    || matches!((source, codec), (Some(source), Some(destination)) if source != destination)
+            })
+        })
     }
 
     // ── WebRTC / SRTP ───────────────────────────────────────────────
@@ -2204,7 +2403,14 @@ impl SessionState {
                             Some(
                                 self.url_sources
                                     .get(&f.id)
-                                    .map(|url| crate::playback::file_cache::cache_key(url))
+                                    .map(|url| {
+                                        f.cache_lease
+                                            .as_ref()
+                                            .map(|lease| lease.key().to_string())
+                                            .unwrap_or_else(|| {
+                                                crate::playback::file_cache::cache_key(url)
+                                            })
+                                    })
                                     .unwrap_or_else(|| f.source_path().to_string()),
                             )
                         } else {
@@ -2267,9 +2473,7 @@ impl SessionState {
         // Drop the cached recording descriptor so a later recording doesn't replay
         // a dead endpoint.
         self.recording_mgr.forget_endpoint(&endpoint_id);
-        if let Some(url) = self.url_sources.remove(&endpoint_id) {
-            self.file_cache.release(&url).await;
-        }
+        self.url_sources.remove(&endpoint_id);
         self.transcode_cache
             .retain(|(src, dst), _| *src != endpoint_id && *dst != endpoint_id);
         // Remove mixer for this destination, and remove this endpoint as a source from all mixers
@@ -2296,7 +2500,25 @@ impl SessionState {
         self.endpoint_count
             .store(self.endpoints.len(), std::sync::atomic::Ordering::Relaxed);
         self.routing.rebuild(&ep_list);
+        // Discard obsolete edges before admitting new encoder state. Active
+        // single-source destinations fit the validated pipeline budget.
+        self.transcode_cache.retain(|(source, destination), _| {
+            !self.routing.is_multi_source(destination)
+                && self
+                    .routing
+                    .destinations(source)
+                    .is_some_and(|destinations| destinations.contains(destination))
+        });
         self.rebuild_mixers();
+        let unused_decoders: Vec<_> = self
+            .analysis_decoders
+            .keys()
+            .copied()
+            .filter(|id| !self.source_needs_pcm(*id))
+            .collect();
+        for id in unused_decoders {
+            self.analysis_decoders.remove(&id);
+        }
         self.recompute_playout_policy();
         // Track when endpoint count drops to zero for empty session timeout
         if self.endpoints.is_empty() {
@@ -2314,8 +2536,16 @@ impl SessionState {
     fn rebuild_mixers(&mut self) {
         let multi = self.routing.multi_source_destinations().clone();
 
-        // Remove mixers for destinations that no longer need mixing
-        self.mixers.retain(|dest_id, _| multi.contains(dest_id));
+        // Negotiated output changes require a fresh encoder and frame size.
+        self.mixers.retain(|dest_id, mixer| {
+            multi.contains(dest_id)
+                && self.endpoints.get(dest_id).is_some_and(|ep| {
+                    match (endpoint_audio_codec(ep), endpoint_send_pt(ep)) {
+                        (Some(codec), Some(pt)) => mixer.matches_output(codec, pt),
+                        _ => false,
+                    }
+                })
+        });
 
         // Create mixers for new multi-source destinations
         for &dest_id in &multi {
@@ -2366,6 +2596,12 @@ impl SessionState {
                     // (mixer-fed) transition so the mixer one-frame-per-tick invariant holds.
                     let matches_existing = self.playout_buffers.get(id).is_some_and(|b| {
                         b.kind() == *kind
+                            && self.endpoints.get(id).is_some_and(|endpoint| {
+                                b.matches_format(
+                                    endpoint_rtp_clock_rate(endpoint),
+                                    endpoint_audio_codec(endpoint).zip(endpoint_send_pt(endpoint)),
+                                )
+                            })
                             && (*kind != PlayoutKind::Tracked
                                 || b.is_mixer_fed() == self.source_is_mixer_fed(*id))
                     });
@@ -2458,11 +2694,10 @@ impl SessionState {
                 rand::random(),
             )),
             // Deep paced (mixer-fed) vs shallow reorder-only.
-            PlayoutKind::Tracked => Some(PlayoutBuffer::tracked(
-                id,
-                clock_rate,
-                self.source_is_mixer_fed(id),
-            )),
+            PlayoutKind::Tracked => Some(
+                PlayoutBuffer::tracked(id, clock_rate, self.source_is_mixer_fed(id))
+                    .with_format(endpoint_audio_codec(ep).zip(endpoint_send_pt(ep))),
+            ),
         }
     }
 
@@ -2567,6 +2802,9 @@ impl SessionState {
                             .flatten(),
                         min_channel_capacity: include_diagnostics
                             .then(|| ep.raw_recv_min_channel_capacity())
+                            .flatten(),
+                        rejected_source_packets: include_diagnostics
+                            .then(|| ep.rejected_source_packets())
                             .flatten(),
                         channel_overflows: include_diagnostics
                             .then(|| ep.raw_recv_channel_overflows())
@@ -2684,6 +2922,7 @@ pub async fn run_media_session(
         tone_rtp_states: HashMap::new(),
         transcode_cache: HashMap::new(),
         url_sources: HashMap::new(),
+        reserved_transfers: HashSet::new(),
         fax_detectors: HashMap::new(),
         analysis_decoders: HashMap::new(),
         media_timeout_emitted: std::collections::HashSet::new(),
@@ -2763,7 +3002,7 @@ pub async fn run_media_session(
                     let (local, desc) = match state.endpoints.get(&routed.source_endpoint_id) {
                         Some(ep) => {
                             let local = endpoint_media_addrs(ep).0;
-                            (local, endpoint_stream_descriptor(ep, local, Some(pkt.source)))
+                            (local, if state.recording_mgr.is_recording() { endpoint_stream_descriptor(ep, local, Some(pkt.source)) } else { None })
                         }
                         None => (None, None),
                     };
@@ -2854,7 +3093,11 @@ pub async fn run_media_session(
                                 let local = endpoint_media_addrs(ep).0;
                                 (
                                     local,
-                                    endpoint_stream_descriptor(ep, local, Some(pkt.source)),
+                                    if state.recording_mgr.is_recording() {
+                                        endpoint_stream_descriptor(ep, local, Some(pkt.source))
+                                    } else {
+                                        None
+                                    },
                                 )
                             }
                             None => (None, None),
@@ -3077,6 +3320,7 @@ pub async fn run_media_session(
 
         for ep in state.endpoints.values_mut() {
             if let Endpoint::Rtp(rep) = ep {
+                rep.check_rekey_switchover();
                 match rep.maybe_send_rtcp(&state.metrics).await {
                     // `maybe_send_rtcp` already transmits on the wire; we no longer
                     // record what we send (outbound recording dropped). Inbound RTCP
@@ -3113,9 +3357,7 @@ pub async fn run_media_session(
 
     // Release URL file-cache references before clearing endpoints,
     // otherwise ref_count stays elevated and prevents cache eviction.
-    for (_eid, url) in state.url_sources.drain() {
-        state.file_cache.release(&url).await;
-    }
+    state.url_sources.clear();
 
     // Explicitly clean up shared playback subscribers before dropping endpoints,
     // so async ref_count decrement happens reliably.
@@ -3181,7 +3423,7 @@ fn handle_inbound_packet(
                 let is_rtcp =
                     pkt.is_rtcp || (rep.rtcp_mux && RtpEndpoint::is_rtcp_mux_packet(&pkt.data));
                 if is_rtcp {
-                    let (bye, decrypted_rtcp) = rep.handle_rtcp(&pkt.data);
+                    let (bye, decrypted_rtcp) = rep.handle_rtcp(&pkt.data, pkt.source);
                     let rtcp_for_recording = decrypted_rtcp.map(|d| (pkt.endpoint_id, d));
                     let bye_info = bye.map(|b| (pkt.endpoint_id, b));
                     return (None, rtcp_for_recording, bye_info);
@@ -3496,7 +3738,7 @@ async fn poll_and_route(
     recording_mgr: &mut RecordingManager,
     vad_monitors: &mut HashMap<EndpointId, VadMonitor>,
     fax_detectors: &mut HashMap<EndpointId, FaxDetector>,
-    analysis_decoders: &mut HashMap<EndpointId, Box<dyn crate::media::codec::AudioDecoder>>,
+    analysis_decoders: &mut HashMap<EndpointId, super::source_audio::SourceAudio>,
     metrics: &crate::metrics::Metrics,
     inbound_rtp: Vec<RoutedRtpPacket>,
     file_rtp_states: &mut HashMap<EndpointId, FileRtpState>,
@@ -3571,7 +3813,7 @@ async fn poll_and_route(
     let generated_start = packets_to_route.len();
 
     // Poll file endpoints for PCM output
-    super::file_poll::poll_file_endpoints(
+    let file_finished = super::file_poll::poll_file_endpoints(
         endpoints,
         file_rtp_states,
         event_tx,
@@ -3582,7 +3824,7 @@ async fn poll_and_route(
     );
 
     // Poll tone endpoints for synthesized audio
-    super::tone_poll::poll_tone_endpoints(
+    let tone_finished = super::tone_poll::poll_tone_endpoints(
         endpoints,
         tone_rtp_states,
         event_tx,
@@ -3630,7 +3872,8 @@ async fn poll_and_route(
         metrics,
         state_events,
         ice_state_events,
-    );
+    ) || file_finished
+        || tone_finished;
 
     // Process DTMF packets: detect events, forward without transcoding
     super::session_dtmf::process_dtmf_packets(
@@ -3648,56 +3891,111 @@ async fn poll_and_route(
     // (Inbound RTP/DTMF is recorded at arrival above — before the playout buffer —
     // so the PCAP keeps real arrival order/timing instead of the re-paced grid.)
 
-    // Analysis tap: decode each packet to PCM once and feed VAD + fax detectors.
-    audio_analysis::process_analysis(
-        &packets_to_route,
-        endpoints,
-        vad_monitors,
-        fax_detectors,
-        analysis_decoders,
-        event_tx,
-        dropped_events,
-        metrics,
-    );
-
     // Route audio packets to destinations (with transcoding/mixing as needed)
     for pkt in packets_to_route {
-        if let Some(dests) = routing.destinations(&pkt.source_endpoint_id) {
-            // Derive source codec from the endpoint's negotiated codec, not the
-            // packet PT — dynamic PTs (e.g. non-111 Opus) aren't in the static map.
-            let src_codec = endpoints
-                .get(&pkt.source_endpoint_id)
-                .and_then(endpoint_audio_codec);
-            let src_clock = src_codec.map(|c| c.rtp_clock_rate()).unwrap_or(8000);
-
-            // Pass 1: collect destination info (immutable borrow on endpoints)
-            let dest_info: Vec<(EndpointId, Option<AudioCodec>, Option<u8>, u32)> = dests
-                .iter()
-                .filter_map(|&did| {
-                    endpoints.get(&did).map(|ep| {
-                        (
-                            did,
-                            endpoint_audio_codec(ep),
-                            endpoint_send_pt(ep),
-                            endpoint_rtp_clock_rate(ep),
-                        )
-                    })
+        let src_codec = endpoints
+            .get(&pkt.source_endpoint_id)
+            .and_then(endpoint_audio_codec);
+        let src_clock = src_codec
+            .map(|codec| codec.rtp_clock_rate())
+            .unwrap_or(8000);
+        let dest_info: Vec<(EndpointId, Option<AudioCodec>, Option<u8>, u32)> = routing
+            .destinations(&pkt.source_endpoint_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|&id| {
+                endpoints.get(&id).map(|ep| {
+                    (
+                        id,
+                        endpoint_audio_codec(ep),
+                        endpoint_send_pt(ep),
+                        endpoint_rtp_clock_rate(ep),
+                    )
                 })
-                .collect();
-
+            })
+            .collect();
+        let want_vad = vad_monitors.contains_key(&pkt.source_endpoint_id);
+        let want_fax = fax_detectors.contains_key(&pkt.source_endpoint_id);
+        let needs_pcm =
+            want_vad || want_fax || dest_info.iter().any(|(id, codec, _, _)| {
+                mixers.contains_key(id)
+                    || matches!((src_codec, codec), (Some(source), Some(dest)) if source != *dest)
+            });
+        let mut frames = Vec::new();
+        if needs_pcm {
+            match audio_analysis::decode_packet_pcm(&pkt, src_codec, analysis_decoders) {
+                audio_analysis::AnalysisPcm::Pcm(pcm) => {
+                    metrics.audio_packets_decoded.inc();
+                    if want_vad {
+                        super::vad_tap::feed_vad(
+                            pkt.source_endpoint_id,
+                            &pcm,
+                            vad_monitors,
+                            event_tx,
+                            dropped_events,
+                            metrics,
+                        );
+                    }
+                    if want_fax {
+                        super::fax_tap::feed_fax(
+                            pkt.source_endpoint_id,
+                            &pcm,
+                            src_codec.map(|codec| codec.sample_rate()).unwrap_or(8000),
+                            fax_detectors,
+                            event_tx,
+                            dropped_events,
+                            metrics,
+                        );
+                    }
+                    let rates: Vec<u32> = dest_info
+                        .iter()
+                        .filter_map(|(_, codec, _, _)| codec.map(|codec| codec.sample_rate()))
+                        .collect();
+                    if let Some(decoder) = analysis_decoders.get_mut(&pkt.source_endpoint_id) {
+                        match decoder.frames(&pcm, &rates) {
+                            Ok(decoded) => frames = decoded,
+                            Err(_) => {
+                                metrics.transcode_errors.inc();
+                            }
+                        }
+                    }
+                }
+                audio_analysis::AnalysisPcm::DecoderInitFailed(error) => {
+                    for (wanted, name) in [(want_vad, "vad.error"), (want_fax, "fax.error")] {
+                        if wanted {
+                            emit_event(
+                                event_tx,
+                                name,
+                                serde_json::json!({ "endpoint_id": pkt.source_endpoint_id, "error": error }),
+                                dropped_events,
+                                metrics,
+                            );
+                        }
+                    }
+                    metrics.transcode_errors.inc();
+                }
+                audio_analysis::AnalysisPcm::Empty => {
+                    metrics.transcode_errors.inc();
+                }
+            }
+        }
+        {
             // Pass 2: route to each destination
             for (dest_id, dest_codec, dest_pt, dest_clock) in dest_info {
-                // Multi-source destinations: feed to mixer (decoded to PCM internally)
                 if let Some(mixer) = mixers.get_mut(&dest_id) {
-                    if let Some(sc) = src_codec
-                        && let Err(e) = mixer.feed(pkt.source_endpoint_id, sc, &pkt.payload)
-                    {
-                        debug!(
-                            src = %pkt.source_endpoint_id,
-                            dst = %dest_id,
-                            error = %e,
-                            "mixer feed error, dropping packet"
-                        );
+                    if let Some(codec) = dest_codec {
+                        for frame in &frames {
+                            if frame.marker {
+                                mixer.remove_source(&pkt.source_endpoint_id);
+                            }
+                            if let Some(pcm) = frame.rates.get(&codec.sample_rate())
+                                && mixer
+                                    .feed_pcm(pkt.source_endpoint_id, Arc::clone(pcm))
+                                    .is_err()
+                            {
+                                metrics.transcode_errors.inc();
+                            }
+                        }
                     }
                     continue;
                 }
@@ -3708,8 +4006,17 @@ async fn poll_and_route(
                     (Some(s), Some(d)) if s != d
                 );
 
-                let routed = if needs_transcode {
+                let routed_packets = if needs_transcode {
                     let cache_key = (pkt.source_endpoint_id, dest_id);
+                    // A source can change its negotiated payload type without
+                    // changing endpoint identity. Never reuse a stale codec epoch.
+                    if let (Some(source), Some(destination)) = (src_codec, dest_codec)
+                        && transcode_cache.get(&cache_key).is_some_and(|cached| {
+                            !cached.pipeline.matches_codecs(source, destination)
+                        })
+                    {
+                        transcode_cache.remove(&cache_key);
+                    }
                     let pipeline = if let Some(cached) = transcode_cache.get_mut(&cache_key) {
                         cached.last_used = Instant::now();
                         &mut cached.pipeline
@@ -3726,7 +4033,7 @@ async fn poll_and_route(
                                 continue;
                             }
                         };
-                        match TranscodePipeline::new(sc, dc) {
+                        match TranscodePipeline::for_pcm(sc, dc) {
                             Ok(p) => {
                                 // Evict oldest entry if cache is at capacity
                                 // O(n) LRU scan; acceptable for typical cache sizes (≤ 100 entries)
@@ -3762,60 +4069,63 @@ async fn poll_and_route(
                             }
                         }
                     };
-                    match pipeline.process(&pkt.payload) {
-                        Ok(data) => {
-                            let ts = if src_clock != dest_clock && src_clock > 0 {
-                                ((pkt.timestamp as u64 * dest_clock as u64) / src_clock as u64)
-                                    as u32
-                            } else {
-                                pkt.timestamp
+                    let mut packets = Vec::with_capacity(frames.len());
+                    if let Some(codec) = dest_codec {
+                        for frame in &frames {
+                            let Some(samples) = frame.rates.get(&codec.sample_rate()) else {
+                                continue;
                             };
-                            RoutedRtpPacket {
-                                source_endpoint_id: pkt.source_endpoint_id,
-                                payload_type: dest_pt.unwrap_or(pkt.payload_type),
-                                sequence_number: pkt.sequence_number,
-                                timestamp: ts,
-                                ssrc: pkt.ssrc,
-                                marker: pkt.marker,
-                                payload: data.to_vec(),
+                            let timestamp =
+                                pipeline.map_timestamp(frame.timestamp, src_clock, dest_clock);
+                            match pipeline.encode_pcm(samples) {
+                                Ok(data) => {
+                                    packets.push(RoutedRtpPacket {
+                                        source_endpoint_id: pkt.source_endpoint_id,
+                                        payload_type: dest_pt.unwrap_or(pkt.payload_type),
+                                        sequence_number: pkt.sequence_number,
+                                        timestamp,
+                                        ssrc: pkt.ssrc,
+                                        marker: frame.marker,
+                                        payload: data.to_vec(),
+                                    });
+                                }
+                                Err(_) => {
+                                    metrics.transcode_errors.inc();
+                                }
                             }
                         }
-                        Err(e) => {
-                            debug!(
-                                src = %pkt.source_endpoint_id,
-                                dst = %dest_id,
-                                error = %e,
-                                "transcode error, dropping packet"
-                            );
-                            metrics.transcode_errors.inc();
-                            continue;
-                        }
                     }
+                    packets
                 } else {
                     // Same codec or unknown — passthrough with PT remap
                     let mut p = pkt.clone();
                     if let Some(pt) = dest_pt {
                         p.payload_type = pt;
                     }
-                    p
+                    vec![p]
                 };
 
-                if let Some(dest_ep) = endpoints.get_mut(&dest_id) {
-                    let result: anyhow::Result<Option<Vec<u8>>> = match dest_ep {
-                        Endpoint::WebRtc(wep) => wep.write_rtp(&routed).map(|()| None),
-                        Endpoint::Rtp(rep) => rep.write_rtp(&routed, metrics).await,
-                        Endpoint::File(_) | Endpoint::Tone(_) => Ok(None),
-                        Endpoint::Bridge(bep) => bep.write_rtp(&routed).await.map(|()| None),
-                        Endpoint::WebSocket(wsep) => wsep.write_rtp(&routed),
-                    };
-                    match result {
-                        Err(e) => {
-                            warn!(src = %pkt.source_endpoint_id, dst = %dest_id, error = %e, "route error")
-                        }
-                        // The write_rtp above already sent to the peer; we no longer
-                        // record what we send (outbound recording dropped).
-                        Ok(_) => {
-                            metrics.packets_routed.inc();
+                for routed in routed_packets {
+                    if let Some(dest_ep) = endpoints.get_mut(&dest_id) {
+                        let result: anyhow::Result<Option<Vec<u8>>> = match dest_ep {
+                            Endpoint::WebRtc(wep) => wep.write_rtp(&routed).map(|()| None),
+                            Endpoint::Rtp(rep) => rep.write_rtp(&routed, metrics).await,
+                            Endpoint::File(_) | Endpoint::Tone(_) => Ok(None),
+                            Endpoint::Bridge(bep) => {
+                                let written = bep.write_rtp(&routed).await;
+                                written.map(|()| None)
+                            }
+                            Endpoint::WebSocket(wsep) => wsep.write_rtp(&routed),
+                        };
+                        match result {
+                            Err(e) => {
+                                warn!(src = %pkt.source_endpoint_id, dst = %dest_id, error = %e, "route error")
+                            }
+                            // The write_rtp above already sent to the peer; we no longer
+                            // record what we send (outbound recording dropped).
+                            Ok(_) => {
+                                metrics.packets_routed.inc();
+                            }
                         }
                     }
                 }
@@ -3835,6 +4145,10 @@ async fn poll_and_route(
         }
     }
 
+    if mix_grid.is_none() && mixers.values().any(|mixer| mixer.has_pending()) {
+        *mix_grid = Some(now + super::playout::FRAME);
+    }
+
     // Deliver mixed frames queued by feed() (flushed on frame boundaries) + grid flush_tick
     for (&dest_id, mixer) in mixers.iter_mut() {
         for routed in mixer.drain() {
@@ -3843,7 +4157,10 @@ async fn poll_and_route(
                     Endpoint::WebRtc(wep) => wep.write_rtp(&routed).map(|()| None),
                     Endpoint::Rtp(rep) => rep.write_rtp(&routed, metrics).await,
                     Endpoint::File(_) | Endpoint::Tone(_) => Ok(None),
-                    Endpoint::Bridge(bep) => bep.write_rtp(&routed).await.map(|()| None),
+                    Endpoint::Bridge(bep) => {
+                        let written = bep.write_rtp(&routed).await;
+                        written.map(|()| None)
+                    }
                     Endpoint::WebSocket(wsep) => wsep.write_rtp(&routed),
                 };
                 match result {

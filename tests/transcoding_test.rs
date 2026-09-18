@@ -331,6 +331,7 @@ async fn test_cross_codec_pcmu_to_g722() {
 
     // Activate both peers so symmetric RTP guard allows outbound packets
     peer_a.activate().await;
+    peer_b.activation_pt = 9;
     peer_b.activate().await;
     tokio::time::sleep(timing::scaled_ms(50)).await;
 
@@ -603,6 +604,7 @@ async fn test_g722_passthrough() {
 
     // Endpoint A: peer provides G.722 offer
     let mut peer_a = TestRtpPeer::new().await;
+    peer_a.activation_pt = 9;
     let offer_a = peer_a.make_g722_sdp_offer();
     let result = client
         .request_ok(
@@ -629,6 +631,7 @@ async fn test_g722_passthrough() {
     let ep_b_id = result["endpoint_id"].as_str().unwrap().to_string();
     let offer_b = result["sdp_offer"].as_str().unwrap();
     let server_addr_b = parse_rtp_addr_from_sdp(offer_b).expect("parse server addr B");
+    peer_b.activation_pt = 9;
     let answer_b = peer_b.make_g722_sdp_answer();
     client
         .request_ok(
@@ -821,6 +824,7 @@ async fn test_transcoding_pcmu_to_opus() {
     peer_b.set_remote(server_addr_b);
 
     // Activate peer B so symmetric RTP guard allows outbound packets
+    peer_b.activation_pt = 111;
     peer_b.activate().await;
     tokio::time::sleep(timing::scaled_ms(50)).await;
 

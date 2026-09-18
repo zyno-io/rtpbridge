@@ -10,6 +10,7 @@ pub struct Resampler {
     to_rate: u32,
     /// Fractional sample position accumulator for precise resampling
     frac_pos: f64,
+    previous: Option<i16>,
 }
 
 impl Resampler {
@@ -20,6 +21,7 @@ impl Resampler {
             from_rate,
             to_rate,
             frac_pos: 0.0,
+            previous: None,
         }
     }
 
@@ -47,25 +49,23 @@ impl Resampler {
         output.reserve(out_len);
 
         let mut pos = self.frac_pos;
-        let last_valid = (input.len() - 1) as f64;
-        while pos <= last_valid {
-            let idx = pos as usize;
-            let frac = pos - idx as f64;
-
-            let s0 = input[idx] as f64;
-            let s1 = if idx + 1 < input.len() {
-                input[idx + 1] as f64
+        // Causal linear interpolation, delayed by one input sample. Keeping the
+        // previous sample preserves continuity across packet boundaries and emits
+        // the full duration, including the final fractional positions of a block.
+        while pos + 1e-9 < input.len() as f64 {
+            let index = pos.floor() as usize;
+            let fraction = pos - index as f64;
+            let before = if index == 0 {
+                self.previous.unwrap_or(input[0])
             } else {
-                s0
+                input[index - 1]
             };
-            output.push((s0 + frac * (s1 - s0)) as i16);
-
+            let current = input[index];
+            output.push((before as f64 + fraction * (current as f64 - before as f64)) as i16);
             pos += ratio;
         }
-
-        // Save fractional position relative to the end of this buffer
-        // so the next call continues from the correct sub-sample offset.
-        self.frac_pos = pos - input.len() as f64;
+        self.frac_pos = (pos - input.len() as f64).max(0.0);
+        self.previous = input.last().copied();
     }
 }
 
@@ -222,8 +222,8 @@ mod tests {
         let output = run(&mut r, &[1000]);
         assert_eq!(
             output.len(),
-            1,
-            "single sample upsample should produce exactly 1 sample, got {}",
+            2,
+            "single sample upsample must preserve its duration, got {}",
             output.len()
         );
         assert_eq!(output[0], 1000, "single sample value should be preserved");

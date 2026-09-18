@@ -26,19 +26,23 @@ rtpbridge sits between VoIP endpoints, routing audio between them with support f
 ### Build
 
 ```bash
-# Requires Rust 1.94+ and libopus development headers
+# Requires Rust 1.94+, libopus headers, a C compiler, make, Perl and curl
+sh scripts/build-openssl.sh target/openssl
+export OPENSSL_DIR="$PWD/target/openssl" OPENSSL_STATIC=1
 cargo build --release
 ```
 
 ### Run
 
 ```bash
-# Default: WebSocket on 0.0.0.0:9100, media on 127.0.0.1
-./target/release/rtpbridge --listen 0.0.0.0:9100 --media-ip 203.0.113.5
+# Default: WebSocket on 127.0.0.1:9100, media on 127.0.0.1
+./target/release/rtpbridge --listen 127.0.0.1:9100 --media-ip 203.0.113.5
 
 # With config file
 ./target/release/rtpbridge --config rtpbridge.toml
 ```
+
+Non-loopback control listeners require TLS and HMAC configuration. A trusted TLS proxy may use `allow_plaintext_control = true` on its protected upstream; unauthenticated remote control requires the separate explicit development exception `allow_unauthenticated_control = true`. The HMAC key authorizes all sessions.
 
 ### Connect
 
@@ -59,7 +63,7 @@ websocat ws://localhost:9100
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--listen` | `0.0.0.0:9100` | WebSocket/HTTP control plane address(es), comma-separated |
+| `--listen` | `127.0.0.1:9100` | WebSocket/HTTP control plane address(es), comma-separated |
 | `--media-ip` | `127.0.0.1` | IP for all media sockets (RTP/WebRTC) |
 | `--config` | — | Path to TOML config file |
 | `--log-level` | `info` | Log level (trace/debug/info/warn/error) |
@@ -67,7 +71,7 @@ websocat ws://localhost:9100
 ### TOML Configuration
 
 ```toml
-listen = "0.0.0.0:9100"
+listen = "127.0.0.1:9100"
 media_ip = "203.0.113.5"            # or "203.0.113.5, 2001:db8::5" for dual-stack
 rtp_port_range = [30000, 39999]
 disconnect_timeout_secs = 30
@@ -98,6 +102,8 @@ for the exact configuration and wire format.
 ## Control Protocol
 
 All communication uses JSON over WebSocket. Each connection is bound to exactly one session.
+
+The control API is intended for backend clients. Without HMAC, privileged requests carrying a browser `Origin` are rejected, and loopback clients must use a loopback IP or `localhost` in `Host`. This protects local development listeners from cross-site requests and DNS rebinding. Browser audio uses the separate `/audio/<connect_token>` capability.
 
 ### Methods
 

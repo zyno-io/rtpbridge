@@ -25,13 +25,17 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
           cache-dependency-path: docs/package-lock.json
 
       - name: Install dependencies
         working-directory: docs
-        run: npm install
+        run: npm ci
+
+      - name: Audit documentation dependencies
+        working-directory: docs
+        run: npm audit
 
       - name: Build VitePress site
         working-directory: docs

@@ -258,11 +258,18 @@ impl TestServerBuilder {
                 max_recording_download_bytes: 512 * 1024 * 1024,
                 recording_channel_size: 1000,
                 log_level: "warn".to_string(),
+                ..Config::default()
             };
 
             let shutdown = ShutdownCoordinator::new();
             let metrics = Arc::new(Metrics::new());
-            let file_cache = Arc::new(FileCache::new(config.cache_dir.clone()).unwrap());
+            let file_cache = Arc::new(
+                FileCache::new(config.cache_dir.clone())
+                    .unwrap()
+                    .with_policy(
+                        rtpbridge::playback::download_policy::DownloadPolicy::loopback_only(),
+                    ),
+            );
             file_cache.start_cleanup_task(config.cache_cleanup_interval_secs, shutdown.clone());
 
             let manager = SessionManager::new(

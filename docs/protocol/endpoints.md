@@ -437,3 +437,9 @@ Endpoint state is reported in `endpoint.state_changed` events and session detail
 | Tone | `playing` → `finished` | Auto-finish after optional duration |
 | Bridge | `new` → `connected` | Virtual wiring endpoint for cross-session bridge |
 | WebSocket | `connecting` → `connected` → `disconnected` | Raw PCM audio socket endpoint; auto-removed if dial-in times out |
+
+## Plain RTP and SRTP negotiation validation
+
+Plain RTP/SRTP SDP must describe exactly one audio media section, a supported RTP transport profile, a reachable configured address family, and supported codecs. Mandatory secure profiles and any supplied crypto attribute require a supported suite with a valid 30-byte SDES key; invalid negotiation returns `ENDPOINT_ERROR` without committing the new endpoint or replacing established state. Existing secure endpoints cannot silently downgrade. The explicitly requested opportunistic offer mode can accept a plain answer declining encryption.
+
+Same-key renegotiation preserves SRTP and SRTCP replay windows and rollover counters. A peer restarting the same SSRC and packet index must negotiate a fresh key. Rekey retires the old receive keys after five seconds, including idle and RTCP-only transitions. New SSRCs use independent bounded receive state. Source changes must satisfy the [configured peer policy](../guide/configuration.md); source tuple validation for plain RTP does not provide cryptographic authentication.

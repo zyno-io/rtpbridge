@@ -1,5 +1,8 @@
 # Deployment
 
+The container and CI release builds statically link the checksum-verified OpenSSL 3.6.4 source built by `scripts/build-openssl.sh`. The binary logs its linked OpenSSL version at startup and rejects older vulnerable releases; system builds support patched 3.5.x (3.5.8+), 3.6.x (3.6.4+), and later release lines. Build-time native dependencies are covered by the [build instructions](./getting-started.md). Container package scanning does not replace reviewing embedded native-library advisories.
+
+
 ## Kubernetes
 
 rtpbridge is designed for k8s deployment with graceful shutdown support.
@@ -69,12 +72,12 @@ spec:
     - name: control-tls
       secret:
         secretName: rtpbridge-control-tls
-        optional: true
     - name: control-auth
       secret:
         secretName: rtpbridge-control-auth
-        optional: true
 ```
+
+The wildcard listener in this example requires a config with `auth_hmac_secret_file` and a `[tls]` certificate/key section, backed by the mounted secrets. Both secrets are required. For a TLS-terminating proxy, explicitly set `allow_plaintext_control = true`, retain HMAC, and restrict the upstream listener to that proxy. The default loopback listener is reachable only inside its network namespace; publishing a container port alone does not expose it.
 
 Resource requirements depend on workload — transcoding (especially Opus) is CPU-intensive. Monitor actual usage and adjust accordingly.
 
@@ -312,49 +315,10 @@ This means:
 
 ## Docker
 
-```dockerfile
-# Pin Rust version to match rust-version in Cargo.toml
-ARG BUILD_VERSION=canary-unknown
-FROM rust:1.94-trixie AS builder
-ARG BUILD_VERSION
-ENV BUILD_VERSION=${BUILD_VERSION}
+The repository Dockerfile builds the Rust binary with the checksum-verified static OpenSSL library, then copies it and libopus into a Distroless Debian 13 runtime. The final image runs as UID/GID `65532:65532`. Build from the repository root so the native build helper is included:
 
-RUN apt-get update && apt-get install -y --no-install-recommends libopus-dev && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
-COPY Cargo.toml Cargo.lock build.rs ./
-# Create stubs so Cargo.toml parses (benches/ excluded by .dockerignore)
-RUN mkdir -p src benches \
-    && echo 'fn main() {}' > src/main.rs \
-    && echo 'fn main() {}' > benches/codec_bench.rs \
-    && echo 'fn main() {}' > benches/srtp_bench.rs \
-    && echo 'fn main() {}' > benches/routing_bench.rs \
-    && echo 'fn main() {}' > benches/pcap_bench.rs \
-    && cargo build --release \
-    && rm -rf src
-
-COPY . .
-RUN touch src/main.rs && cargo build --release
-
-FROM debian:trixie-slim
-ARG BUILD_VERSION
-LABEL org.opencontainers.image.version="${BUILD_VERSION}"
-RUN apt-get update && apt-get install -y --no-install-recommends libopus0 libssl3t64 ca-certificates && rm -rf /var/lib/apt/lists/* \
-    && useradd -r -s /sbin/nologin rtpbridge \
-    && mkdir -p /var/lib/rtpbridge/recordings /var/lib/rtpbridge/media /var/lib/rtpbridge/cache \
-    && chown -R rtpbridge:rtpbridge /var/lib/rtpbridge
-COPY --from=builder /app/target/release/rtpbridge /usr/local/bin/rtpbridge
-EXPOSE 9100
-USER rtpbridge
-# Recommended: run with minimal capabilities in production
-# docker run --cap-drop=ALL --cap-add=NET_BIND_SERVICE --read-only rtpbridge
-# In Kubernetes:
-#   securityContext:
-#     readOnlyRootFilesystem: true
-#     capabilities:
-#       drop: [ALL]
-#       add: [NET_BIND_SERVICE]  # only if binding to ports < 1024
-ENTRYPOINT ["rtpbridge"]
+```bash
+docker build -t rtpbridge:local .
 ```
 
 Pass the same version into Docker that Cargo uses locally:
@@ -369,3 +333,7 @@ docker build --build-arg BUILD_VERSION="$BUILD_VERSION" -t rtpbridge:"$BUILD_VER
 ```
 
 For container health checks, use your orchestrator's native mechanism (e.g., Kubernetes `livenessProbe`) pointed at `GET /health` on the control port.
+
+### Runtime image and volume migration
+
+The runtime uses [Distroless Debian 13](https://github.com/GoogleContainerTools/distroless) with libopus, runs as UID/GID `65532:65532`, and contains no shell or package manager. Existing writable recording, media, and cache volumes must permit access by that UID/GID before upgrading; read-only configuration, HMAC, and TLS key mounts must be readable by it. Set the Kubernetes pod `securityContext.fsGroup` to `65532` where the volume driver supports it, or provision ownership on the host. Use a separate diagnostic container for shell access. CI scans the candidate image and generates its SBOM before publishing.

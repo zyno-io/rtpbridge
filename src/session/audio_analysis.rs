@@ -16,9 +16,10 @@ use tracing::warn;
 
 use super::endpoint::RoutedRtpPacket;
 use super::endpoint_enum::{Endpoint, endpoint_audio_codec};
+use super::source_audio::SourceAudio;
 use super::{fax_tap, vad_tap};
 use crate::control::protocol::*;
-use crate::media::codec::{AudioCodec, AudioDecoder};
+use crate::media::codec::AudioCodec;
 use crate::media::fax::FaxDetector;
 use crate::media::vad::VadMonitor;
 
@@ -42,18 +43,14 @@ pub enum AnalysisPcm {
 pub fn decode_packet_pcm(
     pkt: &RoutedRtpPacket,
     codec: Option<AudioCodec>,
-    decoders: &mut HashMap<EndpointId, Box<dyn AudioDecoder>>,
+    decoders: &mut HashMap<EndpointId, SourceAudio>,
 ) -> AnalysisPcm {
     match codec {
-        Some(AudioCodec::Pcmu) => {
-            let decoder = xlaw::PcmXLawDecoder::new_ulaw();
-            AnalysisPcm::Pcm(pkt.payload.iter().map(|&b| decoder.decode(b)).collect())
-        }
         Some(codec) => {
             use std::collections::hash_map::Entry;
             let dec = match decoders.entry(pkt.source_endpoint_id) {
                 Entry::Occupied(e) => e.into_mut(),
-                Entry::Vacant(e) => match crate::media::codec::make_decoder(codec) {
+                Entry::Vacant(e) => match SourceAudio::new(codec) {
                     Ok(d) => e.insert(d),
                     Err(err) => {
                         warn!(endpoint_id = %pkt.source_endpoint_id, %err, "analysis decoder creation failed");
@@ -61,9 +58,14 @@ pub fn decode_packet_pcm(
                     }
                 },
             };
-            let mut pcm = Vec::new();
-            match dec.decode(&pkt.payload, &mut pcm) {
-                Ok(()) => AnalysisPcm::Pcm(pcm),
+            if dec.codec() != codec {
+                match SourceAudio::new(codec) {
+                    Ok(next) => *dec = next,
+                    Err(error) => return AnalysisPcm::DecoderInitFailed(error.to_string()),
+                }
+            }
+            match dec.decode(pkt) {
+                Ok(pcm) => AnalysisPcm::Pcm(pcm),
                 Err(_) => AnalysisPcm::Empty,
             }
         }
@@ -75,12 +77,13 @@ pub fn decode_packet_pcm(
 /// analysers active on its source endpoint. A packet is decoded only when at
 /// least one analyser is active on that endpoint.
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn process_analysis(
     packets: &[RoutedRtpPacket],
     endpoints: &HashMap<EndpointId, Endpoint>,
     vad_monitors: &mut HashMap<EndpointId, VadMonitor>,
     fax_detectors: &mut HashMap<EndpointId, FaxDetector>,
-    decoders: &mut HashMap<EndpointId, Box<dyn AudioDecoder>>,
+    decoders: &mut HashMap<EndpointId, SourceAudio>,
     event_tx: &Option<mpsc::Sender<Event>>,
     dropped_events: &AtomicU64,
     metrics: &crate::metrics::Metrics,
@@ -243,22 +246,22 @@ mod tests {
     #[test]
     fn decode_pcmu_inline_no_cached_decoder() {
         let id = EndpointId::new_v4();
-        let mut decoders: HashMap<EndpointId, Box<dyn AudioDecoder>> = HashMap::new();
+        let mut decoders: HashMap<EndpointId, SourceAudio> = HashMap::new();
         let pkt = &pcmu_tone_packets(id, 2100.0, 1)[0];
         match decode_packet_pcm(pkt, Some(AudioCodec::Pcmu), &mut decoders) {
             AnalysisPcm::Pcm(pcm) => assert_eq!(pcm.len(), 160),
             _ => panic!("PCMU should decode to PCM"),
         }
         assert!(
-            decoders.is_empty(),
-            "PCMU should not allocate a cached decoder"
+            decoders.contains_key(&id),
+            "PCMU retains source framing state"
         );
     }
 
     #[test]
     fn decode_g722_creates_cached_decoder() {
         let id = EndpointId::new_v4();
-        let mut decoders: HashMap<EndpointId, Box<dyn AudioDecoder>> = HashMap::new();
+        let mut decoders: HashMap<EndpointId, SourceAudio> = HashMap::new();
         let pkt = RoutedRtpPacket {
             source_endpoint_id: id,
             payload_type: 9,
@@ -281,7 +284,7 @@ mod tests {
     #[test]
     fn decode_no_codec_is_empty() {
         let id = EndpointId::new_v4();
-        let mut decoders: HashMap<EndpointId, Box<dyn AudioDecoder>> = HashMap::new();
+        let mut decoders: HashMap<EndpointId, SourceAudio> = HashMap::new();
         let pkt = &pcmu_tone_packets(id, 2100.0, 1)[0];
         assert!(matches!(
             decode_packet_pcm(pkt, None, &mut decoders),
@@ -296,7 +299,7 @@ mod tests {
         endpoints.insert(id, ep);
         let mut vad = HashMap::new();
         let mut fax = HashMap::new();
-        let mut decoders: HashMap<EndpointId, Box<dyn AudioDecoder>> = HashMap::new();
+        let mut decoders: HashMap<EndpointId, SourceAudio> = HashMap::new();
         let event_tx: Option<mpsc::Sender<Event>> = None;
 
         process_analysis(
@@ -325,7 +328,7 @@ mod tests {
         vad.insert(id, VadMonitor::new(8000, 0.5, 1000));
         let mut fax = HashMap::new();
         fax.insert(id, FaxDetector::new(8000));
-        let mut decoders: HashMap<EndpointId, Box<dyn AudioDecoder>> = HashMap::new();
+        let mut decoders: HashMap<EndpointId, SourceAudio> = HashMap::new();
         let (tx, mut rx) = mpsc::channel::<Event>(64);
         let event_tx = Some(tx);
 
@@ -364,7 +367,7 @@ mod tests {
         let mut vad = HashMap::new();
         let mut fax = HashMap::new();
         fax.insert(id, FaxDetector::new(16000)); // G.722 audio rate
-        let mut decoders: HashMap<EndpointId, Box<dyn AudioDecoder>> = HashMap::new();
+        let mut decoders: HashMap<EndpointId, SourceAudio> = HashMap::new();
         let (tx, mut rx) = mpsc::channel::<Event>(64);
         let event_tx = Some(tx);
 
@@ -402,7 +405,7 @@ mod tests {
         let mut vad = HashMap::new();
         let mut fax = HashMap::new();
         fax.insert(id, FaxDetector::new(48000)); // Opus audio rate
-        let mut decoders: HashMap<EndpointId, Box<dyn AudioDecoder>> = HashMap::new();
+        let mut decoders: HashMap<EndpointId, SourceAudio> = HashMap::new();
         let (tx, mut rx) = mpsc::channel::<Event>(64);
         let event_tx = Some(tx);
 
@@ -436,7 +439,7 @@ mod tests {
         let mut vad = HashMap::new();
         vad.insert(EndpointId::new_v4(), VadMonitor::new(8000, 0.5, 1000));
         let mut fax = HashMap::new();
-        let mut decoders: HashMap<EndpointId, Box<dyn AudioDecoder>> = HashMap::new();
+        let mut decoders: HashMap<EndpointId, SourceAudio> = HashMap::new();
         let event_tx: Option<mpsc::Sender<Event>> = None;
         process_analysis(
             &[],

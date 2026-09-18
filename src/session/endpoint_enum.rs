@@ -449,6 +449,13 @@ impl Endpoint {
         }
     }
 
+    pub fn rejected_source_packets(&self) -> Option<u64> {
+        match self {
+            Endpoint::Rtp(endpoint) => Some(endpoint.raw_recv.source_rejections()),
+            _ => None,
+        }
+    }
+
     pub fn raw_recv_channel_overflows(&self) -> Option<u64> {
         match self {
             Endpoint::WebRtc(ep) => Some(ep.raw_recv.channel_overflows()),

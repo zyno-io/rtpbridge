@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicU64;
@@ -869,11 +869,20 @@ async fn handle_dtmf_set_sensitive(
 
 /// Validate a recording file path: must be within the configured recording_dir.
 ///
-/// Returns the resolved (canonicalized) path to use for file creation. This
-/// eliminates the TOCTOU race between validation and file creation — the
-/// caller uses the resolved path directly, so a symlink swap after this
-/// check cannot redirect the file outside recording_dir.
-fn validate_recording_path(file_path: &str, recording_dir: &Path) -> Result<String, String> {
+#[derive(Debug)]
+struct ValidatedRecordingPath {
+    base: PathBuf,
+    relative: PathBuf,
+    resolved: PathBuf,
+}
+
+/// Returns the canonical base, relative path, and display path used for file
+/// creation. Creation walks `relative` from a handle for `base`, rejecting
+/// symlinks at every component so validation and creation cannot be raced.
+fn validate_recording_path(
+    file_path: &str,
+    recording_dir: &Path,
+) -> Result<ValidatedRecordingPath, String> {
     let path = Path::new(file_path);
 
     if !path.is_absolute() {
@@ -921,10 +930,15 @@ fn validate_recording_path(file_path: &str, recording_dir: &Path) -> Result<Stri
         ));
     }
 
-    resolved_path
-        .to_str()
-        .ok_or_else(|| "resolved path is not valid UTF-8".to_string())
-        .map(|s| s.to_string())
+    let relative = resolved_path
+        .strip_prefix(&canonical_dir)
+        .map_err(|_| "recording path is not beneath recording_dir".to_string())?
+        .to_path_buf();
+    Ok(ValidatedRecordingPath {
+        base: canonical_dir,
+        relative,
+        resolved: resolved_path,
+    })
 }
 
 async fn handle_recording_start(
@@ -943,10 +957,7 @@ async fn handle_recording_start(
         Err(e) => return Response::err(id, "INVALID_PARAMS", e.to_string()),
     };
 
-    // Validate the recording path and get the resolved (canonicalized) path.
-    // Using the resolved path for file creation eliminates the TOCTOU race
-    // between this check and the actual File::create_new in the session task.
-    let resolved_path = match validate_recording_path(&params.file_path, manager.recording_dir()) {
+    let validated = match validate_recording_path(&params.file_path, manager.recording_dir()) {
         Ok(p) => p,
         Err(msg) => return Response::err(id, "INVALID_PARAMS", msg),
     };
@@ -957,7 +968,9 @@ async fn handle_recording_start(
         SessionCommand::RecordingStart {
             reply: reply_tx,
             endpoint_id: params.endpoint_id,
-            file_path: resolved_path,
+            recording_base: validated.base,
+            recording_relative: validated.relative,
+            file_path: validated.resolved,
         },
         reply_rx,
         &id,
@@ -1701,60 +1714,17 @@ async fn handle_endpoint_transfer(
         None => return Response::err(id, "SESSION_NOT_FOUND", "Target session not found"),
     };
 
-    // Extract from source
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    let bundle = match send_and_recv(
-        &source_cmd_tx,
-        SessionCommand::ExtractEndpoint {
-            reply: reply_tx,
-            endpoint_id: params.endpoint_id,
-        },
-        reply_rx,
-        &id,
-    )
-    .await
-    {
-        Ok(Ok(bundle)) => bundle,
-        Ok(Err(e)) => return Response::err(id, "ENDPOINT_ERROR", e.to_string()),
-        Err(resp) => return resp,
-    };
-
-    // Insert into target
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    match send_and_recv(
-        &target_cmd_tx,
-        SessionCommand::InsertEndpoint {
-            reply: reply_tx,
-            bundle: Box::new(bundle),
-        },
-        reply_rx,
-        &id,
-    )
-    .await
-    {
-        Ok(Ok(())) => Response::ok(
+    let result =
+        crate::session::transfer::transfer(source_cmd_tx, target_cmd_tx, params.endpoint_id).await;
+    match result {
+        Ok(()) => Response::ok(
             id,
             EndpointTransferResult {
                 endpoint_id: params.endpoint_id,
                 target_session_id: params.target_session_id,
             },
         ),
-        Ok(Err((e, bundle))) => {
-            // Rollback: re-insert into source
-            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-            let _ = send_and_recv(
-                &source_cmd_tx,
-                SessionCommand::InsertEndpoint {
-                    reply: reply_tx,
-                    bundle: Box::new(bundle),
-                },
-                reply_rx,
-                &id,
-            )
-            .await;
-            Response::err(id, "TRANSFER_FAILED", e.to_string())
-        }
-        Err(resp) => resp,
+        Err(error) => Response::err(id, "TRANSFER_FAILED", error.to_string()),
     }
 }
 
@@ -2025,10 +1995,8 @@ mod tests {
 
     #[test]
     fn test_validate_recording_path_returns_resolved_path() {
-        // The returned path must be the canonicalized version, not the
-        // user-supplied string. This closes the TOCTOU race: the caller
-        // uses the resolved path for File::create_new, so a symlink swap
-        // after validation cannot redirect the file outside recording_dir.
+        // The display path is canonicalized while creation uses the returned
+        // base and relative path for its no-follow directory-handle walk.
         let rec_dir = setup_rec_dir();
         let sub = rec_dir.join("resolved_sub");
         std::fs::create_dir_all(&sub).unwrap();
@@ -2040,19 +2008,14 @@ mod tests {
         // no relative components). On macOS /tmp → /private/tmp, so
         // the resolved path may differ from the input.
         let expected = sub.canonicalize().unwrap().join("test.pcap");
-        assert_eq!(
-            resolved,
-            expected.to_str().unwrap(),
-            "returned path must be the canonicalized version"
-        );
+        assert_eq!(resolved.resolved, expected);
     }
 
     #[test]
     fn test_validate_recording_path_symlink_resolved_before_return() {
         // Create a symlink inside rec_dir that points to a subdir also
-        // inside rec_dir. The returned path should follow the symlink
-        // and return the canonical target — proving that the path used
-        // for file creation won't follow a *later* symlink swap.
+        // inside rec_dir. Validation resolves it to a relative path beneath
+        // the canonical base before the no-follow creation walk begins.
         let rec_dir = setup_rec_dir();
         let real_sub = rec_dir.join("real_target");
         std::fs::create_dir_all(&real_sub).unwrap();
@@ -2066,11 +2029,7 @@ mod tests {
         // The resolved path should point through real_target, not through
         // the symlink — confirming the symlink was resolved at validation time.
         let canonical_target = real_sub.canonicalize().unwrap().join("file.pcap");
-        assert_eq!(
-            resolved,
-            canonical_target.to_str().unwrap(),
-            "symlink should be resolved at validation time, not deferred to file creation"
-        );
+        assert_eq!(resolved.resolved, canonical_target);
 
         std::fs::remove_file(&link).ok();
         std::fs::remove_dir_all(&real_sub).ok();

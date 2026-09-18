@@ -3,6 +3,7 @@
 ## Prerequisites
 
 - Rust 1.94+ with Cargo
+- A C compiler, make, Perl, curl and shasum for the pinned OpenSSL build
 - libopus-dev (Debian/Ubuntu), libopus-devel (Fedora), or opus (macOS Homebrew) — required for Opus codec support
 - A WebSocket client for testing (e.g., [websocat](https://github.com/vi/websocat))
 
@@ -11,13 +12,17 @@
 ```bash
 git clone https://github.com/zyno-io/rtpbridge.git
 cd rtpbridge
+sh scripts/build-openssl.sh target/openssl
+export OPENSSL_DIR="$PWD/target/openssl" OPENSSL_STATIC=1
 cargo build --release
 ```
+
+The helper verifies and builds OpenSSL 3.6.4; CI and the container use the same source checksum. Keep these environment variables set for subsequent Cargo commands. A system OpenSSL 3.5.8+, 3.6.4+, or a later release line can also be used without the helper. Startup checks the linked version to reject releases missing the [August 2026 DTLS security fix](https://openssl-library.org/news/secadv/20260825.txt). The previous automatic vendored build has been removed because its compatible Rust package still embeds 3.6.3.
 
 ## Run
 
 ```bash
-# Default: WS on 0.0.0.0:9100, media on 127.0.0.1
+# Default: WS on 127.0.0.1:9100, media on 127.0.0.1
 ./target/release/rtpbridge
 
 # With specific media IP

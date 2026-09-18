@@ -20,6 +20,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use crate::control::protocol::EndpointId;
+use crate::media::codec::AudioCodec;
 
 use super::endpoint::RoutedRtpPacket;
 
@@ -126,6 +127,7 @@ impl PlayoutBuffer {
         PlayoutBuffer::Tracked(TrackedClock {
             source_id,
             clock_rate: clock_rate.max(1),
+            format: None,
             ssrc: None,
             roc: 0,
             max_seq: 0,
@@ -159,6 +161,20 @@ impl PlayoutBuffer {
         }
     }
 
+    pub fn with_format(mut self, format: Option<(AudioCodec, u8)>) -> Self {
+        if let Self::Tracked(clock) = &mut self {
+            clock.format = format;
+        }
+        self
+    }
+
+    pub fn matches_format(&self, rate: u32, format: Option<(AudioCodec, u8)>) -> bool {
+        match self {
+            Self::Synth(clock) => clock.ts_step * 50 == rate,
+            Self::Tracked(clock) => clock.clock_rate == rate && clock.format == format,
+        }
+    }
+
     /// Enqueue an arrived audio frame (telephone-event already split off upstream).
     pub fn push(&mut self, pkt: RoutedRtpPacket, arrival: Instant) {
         match self {
@@ -167,7 +183,8 @@ impl PlayoutBuffer {
         }
     }
 
-    /// At a grid tick, emit at most one 20 ms frame (None = not due / underflow / idle).
+    /// Emit one due packet/frame. Tracked sources can be drained repeatedly on
+    /// a grid tick to preserve sub-20-ms packetization; Synth emits one frame.
     pub fn drain_tick(&mut self, grid_now: Instant) -> Option<RoutedRtpPacket> {
         match self {
             PlayoutBuffer::Synth(s) => s.drain_tick(),
@@ -183,12 +200,11 @@ impl PlayoutBuffer {
         }
     }
 
-    /// Whether the buffer may release more than one frame per grid tick. True only for the
-    /// reorder-only (non-mixer) Tracked mode, which forwards bursts in order without pacing —
-    /// the downstream endpoint does the playout. Synth and mixer-fed Tracked stay one-per-tick
-    /// (the latter to keep a mixer's sources frame-aligned).
+    /// Tracked buffers drain every packet due at this tick, including multiple
+    /// short packets needed to assemble 20 ms of PCM. The mixer then consumes one
+    /// PCM frame per source per tick. Synth buffers produce one frame per tick.
     pub fn drains_burst(&self) -> bool {
-        matches!(self, PlayoutBuffer::Tracked(t) if !t.mixer_fed)
+        matches!(self, PlayoutBuffer::Tracked(_))
     }
 
     /// Whether this is a mixer-fed (paced) Tracked buffer. Used to detect a shallow↔deep mode
@@ -351,6 +367,7 @@ impl SynthClock {
 /// late packets. Resets on SSRC change. Output preserves the source's seq/ts/ssrc/pt so a
 /// transparent WebRTC egress still forwards real values.
 pub struct TrackedClock {
+    format: Option<(AudioCodec, u8)>,
     source_id: EndpointId,
     clock_rate: u32,
     ssrc: Option<u32>,
@@ -859,7 +876,7 @@ mod tests {
     #[test]
     fn paced_releases_by_timestamp_one_per_tick() {
         let mut b = PlayoutBuffer::tracked(Uuid::new_v4(), 8000, true);
-        assert!(!b.drains_burst());
+        assert!(b.drains_burst(), "all packets due at this tick may drain");
         let t0 = Instant::now();
         b.push(rtp(0, 0, 42), t0);
         b.push(rtp(1, 160, 42), t0);

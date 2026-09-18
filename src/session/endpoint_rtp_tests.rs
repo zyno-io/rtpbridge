@@ -673,6 +673,8 @@ async fn test_offerer_latches_public_source_after_long_ring() {
         .unwrap();
     let pair = pool.allocate_pair().await.unwrap();
     let mut ep = RtpEndpoint::new(EndpointId::new_v4(), EndpointDirection::SendRecv, pair);
+    ep.source_networks = vec!["203.0.113.0/24".parse().unwrap()].into();
+    ep.codecs = vec![sdp::CODEC_PCMU, sdp::CODEC_TELEPHONE_EVENT];
 
     // Long ring before the answer.
     ep.created_at = Instant::now() - Duration::from_secs(ep.addr_learn_window_secs + 10);
@@ -708,6 +710,8 @@ async fn test_first_packet_latches_even_after_window_elapsed() {
         .unwrap();
     let pair = pool.allocate_pair().await.unwrap();
     let mut ep = RtpEndpoint::new(EndpointId::new_v4(), EndpointDirection::SendRecv, pair);
+    ep.source_networks = vec!["203.0.113.0/24".parse().unwrap()].into();
+    ep.codecs = vec![sdp::CODEC_PCMU, sdp::CODEC_TELEPHONE_EVENT];
 
     ep.accept_answer(&make_sdp_with_mux(30000, false)).unwrap();
 
@@ -725,8 +729,8 @@ async fn test_first_packet_latches_even_after_window_elapsed() {
     );
     assert_eq!(
         ep.remote_rtcp_addr.unwrap(),
-        SocketAddr::new(public_src.ip(), public_src.port() + 1),
-        "non-mux: RTCP address is the latched RTP source port + 1"
+        "10.0.0.1:30001".parse::<SocketAddr>().unwrap(),
+        "non-mux: keep SDP RTCP destination until its own source is learned"
     );
 }
 
@@ -741,6 +745,8 @@ async fn test_reanswer_reopens_window_to_relatch_established_leg() {
         .unwrap();
     let pair = pool.allocate_pair().await.unwrap();
     let mut ep = RtpEndpoint::new(EndpointId::new_v4(), EndpointDirection::SendRecv, pair);
+    ep.source_networks = vec!["203.0.113.0/24".parse().unwrap()].into();
+    ep.codecs = vec![sdp::CODEC_PCMU, sdp::CODEC_TELEPHONE_EVENT];
 
     // Established leg, already latched to the public source.
     ep.accept_answer(&make_sdp_with_mux(30000, true)).unwrap();
@@ -1531,7 +1537,8 @@ async fn test_rtcp_receiver_report_only_applies_to_current_outbound_ssrc() {
         0, 0, 0, 0, // DLSR
     ]);
 
-    ep.handle_rtcp(&report);
+    ep.remote_rtcp_addr = Some("10.0.0.1:30000".parse().unwrap());
+    ep.handle_rtcp(&report, "10.0.0.1:30000".parse().unwrap());
     let accepted = ep
         .rtcp_stats
         .remote_receiver_report()
@@ -1545,7 +1552,7 @@ async fn test_rtcp_receiver_report_only_applies_to_current_outbound_ssrc() {
         "an SSRC rotation must re-baseline remote receiver-report counters"
     );
 
-    ep.handle_rtcp(&report);
+    ep.handle_rtcp(&report, "10.0.0.1:30000".parse().unwrap());
     assert!(
         ep.rtcp_stats.remote_receiver_report().is_none(),
         "a delayed report for the retired SSRC must not contaminate the new stream"
@@ -1621,4 +1628,217 @@ async fn handle_rtp_rejects_junk_without_counting_media() {
         ep.stats.inbound_packets, before,
         "media counter only counts validated RTP"
     );
+}
+
+#[tokio::test]
+async fn security_regression_same_key_preserves_replay_and_rollover() {
+    let mut ep = mk_ts_endpoint(54000, 54100).await;
+    let key = base64_encode(&[7; 30]);
+    let offer = make_savp_sdp(30000, &key);
+    ep.update_remote_sdp(&offer).unwrap();
+    let mut tx = SrtpContext::from_sdes_key(&key).unwrap();
+    let mut rtcp_tx = SrtcpContext::from_sdes_key(&key).unwrap();
+    let source = "10.0.0.1:30000".parse().unwrap();
+    let first = tx
+        .protect(&RtpHeader::build(0, 65535, 0, 42, false, &[0xff; 160]))
+        .unwrap();
+    assert!(ep.handle_rtp(&first, source).is_some());
+    let rolled = tx
+        .protect(&RtpHeader::build(0, 0, 160, 42, false, &[0xff; 160]))
+        .unwrap();
+    assert!(ep.handle_rtp(&rolled, source).is_some());
+    let rr = [0x80, 201, 0, 1, 0, 0, 0, 42];
+    let old_rtcp = rtcp_tx.protect_rtcp(&rr).unwrap();
+    assert!(
+        ep.handle_rtcp(&old_rtcp, "10.0.0.1:30000".parse().unwrap())
+            .1
+            .is_some()
+    );
+    ep.update_remote_sdp(&offer).unwrap();
+    assert!(ep.handle_rtp(&first, source).is_none());
+    assert!(ep.handle_rtp(&rolled, source).is_none());
+    assert!(
+        ep.handle_rtcp(&old_rtcp, "10.0.0.1:30000".parse().unwrap())
+            .1
+            .is_none()
+    );
+    let next = tx
+        .protect(&RtpHeader::build(0, 1, 320, 42, false, &[0xff; 160]))
+        .unwrap();
+    assert!(ep.handle_rtp(&next, source).is_some());
+    let fresh = tx
+        .protect(&RtpHeader::build(0, 1, 320, 43, false, &[0xff; 160]))
+        .unwrap();
+    assert!(ep.handle_rtp(&fresh, source).is_some());
+}
+
+#[tokio::test]
+async fn security_regression_rekey_retires_old_rtcp_without_new_rtcp() {
+    for new_rtp in [false, true] {
+        let mut ep = mk_ts_endpoint(54000, 54100).await;
+        let old = base64_encode(&[8; 30]);
+        let new = base64_encode(&[9; 30]);
+        ep.update_remote_sdp(&make_savp_sdp(30000, &old)).unwrap();
+        ep.update_remote_sdp(&make_savp_sdp(30000, &new)).unwrap();
+        if new_rtp {
+            let mut tx = SrtpContext::from_sdes_key(&new).unwrap();
+            let packet = tx
+                .protect(&RtpHeader::build(0, 1, 0, 42, false, &[0xff; 160]))
+                .unwrap();
+            assert!(
+                ep.handle_rtp(&packet, "10.0.0.1:30000".parse().unwrap())
+                    .is_some()
+            );
+            assert!(ep.rekey_switchover.is_some());
+        }
+        ep.rekey_switchover = Some(Instant::now() - Duration::from_secs(1));
+        let rr = [0x80, 201, 0, 1, 0, 0, 0, 42];
+        let mut old_tx = SrtcpContext::from_sdes_key(&old).unwrap();
+        assert!(
+            ep.handle_rtcp(
+                &old_tx.protect_rtcp(&rr).unwrap(),
+                "10.0.0.1:30000".parse().unwrap()
+            )
+            .1
+            .is_none()
+        );
+        let mut new_tx = SrtcpContext::from_sdes_key(&new).unwrap();
+        assert!(
+            ep.handle_rtcp(
+                &new_tx.protect_rtcp(&rr).unwrap(),
+                "10.0.0.1:30000".parse().unwrap()
+            )
+            .1
+            .is_some()
+        );
+    }
+}
+
+#[tokio::test]
+async fn security_regression_invalid_secure_sdp_is_transactional() {
+    let mut ep = mk_ts_endpoint(54000, 54100).await;
+    let key = base64_encode(&[10; 30]);
+    let valid = make_savp_sdp(30000, &key);
+    ep.update_remote_sdp(&valid).unwrap();
+    let previous_addr = ep.remote_rtp_addr;
+    for invalid in [
+        make_savp_sdp(40000, "broken"),
+        make_savp_sdp(40000, &key).replace("AES_CM_128_HMAC_SHA1_80", "UNSUPPORTED"),
+        make_savp_sdp(40000, &key)
+            .lines()
+            .filter(|line| !line.starts_with("a=crypto:"))
+            .collect::<Vec<_>>()
+            .join("\r\n"),
+        make_sdp_with_mux(40000, true),
+    ] {
+        assert!(ep.update_remote_sdp(&invalid).is_err());
+        assert_eq!(ep.remote_rtp_addr, previous_addr);
+        assert_eq!(ep.srtp_rx_key_b64.as_deref(), Some(key.as_str()));
+        if invalid.contains("RTP/SAVP") {
+            assert!(sdp::parse_sdp(&invalid).validate_plain_transport().is_err());
+        }
+    }
+}
+
+#[tokio::test]
+async fn security_regression_foreign_rtp_and_rtcp_cannot_mutate_a_call() {
+    let mut ep = mk_ts_endpoint(54000, 54100).await;
+    ep.update_remote_sdp(&make_sdp_with_mux(30000, true))
+        .unwrap();
+    let expected = ep.remote_rtp_addr.unwrap();
+    let allowed = SocketAddr::new(expected.ip(), 31000);
+    let foreign = SocketAddr::new(expected.ip(), 32000);
+    let packet = RtpHeader::build(0, 1, 0, 42, false, &[0xff; 160]);
+    assert!(
+        ep.handle_rtp(&packet, "192.0.2.99:31000".parse().unwrap())
+            .is_none()
+    );
+    assert!(ep.handle_rtp(&packet, allowed).is_some());
+    assert!(ep.addr_locked);
+    let bad = RtpHeader::build(0, 2, 160, 99, false, &[0xff; 160]);
+    assert!(ep.handle_rtp(&bad, foreign).is_none());
+    assert_eq!(ep.remote_ssrc, Some(42));
+    assert_eq!(ep.remote_rtp_addr, Some(allowed));
+    let bye = [0x81, 203, 0, 1, 0, 0, 0, 42];
+    assert!(ep.handle_rtcp(&bye, foreign).1.is_none());
+    assert!(ep.handle_rtcp(&bye, allowed).0.is_some());
+    let mut invalid = packet.clone();
+    invalid[0] |= 0x20;
+    *invalid.last_mut().unwrap() = 0;
+    assert!(ep.handle_rtp(&invalid, allowed).is_none());
+    let unknown_pt = RtpHeader::build(88, 3, 320, 99, false, &[0; 160]);
+    assert!(ep.handle_rtp(&unknown_pt, allowed).is_none());
+}
+
+#[tokio::test]
+async fn security_regression_separate_rtcp_learns_an_independent_nat_port() {
+    let mut ep = mk_ts_endpoint(54000, 54100).await;
+    let offer = make_sdp_with_mux(30000, false) + "a=rtcp:30009\r\n";
+    ep.update_remote_sdp(&offer).unwrap();
+    assert_eq!(ep.remote_rtcp_addr.unwrap().port(), 30009);
+    let ip = ep.remote_rtp_addr.unwrap().ip();
+    let rr = [0x80, 201, 0, 1, 0, 0, 0, 42];
+    let malformed = [&rr[..], &[0x80, 201, 0, 1][..]].concat();
+    let rtcp = SocketAddr::new(ip, 41000);
+    assert!(ep.handle_rtcp(&malformed, rtcp).1.is_none());
+    assert_eq!(ep.remote_rtcp_addr.unwrap().port(), 30009);
+    assert!(ep.handle_rtcp(&rr, rtcp).1.is_some());
+    let packet = RtpHeader::build(0, 1, 0, 42, false, &[0xff; 160]);
+    assert!(ep.handle_rtp(&packet, SocketAddr::new(ip, 40000)).is_some());
+    assert_eq!(ep.remote_rtcp_addr, Some(rtcp));
+    assert!(ep.handle_rtcp(&rr, SocketAddr::new(ip, 41001)).1.is_none());
+}
+
+#[tokio::test]
+async fn transfer_cancels_receive_tasks_with_a_full_packet_queue() {
+    let mut ep = mk_ts_endpoint(54000, 54100).await;
+    let (sender, mut receiver) = mpsc::channel(1);
+    ep.start_recv_tasks(sender);
+    let bound = UdpSocket::bind("127.0.0.1:0").await;
+    let socket = bound.unwrap();
+    let data = RtpHeader::build(0, 1, 0, 42, false, &[0xff; 160]);
+    for _ in 0..8 {
+        let sent = socket.send_to(&data, ep.local_rtp_addr).await;
+        sent.unwrap();
+    }
+    let observed = tokio::time::timeout(Duration::from_secs(1), async {
+        while ep.raw_recv.channel_overflows() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(observed.is_ok());
+    let stopped = tokio::time::timeout(Duration::from_millis(250), ep.stop_recv_tasks()).await;
+    assert!(stopped.is_ok());
+    assert!(receiver.try_recv().is_ok());
+}
+
+#[tokio::test]
+async fn double_check_osrtp_cannot_downgrade_after_a_secure_answer() {
+    let pool = crate::net::socket_pool::SocketPool::new("127.0.0.1".parse().unwrap(), 55300, 55400)
+        .unwrap();
+    let allocated = pool.allocate_pair().await;
+    let (mut endpoint, _) = RtpEndpoint::create_offer(
+        EndpointId::new_v4(),
+        EndpointDirection::SendRecv,
+        allocated.unwrap(),
+        "127.0.0.1".parse().unwrap(),
+        &[crate::media::sdp::CODEC_PCMU],
+        RtpMediaSecurity::OptionalSrtp,
+        tokio::sync::mpsc::channel(1).0,
+    )
+    .unwrap();
+    let key = base64_encode(&[9; 30]);
+    let secure = make_savp_sdp(20000, &key);
+    endpoint.accept_answer(&secure).unwrap();
+    let transmit_key = endpoint.srtp_tx_key_b64.clone();
+    let plain = make_sdp_with_mux(30000, true);
+    assert!(
+        endpoint.accept_answer(&plain).is_err(),
+        "opportunistic plaintext fallback is only valid before SRTP is established"
+    );
+    assert_eq!(endpoint.srtp_tx_key_b64, transmit_key);
+    assert_eq!(endpoint.remote_rtp_addr.unwrap().port(), 20000);
+    assert!(endpoint.srtp_tx.is_some() && endpoint.srtp_rx.is_some());
+    assert!(endpoint.srtcp_tx.is_some() && endpoint.srtcp_rx.is_some());
 }

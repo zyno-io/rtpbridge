@@ -6,3 +6,5 @@ pub mod protocol;
 pub mod server;
 pub mod transport;
 pub mod ws_audio;
+
+pub(crate) mod ws_io;

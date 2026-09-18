@@ -8,3 +8,5 @@ pub mod sdp;
 pub mod srtp;
 pub mod transcode;
 pub mod vad;
+
+pub mod pcm_frames;

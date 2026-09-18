@@ -1,5 +1,5 @@
 use crate::media::codec::AudioCodec;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 /// Codec info for SDP generation
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,6 +133,8 @@ pub fn offer_codec_list(prefer: Option<&[String]>) -> Vec<SdpCodec> {
 #[derive(Debug, Clone)]
 pub struct ParsedSdp {
     pub remote_addr: Option<SocketAddr>,
+    pub remote_rtcp_addr: Option<SocketAddr>,
+    pub invalid_rtcp: bool,
     pub codecs: Vec<SdpCodec>,
     pub telephone_event_pt: Option<u8>,
     /// Negotiated telephone-event rtpmap clock (RFC 4733). `None` if no
@@ -141,6 +143,10 @@ pub struct ParsedSdp {
     /// expressed in this clock, not the audio codec's.
     pub telephone_event_clock_rate: Option<u32>,
     pub crypto: Option<SdpCrypto>,
+    /// Crypto was advertised, including unsupported/malformed attributes.
+    pub crypto_present: bool,
+    /// Multiple active audio sections cannot be represented by this endpoint.
+    pub audio_sections: usize,
     pub is_webrtc: bool,
     pub direction: Option<String>,
     pub rtcp_mux: bool,
@@ -149,6 +155,39 @@ pub struct ParsedSdp {
     /// True if this is OSRTP: RTP/AVP profile with a=crypto present (RFC 8643)
     /// The endpoint should use SRTP if crypto is available, but the profile is "plain"
     pub is_osrtp: bool,
+}
+
+impl ParsedSdp {
+    /// Validate before allocating an endpoint or mutating a live negotiation.
+    pub fn validate_plain_transport(&self) -> anyhow::Result<()> {
+        if self.audio_sections != 1 {
+            anyhow::bail!("SDP must contain exactly one active audio section");
+        }
+        let secure = match self.media_protocol.as_deref() {
+            Some("RTP/AVP" | "RTP/AVPF") => false,
+            Some("RTP/SAVP" | "RTP/SAVPF") => true,
+            _ => anyhow::bail!("unsupported plain RTP transport profile"),
+        };
+        if (secure || self.crypto_present) && self.crypto.is_none() {
+            anyhow::bail!("SDP media security requires a supported valid SDES crypto attribute");
+        }
+        if let Some(crypto) = &self.crypto {
+            crate::media::srtp::SrtpContext::from_sdes_key(&crypto.key_b64)
+                .map_err(|_| anyhow::anyhow!("SDP media security has invalid key material"))?;
+        }
+        if self.invalid_rtcp {
+            anyhow::bail!("invalid SDP RTCP destination");
+        }
+        if self.remote_addr.is_none() {
+            anyhow::bail!("SDP has no connection address");
+        }
+        if let (Some(rtp), Some(rtcp)) = (self.remote_addr, self.remote_rtcp_addr)
+            && rtp.is_ipv6() != rtcp.is_ipv6()
+        {
+            anyhow::bail!("RTCP address family must match RTP");
+        }
+        Ok(())
+    }
 }
 
 /// SRTP SDES crypto attribute
@@ -163,10 +202,14 @@ pub struct SdpCrypto {
 pub fn parse_sdp(sdp: &str) -> ParsedSdp {
     let mut result = ParsedSdp {
         remote_addr: None,
+        remote_rtcp_addr: None,
+        invalid_rtcp: false,
         codecs: Vec::new(),
         telephone_event_pt: None,
         telephone_event_clock_rate: None,
         crypto: None,
+        crypto_present: false,
+        audio_sections: 0,
         is_webrtc: false,
         direction: None,
         rtcp_mux: false,
@@ -177,6 +220,8 @@ pub fn parse_sdp(sdp: &str) -> ParsedSdp {
     let mut session_c_addr: Option<std::net::IpAddr> = None;
     let mut audio_c_addr: Option<std::net::IpAddr> = None;
     let mut m_port: Option<u16> = None;
+    let mut rtcp_port = None;
+    let mut rtcp_ip = None;
     let mut pts: Vec<u8> = Vec::new();
     // Parsed rtpmap entries: PT → (name, clock_rate, channels)
     let mut rtpmap: std::collections::HashMap<u8, (String, u32, Option<u8>)> =
@@ -187,8 +232,6 @@ pub fn parse_sdp(sdp: &str) -> ParsedSdp {
     // Some(false) = inside a non-audio m= section (e.g. m=video)
     // Attributes from non-audio sections are ignored to prevent cross-section PT collisions.
     let mut media_section: Option<bool> = None;
-    let mut selected_active_audio = false;
-
     for line in sdp.lines() {
         let line = line.trim();
 
@@ -212,15 +255,21 @@ pub fn parse_sdp(sdp: &str) -> ParsedSdp {
                 .first()
                 .and_then(|port| port.parse::<u16>().ok())
                 .filter(|port| *port > 0);
-            if active_port.is_none() || selected_active_audio {
-                // RFC 3264 rejects a media stream with port zero. Ignore rejected
-                // and additional audio sections so they cannot overwrite the
-                // first active RTP target selected for this endpoint.
+            if active_port.is_none() {
+                // RFC 3264 rejects a media stream with port zero. Do not let a
+                // later rejected audio section overwrite the selected active one.
                 media_section = Some(false);
                 continue;
             }
 
-            selected_active_audio = true;
+            result.audio_sections += 1;
+            if result.audio_sections > 1 {
+                // This endpoint can represent only one active audio section.
+                // Preserve the first for diagnostics; validation rejects the SDP.
+                media_section = Some(false);
+                continue;
+            }
+
             media_section = Some(true);
             m_port = active_port;
             // Capture media protocol (e.g., "RTP/AVP", "RTP/SAVP")
@@ -274,26 +323,22 @@ pub fn parse_sdp(sdp: &str) -> ParsedSdp {
                 }
             }
         } else if let Some(rest) = line.strip_prefix("a=crypto:") {
-            // e.g., "1 AES_CM_128_HMAC_SHA1_80 inline:base64key..."
-            let parts: Vec<&str> = rest.splitn(3, ' ').collect();
-            if parts.len() == 3 {
-                let tag = parts[0].parse().unwrap_or(1);
-                let suite = parts[1].to_string();
-                let key_material = parts[2].strip_prefix("inline:").unwrap_or(parts[2]);
-                // Strip RFC 4568 lifetime/MKI parameters after '|'
-                let key_b64 = key_material
-                    .split('|')
-                    .next()
-                    .unwrap_or(key_material)
-                    .to_string();
-                // Only accept the supported cipher suite
-                if suite == "AES_CM_128_HMAC_SHA1_80" {
-                    result.crypto = Some(SdpCrypto {
-                        tag,
-                        suite,
-                        key_b64,
-                    });
-                }
+            result.crypto_present = true;
+            let parts: Vec<_> = rest.split_whitespace().collect();
+            // Lifetime/MKI/session parameters are not implemented. Do not claim
+            // a secure negotiation while ignoring their security semantics.
+            if parts.len() == 3
+                && let Ok(tag) = parts[0].parse::<u32>()
+                && tag > 0
+                && parts[1] == "AES_CM_128_HMAC_SHA1_80"
+                && let Some(key) = parts[2].strip_prefix("inline:")
+                && !key.contains('|')
+            {
+                result.crypto = Some(SdpCrypto {
+                    tag,
+                    suite: parts[1].into(),
+                    key_b64: key.into(),
+                });
             }
         } else if line.starts_with("a=fingerprint:") || line.starts_with("a=ice-ufrag:") {
             result.is_webrtc = true;
@@ -305,6 +350,21 @@ pub fn parse_sdp(sdp: &str) -> ParsedSdp {
             result.direction = Some("sendonly".into());
         } else if line == "a=inactive" {
             result.direction = Some("inactive".into());
+        } else if let Some(rest) = line.strip_prefix("a=rtcp:") {
+            let parts: Vec<_> = rest.split_whitespace().collect();
+            rtcp_port = parts
+                .first()
+                .and_then(|port| port.parse::<u16>().ok())
+                .filter(|port| *port > 0);
+            rtcp_ip = parts.get(3).and_then(|ip| ip.parse::<IpAddr>().ok());
+            let valid_address = matches!(
+                (parts.get(1), parts.get(2), rtcp_ip),
+                (Some(&"IN"), Some(&"IP4"), Some(IpAddr::V4(_)))
+                    | (Some(&"IN"), Some(&"IP6"), Some(IpAddr::V6(_)))
+            );
+            if rtcp_port.is_none() || !(parts.len() == 1 || parts.len() == 4 && valid_address) {
+                result.invalid_rtcp = true;
+            }
         } else if line == "a=rtcp-mux" {
             result.rtcp_mux = true;
         }
@@ -318,6 +378,10 @@ pub fn parse_sdp(sdp: &str) -> ParsedSdp {
         if port != 0 {
             result.remote_addr = Some(SocketAddr::new(addr, port));
         }
+    }
+
+    if let (Some(ip), Some(port)) = (rtcp_ip.or(c_addr), rtcp_port) {
+        result.remote_rtcp_addr = Some(SocketAddr::new(ip, port));
     }
 
     // Map PTs to codecs using well-known PTs and rtpmap entries

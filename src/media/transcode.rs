@@ -5,17 +5,26 @@ use super::resample::Resampler;
 
 /// A transcode pipeline: decode source codec → resample → encode to destination codec.
 /// If source and destination codecs are the same, operates in passthrough mode.
+#[allow(dead_code)] // standalone packet-transcoding API is also used by embeddings/benchmarks
 pub struct TranscodePipeline {
-    decoder: Box<dyn AudioDecoder>,
+    decoder: Option<Box<dyn AudioDecoder>>,
+    source: AudioCodec,
+    timeline: Option<(u32, u32)>,
     encoder: Box<dyn AudioEncoder>,
     resampler: Option<Resampler>,
     passthrough: bool,
     decode_buf: Vec<i16>,
     resample_buf: Vec<i16>,
     encode_buf: Vec<u8>,
+    framer: super::pcm_frames::PcmFrames,
 }
 
+#[allow(dead_code)]
 impl TranscodePipeline {
+    pub fn matches_codecs(&self, source: AudioCodec, destination: AudioCodec) -> bool {
+        self.source == source && self.encoder.codec() == destination
+    }
+
     /// Create a new transcode pipeline between two codecs.
     /// If they're the same codec, this is a no-op passthrough.
     pub fn new(from: AudioCodec, to: AudioCodec) -> Result<Self> {
@@ -31,13 +40,31 @@ impl TranscodePipeline {
         };
 
         Ok(Self {
-            decoder,
+            decoder: Some(decoder),
+            source: from,
+            timeline: None,
             encoder,
             resampler,
             passthrough,
             decode_buf: Vec::with_capacity(960),
             resample_buf: Vec::with_capacity(960),
             encode_buf: Vec::with_capacity(960),
+            framer: super::pcm_frames::PcmFrames::new(to.sample_rate()),
+        })
+    }
+
+    pub fn for_pcm(from: AudioCodec, to: AudioCodec) -> Result<Self> {
+        Ok(Self {
+            decoder: None,
+            source: from,
+            timeline: None,
+            encoder: codec::make_encoder(to)?,
+            resampler: None,
+            passthrough: false,
+            decode_buf: Vec::new(),
+            resample_buf: Vec::new(),
+            encode_buf: Vec::new(),
+            framer: super::pcm_frames::PcmFrames::new(to.sample_rate()),
         })
     }
 
@@ -57,7 +84,10 @@ impl TranscodePipeline {
         }
 
         // Decode source codec → PCM
-        self.decoder.decode(input, &mut self.decode_buf)?;
+        self.decoder
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("encoder-only pipeline"))?
+            .decode(input, &mut self.decode_buf)?;
 
         // Resample if needed
         if let Some(resampler) = &mut self.resampler {
@@ -67,27 +97,65 @@ impl TranscodePipeline {
             self.resample_buf.extend_from_slice(&self.decode_buf);
         }
 
-        // All codecs require exact frame sizes. Pad or truncate to target ptime.
         let target_samples = self.encoder.codec().ptime_samples();
-        if self.resample_buf.len() != target_samples {
-            tracing::trace!(
-                expected = target_samples,
-                actual = self.resample_buf.len(),
-                "transcode frame size mismatch, padding/truncating"
-            );
-            self.resample_buf.resize(target_samples, 0);
-        }
-
-        // Encode PCM → destination codec
+        anyhow::ensure!(
+            self.resample_buf.len() == target_samples,
+            "process requires 20 ms input; use process_frames for variable packet durations"
+        );
         self.encoder
             .encode(&self.resample_buf, &mut self.encode_buf)?;
+        Ok(&self.encode_buf)
+    }
 
+    /// Zero or many complete output frames, preserving partial input across calls.
+    pub fn process_frames(&mut self, input: &[u8]) -> Result<Vec<Vec<u8>>> {
+        if self.passthrough {
+            return Ok(vec![input.to_vec()]);
+        }
+        self.decoder
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("encoder-only pipeline"))?
+            .decode(input, &mut self.decode_buf)?;
+        if let Some(resampler) = &mut self.resampler {
+            resampler.process(&self.decode_buf, &mut self.resample_buf);
+        } else {
+            self.resample_buf.clear();
+            self.resample_buf.extend_from_slice(&self.decode_buf);
+        }
+        let frames = self.framer.push(&self.resample_buf)?;
+        let mut output = Vec::with_capacity(frames.len());
+        for frame in frames {
+            self.encoder.encode(&frame, &mut self.encode_buf)?;
+            output.push(self.encode_buf.clone());
+        }
+        Ok(output)
+    }
+
+    pub fn map_timestamp(&mut self, timestamp: u32, source_rate: u32, dest_rate: u32) -> u32 {
+        let mapped = if let Some((previous, output)) = self.timeline {
+            let delta = timestamp.wrapping_sub(previous);
+            output
+                .wrapping_add((delta as u64 * dest_rate as u64 / source_rate.max(1) as u64) as u32)
+        } else {
+            (timestamp as u64 * dest_rate as u64 / source_rate.max(1) as u64) as u32
+        };
+        self.timeline = Some((timestamp, mapped));
+        mapped
+    }
+
+    /// Encode a source-shared frame already at the destination's PCM rate.
+    pub fn encode_pcm(&mut self, samples: &[i16]) -> Result<&[u8]> {
+        anyhow::ensure!(
+            samples.len() == self.encoder.codec().ptime_samples(),
+            "encoder requires 20 ms PCM"
+        );
+        self.encoder.encode(samples, &mut self.encode_buf)?;
         Ok(&self.encode_buf)
     }
 
     #[allow(dead_code)] // used in tests
     pub fn source_codec(&self) -> AudioCodec {
-        self.decoder.codec()
+        self.source
     }
 
     #[allow(dead_code)] // used in tests
@@ -141,14 +209,22 @@ mod tests {
 
         let min_len = original_pcm.len().min(roundtrip_pcm.len());
         assert!(min_len > 0, "both should have samples");
-        let sign_matches: usize = (0..min_len)
-            .filter(|&i| {
-                original_pcm[i].signum() == roundtrip_pcm[i].signum() || original_pcm[i] == 0
+        // G.722 filtering and causal resampling introduce delay. Compare the
+        // signal after alignment rather than treating delay as distortion.
+        let match_pct = (0..32)
+            .map(|delay| {
+                let count = min_len.saturating_sub(delay);
+                let matches = (0..count)
+                    .filter(|&i| {
+                        original_pcm[i].signum() == roundtrip_pcm[i + delay].signum()
+                            || original_pcm[i] == 0
+                    })
+                    .count();
+                matches as f64 / count as f64
             })
-            .count();
-        let match_pct = sign_matches as f64 / min_len as f64;
+            .fold(0.0, f64::max);
         assert!(
-            match_pct > 0.6,
+            match_pct > 0.9,
             "signal shape should be roughly preserved, got {:.0}% sign match",
             match_pct * 100.0
         );
@@ -211,16 +287,13 @@ mod tests {
     }
 
     #[test]
-    fn test_short_input_padded() {
+    fn short_input_accumulates_without_padding() {
         let mut pipeline = TranscodePipeline::new(AudioCodec::Pcmu, AudioCodec::G722).unwrap();
-
-        // Feed only 10 bytes of PCMU instead of the expected 160
-        let short_input = vec![0x55u8; 10];
-        let output = pipeline.process(&short_input).unwrap();
-        assert!(
-            !output.is_empty(),
-            "short input should still produce output after padding"
-        );
+        assert!(pipeline.process_frames(&[0x55; 80]).unwrap().is_empty());
+        let frames = pipeline.process_frames(&[0x55; 80]).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].len(), 160);
+        assert_eq!(pipeline.process_frames(&[0x55; 480]).unwrap().len(), 3);
     }
 
     #[test]

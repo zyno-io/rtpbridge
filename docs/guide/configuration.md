@@ -10,7 +10,7 @@ rtpbridge [OPTIONS]
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `-l, --listen <ADDRS>` | `0.0.0.0:9100` | WebSocket/HTTP control plane listen address(es), comma-separated |
+| `-l, --listen <ADDRS>` | `127.0.0.1:9100` | WebSocket/HTTP control plane listen address(es), comma-separated |
 | `-m, --media-ip <IP>` | `127.0.0.1` | IP address for all media sockets |
 | `-c, --config <PATH>` | — | Path to TOML configuration file |
 | `--log-level <LEVEL>` | `info` | Log level: trace, debug, info, warn, error |
@@ -19,7 +19,7 @@ rtpbridge [OPTIONS]
 
 ```toml
 # WebSocket/HTTP control plane (comma-separated addresses accepted)
-listen = "0.0.0.0:9100"
+listen = "127.0.0.1:9100"
 
 # Optional HMAC control-plane authorization. The value is read from a mounted
 # file, never written inline in this config. When configured, control WebSocket
@@ -52,7 +52,7 @@ cache_dir = "/tmp/rtpbridge-cache"
 cache_cleanup_interval_secs = 300
 
 # Allowed base directory for local file playback
-# If unset, local file playback is disabled (only URLs allowed)
+# If unset, local file playback is disabled; URLs need an allowed origin
 # media_dir = "/var/lib/rtpbridge/media"
 
 # Base directory for PCAP recordings
@@ -66,7 +66,7 @@ max_endpoints_per_session = 20
 # Maximum concurrent PCAP recordings per session
 max_recordings_per_session = 100
 
-# Seconds to wait for recording tasks to flush before aborting
+# Seconds to observe recording flush before reporting a slow writer
 recording_flush_timeout_secs = 10
 
 # Maximum concurrent HTTP downloads for URL-based file playback (default: 16)
@@ -188,6 +188,8 @@ for orchestration and Prometheus. The `/audio/<connect_token>` WebSocket remains
 authorized by rtpbridge's existing server-minted, single-use opaque token; do
 not give an AI/media consumer the HMAC signing key merely to stream PCM.
 
+Without HMAC, privileged HTTP and control WebSocket requests carrying `Origin` are rejected with `403`. Unauthenticated loopback clients must also use `localhost` or a loopback IP in `Host`, preventing DNS rebinding against a development listener. Browser applications should use an authenticated backend for control and the single-use token for audio. A local proxy preserving a public Host must sign its privileged upstream requests with HMAC.
+
 ## Security
 
 ### Path Traversal Protection
@@ -295,7 +297,7 @@ All configuration options with their types, defaults, and descriptions. All chan
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `listen` | `ip:port[,ip:port...]` | `0.0.0.0:9100` | WebSocket/HTTP control plane listen address(es), comma-separated |
+| `listen` | `ip:port[,ip:port...]` | `127.0.0.1:9100` | WebSocket/HTTP control plane listen address(es), comma-separated |
 | `tls.cert_path` | path | — | Optional PEM server certificate. With `tls.key_path`, changes every control listener to HTTPS/WSS. |
 | `tls.key_path` | path | — | Optional PEM private key; must be supplied with `tls.cert_path`. |
 | `auth_hmac_secret_file` | path | — | Optional mounted HMAC key file (minimum 32 bytes) for control-plane authorization. |
@@ -308,9 +310,9 @@ All configuration options with their types, defaults, and descriptions. All chan
 | `recording_dir` | `path` | `/var/lib/rtpbridge/recordings` | PCAP recording output and HTTP serving directory |
 | `cache_dir` | `path` | `/tmp/rtpbridge-cache` | File cache directory for URL downloads |
 | `cache_cleanup_interval_secs` | `u64` | `300` | Interval for cache cleanup of expired entries |
-| `max_concurrent_downloads` | `usize` | `16` | Maximum concurrent HTTP downloads for URL file playback |
-| `max_sessions` | `usize` | `10000` | Maximum concurrent sessions (0 = unlimited) |
-| `max_endpoints_per_session` | `usize` | `20` | Maximum endpoints per session (0 = unlimited) |
+| `max_concurrent_downloads` | `usize` | `16` | Maximum concurrent HTTP downloads for URL file playback (1..256) |
+| `max_sessions` | `usize` | `10000` | Maximum concurrent sessions (1..65536) |
+| `max_endpoints_per_session` | `usize` | `20` | Maximum endpoints per session (1..128) |
 | `max_recordings_per_session` | `usize` | `100` | Maximum concurrent recordings per session |
 | `recording_flush_timeout_secs` | `u64` | `10` | Seconds to wait for recording tasks to flush on stop |
 | `ws_max_message_size_kb` | `usize` | `256` | Maximum WebSocket message/frame size in KB |
@@ -342,7 +344,7 @@ The following fields must be greater than zero:
 `event_channel_size`, `critical_event_channel_size`, `recording_channel_size`,
 `transcode_cache_size`, `media_timeout_secs`
 
-Note: `max_sessions`, `max_endpoints_per_session`, and `max_connections` accept `0` to mean unlimited.
+`max_sessions` and `max_endpoints_per_session` require finite, nonzero limits. `transcode_cache_size` must be at least `max_endpoints_per_session`, so every active single-source destination can retain its encoder without cache churn. `max_connections` retains its legacy `0` meaning of unlimited connections.
 
 ### Numeric Upper Bounds
 
@@ -365,3 +367,33 @@ Note: `max_sessions`, `max_endpoints_per_session`, and `max_connections` accept 
 - `media_dir` (if set): must exist and be a directory
 - `recording_dir`: parent directory must exist (unless using the default `/var/lib/rtpbridge/recordings`); must be writable if it already exists
 - `cache_dir`: parent directory must exist (unless using the default `/tmp/rtpbridge-cache`); must be writable if it already exists
+
+
+Control listeners default to `127.0.0.1:9100`. Every non-loopback address, including a wildcard listener, requires both TLS and `auth_hmac_secret_file`. `allow_plaintext_control = true` explicitly permits the protected upstream of a trusted TLS proxy; it does not waive HMAC. `allow_unauthenticated_control = true` is a separate development exception. Both default to false. Local loopback clients remain trusted, and one HMAC key grants administrative access across sessions.
+
+`rtp_source_networks` is a list of approved alternate IPv4/IPv6 peer CIDRs, empty by default. Incoming plain RTP must originate at the SDP peer IP or an explicitly approved network. The first valid packet learns its symmetric port and locks the tuple until a deliberate renegotiation/direction reset. Separate RTCP validates its own source and learns its own port; `a=rtcp` is honored and NAT mappings need not preserve RTP-plus-one. Configure narrowly scoped networks for trusted SBCs or NAT media gateways before upgrading deployments that previously relied on learning any source address.
+
+## Playback destination policy and resource limits
+
+Remote playback is disabled until `file_download_origins` contains the exact HTTP(S) origin. Origins include scheme, host and port, with no path, userinfo, query or fragment. Every redirect is checked again. Public destination IPs are permitted for approved origins; private, loopback and special-use addresses require an explicit network allowance. DNS results are pinned to the connection and environment proxies are disabled. HTTPS downgrade is rejected. A cross-origin redirect removes all caller-supplied headers.
+
+System DNS work has a separate four-job process limit. A cancelled request retains its DNS slot until the actual system resolver call exits; saturation returns `DNS_BUSY` through the download error. This prevents repeated cancellation from accumulating blocking resolver jobs.
+
+```toml
+file_download_origins = ["https://media.example.com", "http://10.20.0.5:8080"]
+file_download_networks = ["10.20.0.5/32"]
+max_concurrent_downloads = 16
+max_pending_downloads = 64
+max_download_owners = 256
+max_file_download_bytes = 104857600
+max_cache_entries = 1000
+max_cache_bytes = 1073741824
+```
+
+Download owner deadlines include admission queue time. A shared transfer has a maximum lifetime of 60 seconds. Removing the last owner cancels the transfer; another owner's shorter deadline cannot cancel a surviving owner's request. Overload returns `DOWNLOAD_BUSY` or `CACHE_FULL` without creating an unbounded waiting task.
+
+Use a dedicated cache directory for each process. The server locks `.rtpbridge.lock` and recovers only files beginning `rtpbridge-cache-`. Files from older hash-name cache implementations are not automatically deleted; clear that old cache during a stopped-server migration if its disk space must be reclaimed. Header variants have separate cache identities, and playback retains the exact file lease until its decoder finishes.
+
+The cache budget includes active download reservations, temporary files and files awaiting deletion. `max_file_download_bytes` must be nonzero and fit within `max_cache_bytes`. The new owner, pending and entry counts must be between 1 and 65,536. All pinned entries can cause admission to fail even when their TTL has expired.
+
+See [performance and capacity](./performance.md) for fixed process bounds on storage workers, playback streams, recording writers and WebSocket buffers. Control input has a 1 MiB total byte budget across the active request and up to 16 queued requests, in addition to the configured WebSocket wire limit.

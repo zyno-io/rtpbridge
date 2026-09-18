@@ -110,7 +110,7 @@ The `pcap2audio` binary decodes a recording into a WAV file:
 pcap2audio <input.pcap> -o <out.wav> [--mode multichannel|stereo] [--rate 48000] [--metadata <timeline.json>]
 ```
 
-- `--mode multichannel` — one WAV channel per endpoint (prints a channel→endpoint map)
+- `--mode multichannel` — one WAV channel per endpoint in first-appearance order
 - `--mode stereo` (default) — left = first endpoint, right = all others summed
 - Demuxes by the frame `(src,dst)` pair (bound to an endpoint by descriptors),
   treats each repeated descriptor as a new RTP epoch (including concatenated recording
@@ -137,3 +137,10 @@ their (accurate) RTP timestamps for intra-stream timing as usual.
 ## Bounded Channel
 
 Recording uses a bounded channel (capacity 1000 packets) between the media path and the disk write task. If disk I/O stalls, packets are dropped from the recording rather than blocking the media path. Drops are logged at warn level and reported in the `dropped_packets` field of the `recording.stop` response.
+
+
+Recording admission is limited to 32 writers process-wide. The existing packet channel is also bounded by 1 MiB of queued payload per recording and 16 MiB across the process, including a per-packet accounting allowance. File creation and writes run outside the session task. A flush timeout stops waiting; it cannot cancel a syscall or free the writer's admission early.
+
+`GET /recordings/<path>` streams an opened-file snapshot in 64 KiB chunks, with four concurrent downloads, five-second socket write deadlines, ten-second read deadlines and a 120-second overall deadline. Symlinks and parent traversal are rejected at every path component. A growing recording can contain a partial final PCAP record; a download does not finalize or flush it.
+
+The converter uses temporary encoded/PCM spools and blockwise WAV interleaving. Limits are 32 channels, one million captured packets, 64 KiB per captured frame, 16 KiB per encoded audio payload, one hour of output timeline, 1 GiB of WAV data and 2 GiB of temporary storage including the final output. Supported output rates are 8, 16 and 48 kHz. Inputs exceeding a limit fail before publishing the WAV; the completed output is published atomically. Sequence reordering is supported within descriptor epochs using signed 16-bit sequence deltas; gaps of half the sequence space or more are ambiguous and should be separated into recordings/epochs.

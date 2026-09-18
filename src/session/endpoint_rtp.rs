@@ -46,6 +46,8 @@ pub struct RtpEndpoint {
     pub local_rtp_addr: SocketAddr,
     pub remote_rtp_addr: Option<SocketAddr>,
     pub remote_rtcp_addr: Option<SocketAddr>,
+    pub source_networks: Arc<[ipnet::IpNet]>,
+    rtcp_addr_locked: bool,
 
     /// Our SSRC for outgoing RTP
     pub our_ssrc: u32,
@@ -171,6 +173,8 @@ impl RtpEndpoint {
 
             remote_rtp_addr: None,
             remote_rtcp_addr: None,
+            source_networks: Arc::from([]),
+            rtcp_addr_locked: false,
             our_ssrc: rand::random(),
             remote_ssrc: None,
             codecs: Vec::new(),
@@ -251,8 +255,7 @@ impl RtpEndpoint {
         // first sees the new SSRC. With per-SSRC TX state (RFC 3711 §3.2.1) our
         // new SSRC already starts at ROC 0 on its own; we still clear the TX map
         // here so the retired SSRC's now-unused state doesn't accumulate across
-        // repeated rotations. Mirrors the RX-side `reset_sequence_state()` done
-        // in `update_remote_sdp`.
+        // repeated rotations. Receive replay history is never reset for a live key.
         //
         // (Historically this was load-bearing: when ROC was keyed globally, the
         // stale `highest_seq` could spuriously bump ROC on the new SSRC's first
@@ -312,12 +315,14 @@ impl RtpEndpoint {
                                     is_rtcp: false,
                                     local: None,
                                 };
-                                let enqueue_started = Instant::now();
-                                let send_result = tx.send(packet).await;
-                                raw_recv.record_enqueue_wait(enqueue_started.elapsed());
-                                if send_result.is_err() {
-                                    exit_reason = "session channel closed";
-                                    break;
+                                raw_recv.record_enqueue_wait(Duration::ZERO);
+                                match tx.try_send(packet) {
+                                    Ok(()) => {},
+                                    Err(mpsc::error::TrySendError::Full(_)) => raw_recv.record_channel_overflow(),
+                                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                                        exit_reason = "session channel closed";
+                                        break;
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -370,12 +375,14 @@ impl RtpEndpoint {
                                     is_rtcp: true,
                                     local: None,
                                 };
-                                let enqueue_started = Instant::now();
-                                let send_result = packet_tx.send(packet).await;
-                                raw_recv.record_enqueue_wait(enqueue_started.elapsed());
-                                if send_result.is_err() {
-                                    exit_reason = "session channel closed";
-                                    break;
+                                raw_recv.record_enqueue_wait(Duration::ZERO);
+                                match packet_tx.try_send(packet) {
+                                    Ok(()) => {},
+                                    Err(mpsc::error::TrySendError::Full(_)) => raw_recv.record_channel_overflow(),
+                                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                                        exit_reason = "session channel closed";
+                                        break;
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -407,6 +414,7 @@ impl RtpEndpoint {
         packet_tx: mpsc::Sender<InboundPacket>,
     ) -> anyhow::Result<(Self, String)> {
         let parsed = sdp::parse_sdp(offer_sdp);
+        parsed.validate_plain_transport()?;
 
         let mut endpoint = Self::new(id, direction, socket_pair);
 
@@ -428,7 +436,8 @@ impl RtpEndpoint {
             if parsed.rtcp_mux {
                 endpoint.remote_rtcp_addr = Some(addr);
             } else {
-                endpoint.remote_rtcp_addr = rtcp_addr_from_rtp(addr);
+                endpoint.remote_rtcp_addr =
+                    parsed.remote_rtcp_addr.or_else(|| rtcp_addr_from_rtp(addr));
             }
         }
 
@@ -628,6 +637,7 @@ impl RtpEndpoint {
 
     pub fn accept_answer(&mut self, answer_sdp: &str) -> anyhow::Result<()> {
         let parsed = sdp::parse_sdp(answer_sdp);
+        parsed.validate_plain_transport()?;
 
         // An SRTP offer and a plain-RTP answer (or the inverse) cannot produce
         // usable bidirectional media. In particular, retaining the offer-side
@@ -637,7 +647,11 @@ impl RtpEndpoint {
         // deceptively one-way call.
         let offered_srtp = self.srtp_tx_key_b64.is_some();
         let answered_srtp = parsed.crypto.is_some();
-        let selected_plain_rtp = offered_srtp && !answered_srtp && self.srtp_optional;
+        let selected_plain_rtp = offered_srtp
+            && !answered_srtp
+            && self.srtp_optional
+            && self.srtp_rx.is_none()
+            && self.srtp_rx_new.is_none();
         if offered_srtp != answered_srtp && !selected_plain_rtp {
             anyhow::bail!(
                 "SDP answer media security does not match the offer (offered {}, answered {})",
@@ -704,7 +718,8 @@ impl RtpEndpoint {
             if self.rtcp_mux {
                 self.remote_rtcp_addr = Some(addr);
             } else {
-                self.remote_rtcp_addr = rtcp_addr_from_rtp(addr);
+                self.remote_rtcp_addr =
+                    parsed.remote_rtcp_addr.or_else(|| rtcp_addr_from_rtp(addr));
             }
         }
 
@@ -820,6 +835,11 @@ impl RtpEndpoint {
     /// originally-negotiated one, causing one-way audio after hold/unhold.
     pub fn update_remote_sdp(&mut self, sdp: &str) -> anyhow::Result<String> {
         let parsed = sdp::parse_sdp(sdp);
+        parsed.validate_plain_transport()?;
+
+        if self.has_srtp() && parsed.crypto.is_none() {
+            anyhow::bail!("SDP renegotiation cannot remove established SRTP security");
+        }
 
         // Reject a re-INVITE/re-negotiation that flips the address family before
         // mutating any state — the bound socket can't reach the other family and
@@ -848,7 +868,8 @@ impl RtpEndpoint {
             if self.rtcp_mux {
                 self.remote_rtcp_addr = Some(addr);
             } else {
-                self.remote_rtcp_addr = rtcp_addr_from_rtp(addr);
+                self.remote_rtcp_addr =
+                    parsed.remote_rtcp_addr.or_else(|| rtcp_addr_from_rtp(addr));
             }
         }
 
@@ -876,25 +897,8 @@ impl RtpEndpoint {
                 self.rekey_switchover = Some(Instant::now() + Duration::from_secs(5));
                 self.srtp_rx_key_b64 = Some(crypto.key_b64.clone());
                 debug!(endpoint_id = %self.id, "SRTP RX rekey via update_remote_sdp: dual-context transition started (5s)");
-            } else {
-                // Same key — keep the derived session keys, but reset the RX sequence /
-                // replay window. Phones (e.g. Grandstream GXP21xx) commonly send RTCP BYE
-                // on hold and resume with a new SSRC + reset RTP seq number on unhold.
-                // The old replay_window/highest_seq would reject those low-seq packets as
-                // "too old", silently dropping every post-resume packet until the seq #
-                // climbed back above the window. The cipher_key/auth_key derivation stays
-                // intact so we can still decrypt — only the per-stream tracking is reset.
-                if let Some(ref mut rx) = self.srtp_rx {
-                    rx.reset_sequence_state();
-                }
-                if let Some(ref mut rx) = self.srtcp_rx {
-                    rx.reset_recv_state();
-                }
-                debug!(
-                    endpoint_id = %self.id,
-                    "SRTP RX same-key re-INVITE: reset sequence/replay state for restarted peer stream"
-                );
             }
+            // Unchanged keys retain all per-SSRC ROC and replay history.
 
             if self.srtp_tx.is_none() {
                 let mut tx_key_bytes = [0u8; 30];
@@ -980,17 +984,65 @@ impl RtpEndpoint {
     /// RTP port + 1.
     fn latch_remote_addr(&mut self, source: SocketAddr) {
         self.remote_rtp_addr = Some(source);
-        self.remote_rtcp_addr = if self.rtcp_mux {
-            Some(source)
+        if self.rtcp_mux {
+            self.remote_rtcp_addr = Some(source);
+        } // Separate RTCP learns its own port; NAT need not preserve RTP+1.
+    }
+
+    fn source_allowed(&self, source: SocketAddr, rtcp: bool) -> bool {
+        if source.is_ipv6() != self.local_rtp_addr.is_ipv6() {
+            return false;
+        }
+        let expected = if rtcp {
+            self.remote_rtcp_addr
         } else {
-            rtcp_addr_from_rtp(source)
+            self.remote_rtp_addr
         };
+        let Some(expected) = expected else {
+            return false;
+        };
+        let ip = source.ip().to_canonical();
+        if ip != expected.ip().to_canonical()
+            && !self.source_networks.iter().any(|net| net.contains(&ip))
+        {
+            return false;
+        }
+        let locked = if rtcp && !self.rtcp_mux {
+            self.rtcp_addr_locked
+        } else {
+            self.addr_locked
+        };
+        !locked || source == expected
     }
 
     /// Process an inbound RTP packet (SRTP decrypt if enabled)
     pub fn handle_rtp(&mut self, data: &[u8], source: SocketAddr) -> Option<RoutedRtpPacket> {
         // Check rekey switchover deadline
         self.check_rekey_switchover();
+
+        if !self.addr_locked
+            && self.remote_ssrc.is_some()
+            && self.created_at.elapsed() > Duration::from_secs(self.addr_learn_window_secs)
+        {
+            self.addr_locked = true;
+        }
+        if !self.source_allowed(source, false) {
+            self.raw_recv.record_source_rejection();
+            return None;
+        }
+        let wire_header = RtpHeader::parse(data)?;
+        if !self
+            .codecs
+            .iter()
+            .any(|codec| codec.pt == wire_header.payload_type)
+            && self
+                .send_codec
+                .as_ref()
+                .is_none_or(|codec| codec.pt != wire_header.payload_type)
+            && self.telephone_event_pt != Some(wire_header.payload_type)
+        {
+            return None;
+        }
 
         // SRTP decrypt if enabled
         let decrypted;
@@ -1002,7 +1054,7 @@ impl RtpEndpoint {
                         // New key works — promote it and clear transition state
                         debug!(endpoint_id = %self.id, "SRTP rekey: new key succeeded, promoting");
                         self.srtp_rx = self.srtp_rx_new.take();
-                        self.rekey_switchover = None;
+                        // Keep the shared deadline until SRTCP has also retired its old key.
                         decrypted = d;
                         &decrypted
                     }
@@ -1044,18 +1096,15 @@ impl RtpEndpoint {
         };
 
         let header = RtpHeader::parse(data)?;
+        if header.padding {
+            let padding = usize::from(*data.last()?);
+            if padding == 0 || padding > data.len() - header.header_len {
+                return None;
+            }
+        }
         let payload = header.payload(data);
 
-        // Learn remote SSRC from the first packet. That same first (already
-        // authenticated, for SRTP) packet also latches the real source address
-        // unconditionally — even if the symmetric-RTP learning window has already
-        // elapsed. This covers an offerer leg whose callee rings longer than the
-        // window before answering, so media only starts well after the endpoint
-        // was created: the negotiated SDP address is just a placeholder (often an
-        // unroutable private NAT address) until we actually hear from the peer.
-        // SRTP packets are authenticated/decrypted above and plain RTP already
-        // trusts the first packet for the SSRC, so this does not widen the
-        // spoofing surface. Later NAT rebinds are handled by the windowed path.
+        // Only validated packets from approved sources may learn identity/addresses.
         if self.remote_ssrc.is_none() {
             self.remote_ssrc = Some(header.ssrc);
             debug!(endpoint_id = %self.id, ssrc = header.ssrc, "learned remote SSRC");
@@ -1107,6 +1156,12 @@ impl RtpEndpoint {
             }
         }
 
+        // Plain RTP has no cryptographic evidence for autonomous source migration.
+        // Relatching requires an explicit negotiation/direction reset.
+        if !self.has_srtp() {
+            self.addr_locked = true;
+        }
+
         // Update stats
         self.stats.record_inbound(payload.len());
         self.rtcp_stats.record_received(
@@ -1130,7 +1185,16 @@ impl RtpEndpoint {
 
     /// Process an inbound RTCP packet (SRTCP decrypt if enabled).
     /// Returns (ByePacket if BYE received, decrypted RTCP bytes for recording).
-    pub fn handle_rtcp(&mut self, data: &[u8]) -> (Option<rtcp::ByePacket>, Option<Vec<u8>>) {
+    pub fn handle_rtcp(
+        &mut self,
+        data: &[u8],
+        source: SocketAddr,
+    ) -> (Option<rtcp::ByePacket>, Option<Vec<u8>>) {
+        self.check_rekey_switchover();
+        if !self.source_allowed(source, true) {
+            self.raw_recv.record_source_rejection();
+            return (None, None);
+        }
         let plain = if self.srtcp_rx.is_some() || self.srtcp_rx_new.is_some() {
             // During rekey, try the new context first, then fall back to old
             if let Some(ref mut new_ctx) = self.srtcp_rx_new {
@@ -1168,6 +1232,15 @@ impl RtpEndpoint {
         } else {
             data.to_vec()
         };
+        if !rtcp::valid_compound(&plain) {
+            return (None, None);
+        }
+        self.remote_rtcp_addr = Some(source);
+        self.rtcp_addr_locked = true;
+        if self.rtcp_mux {
+            self.remote_rtp_addr = Some(source);
+            self.addr_locked = true;
+        }
         let packets = rtcp::parse_rtcp(&plain);
         let mut bye_result = None;
         for pkt in packets {
@@ -1442,6 +1515,7 @@ impl RtpEndpoint {
     /// may resume from a new NAT binding.
     pub fn reset_addr_lock(&mut self) {
         self.addr_locked = false;
+        self.rtcp_addr_locked = false;
         self.created_at = Instant::now();
     }
 
@@ -1514,7 +1588,7 @@ impl RtpEndpoint {
     }
 
     /// If the rekey switchover deadline has passed, force-promote the new RX context.
-    fn check_rekey_switchover(&mut self) {
+    pub(crate) fn check_rekey_switchover(&mut self) {
         if let Some(deadline) = self.rekey_switchover
             && Instant::now() >= deadline
         {
@@ -1550,8 +1624,12 @@ impl RtpEndpoint {
     /// and creates a fresh CancellationToken for restart.
     pub async fn stop_recv_tasks(&mut self) {
         self.cancel_token.cancel();
-        for handle in self.recv_tasks.drain(..) {
-            let _ = handle.await;
+        for mut handle in self.recv_tasks.drain(..) {
+            let joined = tokio::time::timeout(Duration::from_secs(1), &mut handle).await;
+            if joined.is_err() {
+                handle.abort();
+                let _ = handle.await;
+            }
         }
         self.cancel_token = CancellationToken::new();
     }

@@ -15,7 +15,11 @@
 
 # WebSocket JSON control plane listen address.
 # Clients connect here to create sessions, add endpoints, and control routing.
-# listen = "0.0.0.0:9100"
+# listen = "127.0.0.1:9100"
+# Non-loopback listeners require TLS and HMAC. Behind a trusted TLS proxy only,
+# explicitly allow plaintext on the protected upstream while retaining HMAC.
+# allow_plaintext_control = false
+# allow_unauthenticated_control = false
 
 # Optional shared HMAC key for privileged control WebSocket upgrades and
 # session/recording HTTP routes. Keep this in a mounted secret file; never put
@@ -39,6 +43,9 @@ media_ip = "203.0.113.10"
 # Size the range for your expected concurrent RTP streams — each endpoint
 # binds a pair of ports (even for RTP, odd for RTCP) from this pool.
 rtp_port_range = [30000, 39999]
+
+# Alternate RTP/RTCP source IPs allowed during NAT learning. Empty means SDP IP only.
+# rtp_source_networks = ["203.0.113.0/24", "2001:db8:1234::/48"]
 
 # ---------------------------------------------------------------------------
 # Session Lifecycle
@@ -88,11 +95,11 @@ recording_dir = "/var/lib/rtpbridge/recordings"
 # Limits
 # ---------------------------------------------------------------------------
 
-# Maximum number of concurrent sessions (0 = unlimited).
+# Maximum number of concurrent sessions (1..65536).
 # Set a hard cap to protect against runaway resource consumption.
 max_sessions = 10000
 
-# Maximum endpoints per session (0 = unlimited).
+# Maximum endpoints per session (1..128; transcode_cache_size must cover this limit).
 # Useful as a safety valve against misbehaving control-plane clients.
 max_endpoints_per_session = 20
 
@@ -197,3 +204,11 @@ recording_flush_timeout_secs = 10
 #
 # Graceful shutdown: Set terminationGracePeriodSeconds >= shutdown_max_wait_secs
 # so the application can drain active sessions before the kubelet sends SIGKILL.
+
+# Remote playback is disabled until exact origins are approved.
+file_download_origins = []
+file_download_networks = []
+max_pending_downloads = 64
+max_download_owners = 256
+max_cache_entries = 1000
+max_cache_bytes = 1073741824

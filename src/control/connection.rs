@@ -1,10 +1,12 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use futures_util::stream::SplitSink;
-use futures_util::{SinkExt, StreamExt};
+use super::ws_io::{NetworkTasks, Writer};
+use futures_util::StreamExt;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, debug_span, info, info_span, trace, warn};
 
 use super::handler::{ConnectionState, handle_request};
@@ -54,7 +56,58 @@ async fn handle_connection_inner(
 ) {
     info!("WebSocket connection established");
 
-    let (mut ws_tx, mut ws_rx) = ws.split();
+    let cancel = CancellationToken::new();
+    let (sink, mut stream) = ws.split();
+    let (mut ws_tx, writer_task) = Writer::spawn(sink, cancel.clone());
+    let (inbound, mut ws_rx) = mpsc::channel(16);
+    let reader_cancel = cancel.clone();
+    let reader_writer = ws_tx.clone();
+    let reader_task = tokio::spawn(async move {
+        let input_budget = Arc::new(tokio::sync::Semaphore::new(1024 * 1024));
+        let mut ping = tokio::time::interval(Duration::from_secs(ws_ping_interval_secs.max(1)));
+        ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ping.tick().await;
+        let mut pending: Option<(Vec<u8>, tokio::time::Instant)> = None;
+        loop {
+            let deadline = pending
+                .as_ref()
+                .map(|(_, deadline)| *deadline)
+                .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(86400));
+            tokio::select! {
+                _ = reader_cancel.cancelled() => break,
+                _ = tokio::time::sleep_until(deadline), if pending.is_some() => break,
+                _ = ping.tick(), if pending.is_none() => {
+                    let nonce = rand::random::<u64>().to_be_bytes().to_vec();
+                    let sent = reader_writer.send(Message::Ping(nonce.clone().into())).await;
+                    if sent.is_err() { break; }
+                    pending = Some((nonce, tokio::time::Instant::now() + Duration::from_secs(10)));
+                }
+                message = stream.next() => match message {
+                    Some(Ok(Message::Pong(data))) => {
+                        if pending.as_ref().is_some_and(|(nonce, _)| nonce.as_slice() == data.as_ref()) { pending = None; }
+                    }
+                    Some(Ok(Message::Ping(data))) => {
+                        let sent = reader_writer.send(Message::Pong(data)).await;
+                        if sent.is_err() { break; }
+                    }
+                    Some(message) => {
+                        let terminal = !matches!(&message, Ok(Message::Text(_)) | Ok(Message::Binary(_)));
+                        let bytes = message.as_ref().map(|message| message.len().saturating_add(64)).unwrap_or(64);
+                        let Ok(bytes) = u32::try_from(bytes) else { break };
+                        let Ok(permit) = Arc::clone(&input_budget).try_acquire_many_owned(bytes) else { break };
+                        if inbound.try_send((message, permit)).is_err() { break; }
+                        if terminal { break; }
+                    }
+                    None => break,
+                }
+            }
+        }
+        reader_cancel.cancel();
+    });
+    let _network = NetworkTasks {
+        cancel: cancel.clone(),
+        tasks: vec![reader_task, writer_task],
+    };
     // Bounded event channel to prevent OOM under back-pressure.
     // 256 events ≈ generous buffer; dropped events are tracked and the
     // client is notified via an events.dropped notification.
@@ -64,17 +117,10 @@ async fn handle_connection_inner(
     let dropped_events = Arc::new(AtomicU64::new(0));
     let mut state = ConnectionState::new();
 
-    // Periodic WebSocket ping to detect dead connections behind NATs/load balancers
-    let mut ping_interval =
-        tokio::time::interval(std::time::Duration::from_secs(ws_ping_interval_secs));
-    ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // Skip the first immediate tick
-    ping_interval.tick().await;
-
     /// Send the session.orphaned event directly on the WebSocket.
     /// Best-effort: errors are silently ignored since the connection is closing.
     async fn send_orphan_event(
-        ws_tx: &mut futures_util::stream::SplitSink<ServerWebSocket, Message>,
+        ws_tx: &mut Writer,
         state: &ConnectionState,
         manager: &SessionManager,
     ) {
@@ -99,7 +145,7 @@ async fn handle_connection_inner(
 
     loop {
         tokio::select! {
-            biased;
+            _ = cancel.cancelled() => break,
 
             // Critical events get priority delivery
             Some(event) = critical_event_rx.recv() => {
@@ -108,17 +154,18 @@ async fn handle_connection_inner(
                     r#"{"event":"error","data":{}}"#.to_string()
                 });
                 trace!(event = %safe_protocol_name(&event.event), payload_bytes = json.len(), body = %event_body(&event), "ws send critical event");
-                if ws_tx.send(Message::Text(json.into())).await.is_err() {
+                let sent = ws_tx.send(Message::Text(json.into())).await;
+                if sent.is_err() {
                     break;
                 }
             }
 
             // Incoming WS message from client
-            msg = ws_rx.next() => {
-                match msg {
+            msg = ws_rx.recv() => {
+                let Some((msg, _input_bytes)) = msg else { break };
+                match Some(msg) {
                     Some(Ok(Message::Text(text))) => {
-                        // NOTE: serde_json has no recursion depth limit. Deeply nested JSON could
-                        // cause stack overflow, bounded by the WebSocket message size limit.
+                        // serde_json's default recursion limit stays enabled.
                         let req: Request = match serde_json::from_str(&text) {
                             Ok(r) => r,
                             Err(e) => {
@@ -208,7 +255,8 @@ async fn handle_connection_inner(
                         break;
                     }
                     Some(Ok(Message::Ping(data))) => {
-                        if ws_tx.send(Message::Pong(data)).await.is_err() {
+                        let sent = ws_tx.send(Message::Pong(data)).await;
+                        if sent.is_err() {
                             break;
                         }
                     }
@@ -234,7 +282,8 @@ async fn handle_connection_inner(
                     );
                     if let Ok(json) = serde_json::to_string(&drop_event) {
                         trace!(event = %safe_protocol_name(&drop_event.event), payload_bytes = json.len(), body = %event_body(&drop_event), "ws send event");
-                        if ws_tx.send(Message::Text(json.into())).await.is_err() {
+                        let sent = ws_tx.send(Message::Text(json.into())).await;
+                        if sent.is_err() {
                             break;
                         }
                     }
@@ -245,17 +294,13 @@ async fn handle_connection_inner(
                     r#"{"event":"error","data":{}}"#.to_string()
                 });
                 trace!(event = %safe_protocol_name(&event.event), payload_bytes = json.len(), body = %event_body(&event), "ws send event");
-                if ws_tx.send(Message::Text(json.into())).await.is_err() {
+                let sent = ws_tx.send(Message::Text(json.into())).await;
+                if sent.is_err() {
                     break;
                 }
             }
 
-            // Periodic ping for keepalive / dead connection detection
-            _ = ping_interval.tick() => {
-                if ws_tx.send(Message::Ping(vec![].into())).await.is_err() {
-                    break;
-                }
-            }
+
         }
     }
 
@@ -268,11 +313,7 @@ async fn handle_connection_inner(
     info!("WebSocket connection closed");
 }
 
-async fn send_ws_response(
-    ws_tx: &mut SplitSink<ServerWebSocket, Message>,
-    method: &str,
-    resp: Response,
-) -> bool {
+async fn send_ws_response(ws_tx: &mut Writer, method: &str, resp: Response) -> bool {
     let logged_method = safe_protocol_name(method);
     let json = serde_json::to_string(&resp).unwrap_or_else(|e| {
         warn!(
@@ -367,7 +408,7 @@ fn log_ws_response_sent(method: &str, resp: &Response) {
 /// learns about drops immediately after the request that caused them.
 /// Returns `false` if a WebSocket send failed (connection is dead).
 async fn drain_pending_events(
-    ws_tx: &mut futures_util::stream::SplitSink<ServerWebSocket, Message>,
+    ws_tx: &mut Writer,
     critical_rx: &mut mpsc::Receiver<Event>,
     event_rx: &mut mpsc::Receiver<Event>,
     dropped_events: &AtomicU64,
@@ -384,29 +425,38 @@ async fn drain_pending_events(
             super::protocol::Event::new("events.dropped", serde_json::json!({ "count": dropped }));
         if let Ok(json) = serde_json::to_string(&drop_event) {
             trace!(event = %safe_protocol_name(&drop_event.event), payload_bytes = json.len(), body = %event_body(&drop_event), "ws send event");
-            if ws_tx.send(Message::Text(json.into())).await.is_err() {
+            let sent = ws_tx.send(Message::Text(json.into())).await;
+            if sent.is_err() {
                 return false;
             }
         }
     }
 
-    while let Ok(event) = critical_rx.try_recv() {
+    for _ in 0..critical_rx.len() {
+        let Ok(event) = critical_rx.try_recv() else {
+            break;
+        };
         let json = serde_json::to_string(&event).unwrap_or_else(|e| {
             warn!(error = %e, "failed to serialize critical event");
             r#"{"event":"error","data":{}}"#.to_string()
         });
         trace!(event = %safe_protocol_name(&event.event), payload_bytes = json.len(), body = %event_body(&event), "ws send critical event");
-        if ws_tx.send(Message::Text(json.into())).await.is_err() {
+        let sent = ws_tx.send(Message::Text(json.into())).await;
+        if sent.is_err() {
             return false;
         }
     }
-    while let Ok(event) = event_rx.try_recv() {
+    for _ in 0..event_rx.len() {
+        let Ok(event) = event_rx.try_recv() else {
+            break;
+        };
         let json = serde_json::to_string(&event).unwrap_or_else(|e| {
             warn!(error = %e, "failed to serialize event");
             r#"{"event":"error","data":{}}"#.to_string()
         });
         trace!(event = %safe_protocol_name(&event.event), payload_bytes = json.len(), body = %event_body(&event), "ws send event");
-        if ws_tx.send(Message::Text(json.into())).await.is_err() {
+        let sent = ws_tx.send(Message::Text(json.into())).await;
+        if sent.is_err() {
             return false;
         }
     }

@@ -1,5 +1,7 @@
 //! WSS/HTTPS transport and HMAC authorization coverage for the control plane.
 
+use rustls_pki_types::pem::PemObject;
+
 mod helpers;
 
 use std::io::{BufReader, Cursor};
@@ -20,10 +22,48 @@ use tokio_tungstenite::{Connector, connect_async_tls_with_config};
 
 const CONTROL_SECRET: &[u8] = b"rtpbridge-control-test-key-must-be-at-least-32-bytes";
 
+#[tokio::test]
+async fn unauthenticated_loopback_control_rejects_browser_and_rebinding_requests() {
+    let server = TestServer::builder().start().await;
+    let url = format!("ws://{}", server.addr);
+    for origin in ["https://attacker.invalid", "null", "http://localhost"] {
+        let mut request = url.clone().into_client_request().unwrap();
+        request
+            .headers_mut()
+            .insert("Origin", origin.parse().unwrap());
+        let connected = tokio_tungstenite::connect_async(request).await;
+        match connected.expect_err("browser control must not bypass loopback authentication") {
+            WebSocketError::Http(response) => assert_eq!(response.status(), StatusCode::FORBIDDEN),
+            other => panic!("expected HTTP 403, received {other:?}"),
+        }
+    }
+    let client = reqwest::Client::new();
+    let response = client
+        .get(format!("http://{}/sessions", server.addr))
+        .header("Host", "attacker.invalid")
+        .send()
+        .await;
+    assert_eq!(response.unwrap().status(), StatusCode::FORBIDDEN);
+    let mut request = url.clone().into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("Host", "attacker.invalid".parse().unwrap());
+    let connected = tokio_tungstenite::connect_async(request).await;
+    match connected.expect_err("rebound control host must be rejected") {
+        WebSocketError::Http(response) => assert_eq!(response.status(), StatusCode::FORBIDDEN),
+        other => panic!("expected HTTP 403, received {other:?}"),
+    }
+    let connected = tokio_tungstenite::connect_async(url).await;
+    let (mut control, _) = connected.expect("local server client should still connect");
+    let session = send_control_request(&mut control, "session.create", json!({})).await;
+    assert!(session["result"]["session_id"].is_string());
+    let _ = control.close(None).await;
+}
+
 fn tls_connector(certificate_pem: &str) -> Connector {
     let mut roots = RootCertStore::empty();
     let mut reader = BufReader::new(Cursor::new(certificate_pem.as_bytes()));
-    let certificates = rustls_pemfile::certs(&mut reader)
+    let certificates = rustls_pki_types::CertificateDer::pem_reader_iter(&mut reader)
         .collect::<Result<Vec<_>, _>>()
         .expect("test certificate PEM should parse");
     for certificate in certificates {
@@ -136,10 +176,14 @@ async fn wss_https_and_hmac_authorize_control_while_audio_keeps_its_own_token() 
     // The audio bearer token is its own capability: the media client never
     // receives the shared HMAC control key.
     let audio_url = format!("{wss_url}/audio/{connect_token}");
+    let mut audio_request = audio_url.into_client_request().unwrap();
+    audio_request
+        .headers_mut()
+        .insert("Origin", "https://browser.example".parse().unwrap());
+    let connected =
+        connect_async_tls_with_config(audio_request, None, false, Some(connector.clone())).await;
     let (mut audio, _) =
-        connect_async_tls_with_config(audio_url, None, false, Some(connector.clone()))
-            .await
-            .expect("single-use audio token should authorize WSS audio without HMAC");
+        connected.expect("single-use audio token should authorize WSS audio without HMAC");
     audio
         .close(None)
         .await

@@ -7,6 +7,7 @@ mod playback;
 mod recording;
 mod session;
 mod shutdown;
+mod storage;
 mod version;
 
 use clap::Parser;
@@ -38,18 +39,25 @@ async fn main() -> anyhow::Result<()> {
         .init();
     info!(
         version = version::BUILD_VERSION,
+        openssl = openssl::version::version(),
         listen = ?config.listen,
         media_ip = ?config.media_ip,
         "rtpbridge starting"
     );
 
-    if config.max_sessions == 0 {
-        warn!(
-            "max_sessions is 0 (unlimited) — consider setting a limit to prevent resource exhaustion"
-        );
-    }
-    if config.max_endpoints_per_session == 0 {
-        warn!("max_endpoints_per_session is 0 (unlimited) — consider setting a limit");
+    if config
+        .listen
+        .iter()
+        .any(|address| !address.ip().to_canonical().is_loopback())
+    {
+        if config.tls.is_none() {
+            warn!("plaintext control explicitly enabled on a non-loopback listener");
+        }
+        if config.auth_hmac_secret_file.is_none() {
+            warn!(
+                "unauthenticated administrative control explicitly enabled on a non-loopback listener"
+            );
+        }
     }
     let authenticator = config
         .auth_hmac_secret_file
@@ -117,38 +125,12 @@ async fn main() -> anyhow::Result<()> {
 
     let metrics = Arc::new(Metrics::new());
 
-    let file_cache = Arc::new(
-        FileCache::with_options(
-            config.cache_dir.clone(),
-            1000,
-            config.max_concurrent_downloads,
-            config.max_file_download_bytes,
-        )
-        .map_err(|e| anyhow::anyhow!("Failed to initialize file cache: {e}"))?,
-    );
+    let file_cache = Arc::new(FileCache::from_config(&config)?);
     let cleanup_handle =
         file_cache.start_cleanup_task(config.cache_cleanup_interval_secs, shutdown.clone());
 
-    let manager = SessionManager::new(
-        shutdown.clone(),
-        config.disconnect_timeout_secs,
-        config.media_ip.clone(),
-        config.rtp_port_range,
-        config.max_sessions,
-        config.max_endpoints_per_session,
-        config.max_recordings_per_session,
-        config.recording_flush_timeout_secs,
-        config.recording_channel_size,
-        config.max_sdp_size_kb,
-        config.session_idle_timeout_secs,
-        config.empty_session_timeout_secs,
-        config.media_timeout_secs,
-        config.transcode_cache_size,
-        config.media_dir.clone(),
-        file_cache,
-        Arc::clone(&metrics),
-        config.recording_dir.clone(),
-    )?;
+    let manager =
+        SessionManager::from_config(&config, shutdown.clone(), file_cache, Arc::clone(&metrics))?;
 
     // Start WebSocket control server
     let ws_handle = {

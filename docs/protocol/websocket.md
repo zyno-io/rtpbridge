@@ -54,7 +54,7 @@ Direction uses the same peer/SDP perspective as plain RTP and WebRTC endpoints:
 ## Wire format
 
 Binary WebSocket frames only. Each frame is **raw little-endian 16-bit mono PCM**
-at the negotiated `sample_rate`. Frames may be any length; rtpbridge reframes the
+at the negotiated `sample_rate`. Frames may vary in length within the limits below; rtpbridge reframes the
 inbound stream to 20 ms internally (a trailing partial sample is buffered until the
 next frame). Text frames are ignored; Ping is answered with Pong; Close disconnects
 the audio endpoint.
@@ -90,3 +90,9 @@ the audio endpoint.
 - WebSocket endpoints cannot be transferred between sessions (`endpoint.transfer`).
 - Backpressure: if the peer can't keep up, the newest outbound frame is dropped
   rather than blocking the session (same policy as bridge endpoints).
+
+- The inbound byte ring buffers at most 256 KiB of PCM (about 16.4 seconds at 8 kHz or 2.7 seconds at 48 kHz). Accepted bytes are paced into the session at 20 ms per frame; trailing odd bytes are carried across messages. Sending beyond the budget closes the connection. Closing the endpoint discards remaining buffered input.
+- Both transports close after a socket write exceeds five seconds or a matching Pong is absent for ten seconds after a Ping. Audio Pings are sent every 30 seconds; control uses `ws_ping_interval_secs`. Reads and heartbeat processing run independently of media output and control handlers.
+- Outbound packet queueing remains nonblocking and may drop the newest packet under backpressure. The socket writer also has a finite message/byte budget. Disconnect completion is reserved at attach time so a full session command channel cannot lose cleanup.
+
+The 256 KiB limit applies to the IO ring. Also budget for the currently decoded WebSocket message, the session’s bounded 256-packet input queue, its playout frames, and transport buffers; those are separate fixed bounds. The ring drains at most one 20 ms frame per tick, so accepted TTS bursts are paced instead of filling the downstream queue at once.

@@ -145,9 +145,14 @@ impl SrtpContext {
     /// The key material is: master_key (16 bytes) || master_salt (14 bytes) = 30 bytes.
     pub fn from_sdes_key(key_b64: &str) -> anyhow::Result<Self> {
         let mut key_material = base64_decode(key_b64)?;
-        if key_material.len() < SRTP_MASTER_KEY_LEN + SRTP_MASTER_SALT_LEN {
+        if key_material.len() != SRTP_MASTER_KEY_LEN + SRTP_MASTER_SALT_LEN {
             anyhow::bail!(
-                "SRTP key material too short: {} bytes (need {})",
+                "SRTP key material {}: {} bytes (need {})",
+                if key_material.len() < 30 {
+                    "too short"
+                } else {
+                    "too long"
+                },
                 key_material.len(),
                 SRTP_MASTER_KEY_LEN + SRTP_MASTER_SALT_LEN
             );
@@ -383,8 +388,11 @@ impl SrtcpContext {
     /// Create an SRTCP context from a base64-encoded SDES key (same key as SRTP).
     pub fn from_sdes_key(key_b64: &str) -> anyhow::Result<Self> {
         let mut key_material = base64_decode(key_b64)?;
-        if key_material.len() < SRTP_MASTER_KEY_LEN + SRTP_MASTER_SALT_LEN {
-            anyhow::bail!("SRTCP key material too short: {} bytes", key_material.len());
+        if key_material.len() != SRTP_MASTER_KEY_LEN + SRTP_MASTER_SALT_LEN {
+            anyhow::bail!(
+                "SRTCP key material has invalid length: {} bytes",
+                key_material.len()
+            );
         }
 
         let mut master_key: [u8; 16] = key_material[..16]
@@ -465,19 +473,6 @@ impl SrtcpContext {
         output.extend_from_slice(&tag[..SRTP_AUTH_TAG_LEN]);
 
         Ok(output)
-    }
-
-    /// Reset the inbound SRTCP replay state, preserving the derived session keys
-    /// and the outbound `srtcp_index` counter.
-    ///
-    /// Use this when the remote peer restarts their RTCP stream mid-session — e.g.,
-    /// after a SIP hold where the phone sends RTCP BYE and resumes with a fresh
-    /// SRTCP index of 0. Without this, the old `replay_window` / `highest_recv_index`
-    /// would reject the peer's restarted low-index packets as "too old".
-    pub fn reset_recv_state(&mut self) {
-        // Drop all per-SSRC inbound replay state so a restarted (same or new)
-        // SRTCP source re-baselines; preserves keys and the outbound index.
-        self.recv_streams.clear();
     }
 
     /// Decrypt an SRTCP packet, verifying auth and decrypting if E=1.

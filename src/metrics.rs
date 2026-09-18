@@ -36,6 +36,8 @@ pub struct Metrics {
     pub endpoints_active: Gauge,
     /// Total packets routed between endpoints.
     pub packets_routed: Counter,
+    /// Real input packets decoded, independent of destination fanout.
+    pub audio_packets_decoded: Counter,
     /// Total packets recorded to PCAP.
     pub packets_recorded: Counter,
     /// Currently active recordings.
@@ -137,6 +139,7 @@ impl Metrics {
         let endpoints_total = Counter::default();
         let endpoints_active = Gauge::default();
         let packets_routed = Counter::default();
+        let audio_packets_decoded = Counter::default();
         let packets_recorded = Counter::default();
         let recordings_active = Gauge::default();
         let srtp_errors = Counter::default();
@@ -181,6 +184,11 @@ impl Metrics {
             "rtpbridge_endpoints_active",
             "Currently active endpoints",
             endpoints_active.clone(),
+        );
+        registry.register(
+            "rtpbridge_audio_packets_decoded",
+            "Source audio packets decoded",
+            audio_packets_decoded.clone(),
         );
         registry.register(
             "rtpbridge_packets_routed",
@@ -303,6 +311,7 @@ impl Metrics {
             endpoints_total,
             endpoints_active,
             packets_routed,
+            audio_packets_decoded,
             packets_recorded,
             recordings_active,
             srtp_errors,

@@ -469,14 +469,10 @@ async fn test_record_packet_dead_recording_cleanup() {
 
     assert_eq!(mgr.active_recordings().len(), 1);
 
-    // Force the recording task to die by aborting it
-    // Access the recording's task handle and abort it
-    if let Some(recording) = mgr.recordings.get(&rec_id) {
-        recording.task.abort();
-    }
-
-    // Give the task time to detect channel closure
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // Simulate a writer that has closed its receiver after an I/O failure.
+    let (dead_tx, dead_rx) = tokio::sync::mpsc::channel(1);
+    drop(dead_rx);
+    mgr.recordings.get_mut(&rec_id).unwrap().tx = dead_tx;
 
     // Now record_packet should detect the dead channel and clean up
     let stopped = mgr.record_packet(&ep, &[0xFF; 100]);

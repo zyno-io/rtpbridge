@@ -28,6 +28,7 @@ async fn create_pcmu_endpoint(client: &mut TestControlClient, peer: &mut TestRtp
 
 /// Helper: create a G.722 endpoint from a peer's SDP offer.
 async fn create_g722_endpoint(client: &mut TestControlClient, peer: &mut TestRtpPeer) -> String {
+    peer.activation_pt = 9;
     let offer = peer.make_g722_sdp_offer();
     let result = client
         .request_ok(
@@ -106,7 +107,7 @@ async fn test_three_party_pcmu_mixing() {
 
     let (pa, pb) = tokio::join!(send_a, send_b);
     peer_a = pa.unwrap();
-    peer_b = pb.unwrap();
+    let _peer_b = pb.unwrap();
 
     tokio::time::sleep(timing::scaled_ms(500)).await;
 

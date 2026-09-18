@@ -10,7 +10,11 @@ permissions:
   packages: write
 
 jobs:
+  checks:
+    uses: ./.github/workflows/ci.yml
+
   docker:
+    needs: checks
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -33,27 +37,40 @@ jobs:
       - uses: docker/build-push-action@v6
         with:
           context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          load: true
+          push: false
+          tags: ghcr.io/${{ github.repository }}:candidate-${{ github.sha }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: BUILD_VERSION=${{ github.ref_name }}
 
       - name: Generate SBOM
         uses: anchore/sbom-action@v0
         with:
-          image: ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+          image: ghcr.io/${{ github.repository }}:candidate-${{ github.sha }}
           artifact-name: sbom-${{ github.ref_name }}.spdx.json
           output-file: sbom.spdx.json
 
       - name: Scan container image
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+          image-ref: ghcr.io/${{ github.repository }}:candidate-${{ github.sha }}
           format: table
           exit-code: '1'
-          ignore-unfixed: true
+          ignore-unfixed: 'false'
           severity: CRITICAL,HIGH
 
+      - name: Publish the scanned candidate
+        env:
+          CANDIDATE: ghcr.io/${{ github.repository }}:candidate-${{ github.sha }}
+          RELEASE_TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          while IFS= read -r tag; do
+            docker tag "$CANDIDATE" "$tag"
+            docker push "$tag"
+          done <<< "$RELEASE_TAGS"
+
   release:
+    needs: docker
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

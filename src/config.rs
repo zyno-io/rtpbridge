@@ -27,7 +27,7 @@ fn parse_listen_addrs(s: &str) -> Result<Vec<SocketAddr>, String> {
 }
 
 /// Deserialize listen addresses from TOML — accepts a single string like
-/// `"0.0.0.0:9100"` or comma-separated `"10.0.0.1:9100, 127.0.0.1:9100"`.
+/// `"127.0.0.1:9100"` or comma-separated `"10.0.0.1:9100, 127.0.0.1:9100"`.
 fn deserialize_listen_addrs<'de, D>(deserializer: D) -> Result<Vec<SocketAddr>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -66,7 +66,7 @@ where
 )]
 pub struct Cli {
     /// WebSocket control plane listen addresses (comma-separated ip:port)
-    #[arg(short, long, default_value = "0.0.0.0:9100", value_delimiter = ',')]
+    #[arg(short, long, default_value = "127.0.0.1:9100", value_delimiter = ',')]
     pub listen: Vec<SocketAddr>,
 
     /// Media plane bind IPs for RTP/WebRTC UDP sockets (comma-separated; at most
@@ -94,6 +94,12 @@ pub struct Config {
     /// retain the legacy plaintext `ws://` / `http://` listener.
     pub tls: Option<TlsConfig>,
 
+    /// Explicit exception for plaintext control on a non-loopback listener (e.g. TLS proxy).
+    pub allow_plaintext_control: bool,
+
+    /// Explicit exception for unauthenticated control on a non-loopback listener.
+    pub allow_unauthenticated_control: bool,
+
     /// Optional path to shared HMAC key material. When set, control WebSocket
     /// upgrades and sensitive HTTP routes require signed Authorization headers.
     /// The audio plane deliberately remains authorized by its single-use token.
@@ -115,6 +121,9 @@ pub struct Config {
 
     /// UDP port range for plain RTP endpoints (start, end inclusive)
     pub rtp_port_range: (u16, u16),
+
+    /// Approved alternate media source networks for peers behind NAT.
+    pub rtp_source_networks: Vec<ipnet::IpNet>,
 
     /// Session disconnect timeout in seconds
     pub disconnect_timeout_secs: u64,
@@ -140,11 +149,17 @@ pub struct Config {
 
     /// Maximum concurrent HTTP downloads for URL file playback
     pub max_concurrent_downloads: usize,
+    pub max_pending_downloads: usize,
+    pub max_download_owners: usize,
+    pub max_cache_entries: usize,
+    pub max_cache_bytes: u64,
+    pub file_download_origins: Vec<String>,
+    pub file_download_networks: Vec<ipnet::IpNet>,
 
-    /// Maximum number of concurrent sessions (0 = unlimited)
+    /// Maximum number of concurrent sessions (1..65536)
     pub max_sessions: usize,
 
-    /// Maximum endpoints per session (0 = unlimited)
+    /// Maximum endpoints per session (1..128)
     pub max_endpoints_per_session: usize,
 
     /// Maximum concurrent recordings per session
@@ -215,16 +230,19 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             listen: vec![
-                "0.0.0.0:9100"
+                "127.0.0.1:9100"
                     .parse()
                     .expect("hardcoded default listen address must parse"),
             ],
             tls: None,
+            allow_plaintext_control: false,
+            allow_unauthenticated_control: false,
             auth_hmac_secret_file: None,
             auth_hmac_max_age_secs: default_auth_hmac_max_age_secs(),
             media_ip: default_media_ip(),
             // rtp_port_range applies per family — each media IP gets its own pool.
             rtp_port_range: (30000, 39999),
+            rtp_source_networks: Vec::new(),
             disconnect_timeout_secs: 30,
             shutdown_max_wait_secs: 300,
             media_dir: None,
@@ -232,6 +250,12 @@ impl Default for Config {
             cache_dir: PathBuf::from("/tmp/rtpbridge-cache"),
             cache_cleanup_interval_secs: 300,
             max_concurrent_downloads: 16,
+            max_pending_downloads: 64,
+            max_download_owners: 256,
+            max_cache_entries: 1000,
+            max_cache_bytes: 1024 * 1024 * 1024,
+            file_download_origins: Vec::new(),
+            file_download_networks: Vec::new(),
             max_sessions: 10000,
             max_endpoints_per_session: 20,
             max_recordings_per_session: 100,
@@ -296,6 +320,29 @@ impl Config {
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.listen.is_empty() {
             anyhow::bail!("listen must contain at least one address");
+        }
+        if self
+            .listen
+            .iter()
+            .any(|addr| !addr.ip().to_canonical().is_loopback())
+        {
+            if self.tls.is_none() && !self.allow_plaintext_control {
+                anyhow::bail!(
+                    "non-loopback control requires TLS; set allow_plaintext_control explicitly for a trusted TLS proxy"
+                );
+            }
+            if self.auth_hmac_secret_file.is_none() && !self.allow_unauthenticated_control {
+                anyhow::bail!(
+                    "non-loopback control requires auth_hmac_secret_file; allow_unauthenticated_control is an explicit development exception"
+                );
+            }
+            if self.tls.is_none() || self.auth_hmac_secret_file.is_none() {
+                tracing::warn!(
+                    plaintext = self.tls.is_none(),
+                    unauthenticated = self.auth_hmac_secret_file.is_none(),
+                    "non-loopback control security exception enabled"
+                );
+            }
         }
         if let Some(tls) = &self.tls {
             if !tls.cert_path.is_file() {
@@ -400,6 +447,23 @@ impl Config {
         if self.max_recordings_per_session == 0 {
             anyhow::bail!("max_recordings_per_session must be > 0");
         }
+        crate::playback::download_policy::DownloadPolicy::new(
+            &self.file_download_origins,
+            self.file_download_networks.clone(),
+        )?;
+        for (name, value) in [
+            ("max_pending_downloads", self.max_pending_downloads),
+            ("max_download_owners", self.max_download_owners),
+            ("max_cache_entries", self.max_cache_entries),
+        ] {
+            if value == 0 || value > 65_536 {
+                anyhow::bail!("{name} must be 1..65536");
+            }
+        }
+        if self.max_file_download_bytes == 0 || self.max_file_download_bytes > self.max_cache_bytes
+        {
+            anyhow::bail!("max_file_download_bytes must be nonzero and fit within max_cache_bytes");
+        }
         if self.max_concurrent_downloads == 0 {
             anyhow::bail!("max_concurrent_downloads must be > 0");
         }
@@ -417,6 +481,20 @@ impl Config {
         }
         if self.transcode_cache_size == 0 {
             anyhow::bail!("transcode_cache_size must be > 0");
+        }
+        if self.max_sessions == 0 || self.max_sessions > 65536 {
+            anyhow::bail!("max_sessions must be 1..65536");
+        }
+        if self.max_endpoints_per_session == 0 || self.max_endpoints_per_session > 128 {
+            anyhow::bail!("max_endpoints_per_session must be 1..128");
+        }
+        // A single-source destination needs at most one encoder pipeline. Reserve
+        // enough slots for every admitted destination, avoiding active-state LRU churn.
+        if self.transcode_cache_size < self.max_endpoints_per_session {
+            anyhow::bail!("transcode_cache_size must cover max_endpoints_per_session");
+        }
+        if self.max_concurrent_downloads > 256 {
+            anyhow::bail!("max_concurrent_downloads must be <= 256");
         }
         // Validate cache_dir parent if it's not the default
         let default_cache = PathBuf::from("/tmp/rtpbridge-cache");
@@ -442,6 +520,11 @@ impl Config {
             }
         }
         self.validate_media_ips()?;
+        anyhow::ensure!(
+            supported_openssl(openssl::version::number() as u64),
+            "unsupported or outdated native crypto: {}; use OpenSSL 3.5.8+, 3.6.4+, or a newer release line (scripts/build-openssl.sh builds the tested version)",
+            openssl::version::version()
+        );
         Ok(())
     }
 
@@ -507,9 +590,70 @@ fn is_dir_writable(path: &std::path::Path) -> bool {
     }
 }
 
+// OpenSSL 3.6.3's DTLS implementation has CVE-2026-54874. Check the
+// actual linked library, since Cargo advisory scanning cannot see native code.
+fn supported_openssl(version: u64) -> bool {
+    let release_line = version & 0xfff0_0000;
+    match release_line {
+        0x3050_0000 => version >= 0x3050_0080,
+        0x3060_0000 => version >= 0x3060_0040,
+        _ => release_line >= 0x3070_0000,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_crypto_rejects_versions_missing_dtls_security_fixes() {
+        for vulnerable in [0x1010_11ff, 0x3000_0150, 0x3050_0070, 0x3060_0030] {
+            assert!(!supported_openssl(vulnerable));
+        }
+        for patched in [
+            0x3050_0080,
+            0x3050_0090,
+            0x3060_0040,
+            0x3060_0050,
+            0x3070_0000,
+            0x4000_0000,
+        ] {
+            assert!(supported_openssl(patched));
+        }
+        assert!(supported_openssl(openssl::version::number() as u64));
+    }
+
+    #[test]
+    fn remote_control_requires_explicit_security_exceptions() {
+        for address in ["0.0.0.0:9100", "[::]:9100", "192.0.2.1:9100"] {
+            let mut config = Config {
+                listen: vec!["127.0.0.1:9100".parse().unwrap(), address.parse().unwrap()],
+                ..Config::default()
+            };
+            assert!(
+                config
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("requires TLS")
+            );
+            config.allow_plaintext_control = true;
+            assert!(
+                config
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("requires auth_hmac")
+            );
+            config.allow_unauthenticated_control = true;
+            config.validate().unwrap();
+        }
+        let config = Config {
+            listen: vec!["[::1]:9100".parse().unwrap()],
+            ..Config::default()
+        };
+        config.validate().unwrap();
+    }
 
     #[test]
     fn test_cli_help_includes_build_version() {
@@ -527,7 +671,7 @@ mod tests {
         let config = Config::default();
         assert_eq!(
             config.listen,
-            vec!["0.0.0.0:9100".parse::<SocketAddr>().unwrap()]
+            vec!["127.0.0.1:9100".parse::<SocketAddr>().unwrap()]
         );
         assert_eq!(config.media_ip, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]);
         assert_eq!(config.rtp_port_range, (30000, 39999));
@@ -573,7 +717,7 @@ mod tests {
         // Everything else defaults
         assert_eq!(
             config.listen,
-            vec!["0.0.0.0:9100".parse::<SocketAddr>().unwrap()]
+            vec!["127.0.0.1:9100".parse::<SocketAddr>().unwrap()]
         );
         assert_eq!(config.rtp_port_range, (30000, 39999));
         assert_eq!(config.max_sessions, 10000);
@@ -704,7 +848,7 @@ mod tests {
         std::fs::write(&tmp, toml_content).unwrap();
 
         let cli = Cli {
-            listen: vec!["0.0.0.0:9100".parse().unwrap()],
+            listen: vec!["127.0.0.1:9100".parse().unwrap()],
             media_ip: None,
             config: Some(tmp.clone()),
             log_level: "info".to_string(),
@@ -1022,5 +1166,48 @@ mod tests {
             "unexpected error: {}",
             err
         );
+    }
+
+    #[test]
+    fn media_capacity_is_finite_and_covers_active_encoders() {
+        for limit in [0, 65537] {
+            let config = Config {
+                max_sessions: limit,
+                ..Config::default()
+            };
+            assert!(
+                config
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("max_sessions")
+            );
+        }
+        for limit in [0, 129] {
+            let config = Config {
+                max_endpoints_per_session: limit,
+                ..Config::default()
+            };
+            assert!(
+                config
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("max_endpoints")
+            );
+        }
+        let mut config = Config {
+            max_endpoints_per_session: 65,
+            ..Config::default()
+        };
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("transcode_cache_size")
+        );
+        config.transcode_cache_size = 65;
+        config.validate().unwrap();
     }
 }

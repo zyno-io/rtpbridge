@@ -529,7 +529,7 @@ fn test_parse_sdp_duplicate_codec_definitions() {
 
 #[test]
 fn test_parse_sdp_two_audio_m_lines() {
-    // One endpoint selects the first active m=audio section.
+    // Two active m=audio lines cannot be represented by one RTP endpoint.
     let sdp = "v=0\r\n\
         o=- 600 1 IN IP4 10.0.0.1\r\n\
         s=-\r\n\
@@ -543,12 +543,13 @@ fn test_parse_sdp_two_audio_m_lines() {
         a=sendrecv\r\n";
 
     let parsed = parse_sdp(sdp);
-    // Preserve the first section and ignore attributes from the second.
+    // Preserve the first section for diagnostics, but reject the transport.
     let has_pcmu = parsed.codecs.iter().any(|c| c.name == "PCMU");
     let has_g722 = parsed.codecs.iter().any(|c| c.name == "G722");
     assert!(has_pcmu, "should have PCMU from first m=audio line");
     assert!(!has_g722, "should not merge G722 from second m=audio line");
-    assert_eq!(parsed.remote_addr.unwrap().port(), 30000);
+    assert_eq!(parsed.audio_sections, 2);
+    assert!(parsed.validate_plain_transport().is_err());
 }
 
 #[test]
@@ -619,10 +620,12 @@ fn test_parse_sdp_port_zero_rejected() {
         parsed.remote_addr.is_none(),
         "port 0 should result in no remote_addr (stream rejected)"
     );
+    assert_eq!(parsed.audio_sections, 0, "a rejected section is not active");
     assert!(
         parsed.codecs.is_empty(),
         "codecs from a rejected section should be ignored"
     );
+    assert!(parsed.validate_plain_transport().is_err());
 }
 
 #[test]
@@ -638,14 +641,20 @@ fn test_rejected_audio_section_does_not_overwrite_active_session_level_connectio
         a=rtpmap:9 G722/8000\r\n\
         a=rtpmap:101 telephone-event/8000\r\n\
         a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\n\
+        a=rtcp:17827 IN IP4 135.148.37.93\r\n\
         a=sendrecv\r\n\
         m=audio 0 RTP/AVP 19\r\n\
         a=rtpmap:19 CN/8000\r\n";
 
     let parsed = parse_sdp(sdp);
+    assert_eq!(parsed.audio_sections, 1);
     assert_eq!(
         parsed.remote_addr,
         Some("135.148.37.93:17826".parse().unwrap())
+    );
+    assert_eq!(
+        parsed.remote_rtcp_addr,
+        Some("135.148.37.93:17827".parse().unwrap())
     );
     assert_eq!(parsed.media_protocol.as_deref(), Some("RTP/SAVP"));
     assert_eq!(
@@ -656,5 +665,7 @@ fn test_rejected_audio_section_does_not_overwrite_active_session_level_connectio
             .collect::<Vec<_>>(),
         vec!["G722", "telephone-event"]
     );
-    assert!(parsed.crypto.is_some());
+    parsed
+        .validate_plain_transport()
+        .expect("the active FreeSWITCH audio section should remain usable");
 }

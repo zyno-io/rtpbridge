@@ -235,6 +235,19 @@ fn test_reordered_packets_no_spurious_loss() {
 }
 
 #[test]
+fn reordered_previous_cycle_packet_does_not_inflate_loss() {
+    let mut stats = RtcpStats::new();
+    for (index, seq) in [65534u16, 0, 65535, 1].into_iter().enumerate() {
+        stats.record_received(1, seq, index as u32 * 160, 160, 8000);
+    }
+    assert_eq!(stats.expected_packets(), 4);
+    assert_eq!(stats.packets_received, 4);
+    assert_eq!(stats.highest_seq(), 65537);
+    assert_eq!(stats.cumulative_lost(), 0);
+    assert_eq!(stats.fraction_lost_and_update(), 0);
+}
+
+#[test]
 fn test_sequence_wraparound() {
     let mut stats = RtcpStats::new();
     // Start near wraparound
@@ -616,16 +629,14 @@ fn test_fraction_lost_large_interval_no_overflow() {
     // After 512 rollovers: extended_max_seq ≈ 512 * 65536 = 33_554_432 (> 2^24)
     // We only receive a few packets so most are "lost".
     //
-    // Drive this through the public API by recording a seq that forces rollovers.
-    // record_received detects rollover when (max_seq_lo - seq32) > 0x8000.
-    // We simulate this by alternating near-end and near-start seqs.
+    // Each forward step stays below half the sequence space so it is not
+    // ambiguous with an old packet reordered from the previous cycle.
     let mut ts = 160u32;
     for _ in 0..512 {
-        // Jump to near-end of seq space to trigger rollover detection
-        stats.record_received(0x1111_1111u32, 65535, ts, 160, 8000);
-        ts = ts.wrapping_add(160);
-        stats.record_received(0x1111_1111u32, 0, ts, 160, 8000);
-        ts = ts.wrapping_add(160);
+        for seq in [21845, 43690, 65535, 0] {
+            stats.record_received(0x1111_1111u32, seq, ts, 160, 8000);
+            ts = ts.wrapping_add(160);
+        }
     }
     // extended_max_seq should now be very large (512 rollovers * 65536 + some)
     let expected = stats.expected_packets();
@@ -635,7 +646,7 @@ fn test_fraction_lost_large_interval_no_overflow() {
         expected
     );
 
-    // Fraction lost should be very high (we only received 1025 packets out of millions)
+    // Fraction lost should be very high (we only received 2049 packets out of millions)
     // and must not panic from overflow
     let frac = stats.fraction_lost_and_update();
     assert!(
@@ -643,6 +654,23 @@ fn test_fraction_lost_large_interval_no_overflow() {
         "massive loss should produce fraction_lost >= 250, got {}",
         frac
     );
+}
+
+#[test]
+fn jitter_handles_rtp_timestamp_rollover() {
+    for rate in [8000, 48000] {
+        let step = rate / 50;
+        let mut stats = RtcpStats::new();
+        stats.record_received(1, 0, u32::MAX - step + 1, 160, rate);
+        stats.record_received(1, 1, 0, 160, rate);
+        // Back-to-back delivery of two 20 ms packets contributes about 1.25 ms
+        // of smoothed jitter. Wrapping the RTP counter is not a multi-hour gap.
+        assert!(
+            stats.jitter < 10_000,
+            "rollover inflated jitter: {}",
+            stats.jitter
+        );
+    }
 }
 
 #[test]

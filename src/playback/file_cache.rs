@@ -1,44 +1,164 @@
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use tokio::sync::{Mutex, Semaphore, broadcast};
-use tracing::{debug, info, warn};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
+use tokio_util::sync::CancellationToken;
 
-/// Manages a cache of downloaded URL files with atime-based TTL.
+use super::download_policy::DownloadPolicy;
+
+#[derive(Clone)]
 pub struct FileCache {
     cache_dir: PathBuf,
+    directory_lock: Arc<std::fs::File>,
     state: Arc<Mutex<CacheState>>,
-    /// Maximum number of cached entries. 0 = unlimited.
     max_entries: usize,
-    /// Limits concurrent HTTP downloads to prevent file descriptor exhaustion.
+    max_inflight: usize,
     download_semaphore: Arc<Semaphore>,
-    /// Maximum file download size in bytes.
+    owners: Arc<Semaphore>,
     max_download_bytes: u64,
-    /// Reusable HTTP client for connection pooling across downloads.
-    http_client: reqwest::Client,
+    max_cache_bytes: u64,
+    disk_bytes: Arc<AtomicU64>,
+    policy: DownloadPolicy,
 }
 
+#[derive(Default)]
 struct CacheState {
-    /// URL hash → cache entry
     entries: HashMap<String, CacheEntry>,
-    /// In-flight downloads: URL hash → broadcast sender that signals completion.
-    /// Concurrent requests for the same URL await the broadcast instead of downloading again.
-    inflight: HashMap<String, broadcast::Sender<Result<PathBuf, String>>>,
+    inflight: HashMap<String, Arc<Pending>>,
+    garbage: Vec<Arc<CachedFile>>,
 }
 
 struct CacheEntry {
+    file: Arc<CachedFile>,
+    expires_at: Instant,
+}
+
+#[derive(Debug)]
+struct DiskReservation {
+    _directory_lock: Arc<std::fs::File>,
+    total: Arc<AtomicU64>,
+    bytes: AtomicU64,
+}
+impl DiskReservation {
+    fn shrink(&self, bytes: u64) {
+        let previous = self.bytes.swap(bytes, Ordering::AcqRel);
+        self.total.fetch_sub(previous - bytes, Ordering::AcqRel);
+    }
+}
+impl Drop for DiskReservation {
+    fn drop(&mut self) {
+        self.total
+            .fetch_sub(self.bytes.load(Ordering::Relaxed), Ordering::AcqRel);
+    }
+}
+
+#[derive(Debug)]
+struct CachedFile {
     path: PathBuf,
-    /// When this entry should expire (if no references)
-    expires_at: std::time::Instant,
-    /// Number of active references (playback endpoints using this file)
-    ref_count: u32,
+    key: String,
+    reservation: Arc<DiskReservation>,
+}
+
+/// Ownership of an exact cache-file instance, independent of URL/header recomputation.
+#[derive(Debug, Clone)]
+pub struct CacheLease(Arc<CachedFile>);
+impl CacheLease {
+    pub fn key(&self) -> &str {
+        &self.0.key
+    }
+}
+impl std::ops::Deref for CacheLease {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0.path
+    }
+}
+impl AsRef<Path> for CacheLease {
+    fn as_ref(&self) -> &Path {
+        &self.0.path
+    }
+}
+
+struct Pending {
+    result: watch::Sender<Option<Result<CacheLease, String>>>,
+    cancel: CancellationToken,
+    owners: AtomicUsize,
+}
+
+/// Admitted before any per-owner task is spawned. Dropping the last owner cancels work.
+pub struct DownloadRequest {
+    pending: Option<Arc<Pending>>,
+    receiver: Option<watch::Receiver<Option<Result<CacheLease, String>>>>,
+    ready: Option<CacheLease>,
+    deadline: tokio::time::Instant,
+    _permit: OwnedSemaphorePermit,
+}
+impl Drop for DownloadRequest {
+    fn drop(&mut self) {
+        if let Some(pending) = &self.pending
+            && pending.owners.fetch_sub(1, Ordering::AcqRel) == 1
+        {
+            pending.cancel.cancel();
+        }
+    }
+}
+impl DownloadRequest {
+    pub async fn wait(mut self) -> anyhow::Result<CacheLease> {
+        if let Some(ready) = self.ready.take() {
+            return Ok(ready);
+        }
+        let receiver = self
+            .receiver
+            .as_mut()
+            .expect("pending request has a receiver");
+        let result = tokio::time::timeout_at(self.deadline, async {
+            loop {
+                let result = receiver.borrow_and_update().clone();
+                if let Some(result) = result {
+                    return result.map_err(anyhow::Error::msg);
+                }
+                let changed = receiver.changed().await;
+                changed.map_err(|_| anyhow::anyhow!("download worker ended"))?;
+            }
+        })
+        .await;
+        result.map_err(|_| anyhow::anyhow!("Download timeout including queue time"))?
+    }
+}
+
+/// Cleanup bookkeeping is synchronous; actual deletion runs on bounded workers.
+struct DownloadGuard {
+    state: Arc<Mutex<CacheState>>,
+    key: String,
+    pending: Arc<Pending>,
+    unpublished: Vec<Arc<CachedFile>>,
+}
+impl Drop for DownloadGuard {
+    fn drop(&mut self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state
+            .inflight
+            .get(&self.key)
+            .is_some_and(|entry| Arc::ptr_eq(entry, &self.pending))
+        {
+            state.inflight.remove(&self.key);
+        }
+        state.garbage.append(&mut self.unpublished);
+        let unfinished = self.pending.result.borrow().is_none();
+        if unfinished {
+            self.pending
+                .result
+                .send_replace(Some(Err("download cancelled".into())));
+        }
+    }
 }
 
 impl FileCache {
-    /// Convenience constructor with default options (1000 entries, 16 concurrent, 100MB max).
-    #[allow(dead_code)]
+    #[allow(dead_code)] // convenience constructor for embedding
     pub fn new(cache_dir: PathBuf) -> anyhow::Result<Self> {
         Self::with_options(cache_dir, 1000, 16, 100 * 1024 * 1024)
     }
@@ -49,272 +169,345 @@ impl FileCache {
         max_concurrent_downloads: usize,
         max_download_bytes: u64,
     ) -> anyhow::Result<Self> {
-        // Create cache dir if it doesn't exist — fail loudly so callers
-        // get a clear error instead of confusing download failures later.
-        std::fs::create_dir_all(&cache_dir).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to create cache directory '{}': {e}",
-                cache_dir.display()
-            )
-        })?;
-
-        // Clean up orphaned files from previous runs (crash recovery).
-        // Only removes regular files; subdirectories are left untouched.
-        if let Ok(entries) = std::fs::read_dir(&cache_dir) {
-            for entry in entries.flatten() {
-                if entry.path().is_file() {
-                    let _ = std::fs::remove_file(entry.path());
-                }
+        if max_entries == 0 || max_concurrent_downloads == 0 || max_download_bytes == 0 {
+            anyhow::bail!("file cache limits must be nonzero");
+        }
+        std::fs::create_dir_all(&cache_dir)?;
+        let directory_lock = Arc::new(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(cache_dir.join(".rtpbridge.lock"))?,
+        );
+        directory_lock
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("cache directory is already in use"))?;
+        // Recover only files exclusively named by this implementation.
+        for entry in std::fs::read_dir(&cache_dir)? {
+            let entry = entry?;
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("rtpbridge-cache-")
+                && entry.file_type()?.is_file()
+            {
+                // Do not start with unaccounted cache bytes if recovery fails.
+                std::fs::remove_file(entry.path())?;
             }
         }
-
         Ok(Self {
             cache_dir,
-            state: Arc::new(Mutex::new(CacheState {
-                entries: HashMap::new(),
-                inflight: HashMap::new(),
-            })),
+            directory_lock,
+            state: Arc::new(Mutex::new(CacheState::default())),
             max_entries,
+            max_inflight: 64,
             download_semaphore: Arc::new(Semaphore::new(max_concurrent_downloads)),
+            owners: Arc::new(Semaphore::new(256)),
             max_download_bytes,
-            http_client: reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .redirect(reqwest::redirect::Policy::limited(5))
-                .build()
-                .map_err(|e| anyhow::anyhow!("Failed to build HTTP client: {e}"))?,
+            max_cache_bytes: (1024 * 1024 * 1024).max(max_download_bytes),
+            disk_bytes: Arc::new(AtomicU64::new(0)),
+            policy: DownloadPolicy::default(),
         })
     }
 
-    /// Get a cached file path for a URL, downloading if necessary.
-    /// Returns the local file path.
-    ///
-    /// Optional `headers` are sent with the HTTP request and included in the
-    /// cache key so that requests with different credentials are cached separately.
+    #[allow(dead_code)] // explicit policy for embedded/test servers
+    pub fn with_policy(mut self, policy: DownloadPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    pub fn from_config(config: &crate::config::Config) -> anyhow::Result<Self> {
+        let mut cache = Self::with_options(
+            config.cache_dir.clone(),
+            config.max_cache_entries,
+            config.max_concurrent_downloads,
+            config.max_file_download_bytes,
+        )?;
+        cache.max_cache_bytes = config.max_cache_bytes;
+        cache.max_inflight = config.max_pending_downloads;
+        cache.owners = Arc::new(Semaphore::new(config.max_download_owners));
+        cache.policy = DownloadPolicy::new(
+            &config.file_download_origins,
+            config.file_download_networks.clone(),
+        )?;
+        Ok(cache)
+    }
+
+    pub fn start_download(
+        &self,
+        url: &str,
+        cache_ttl_secs: u32,
+        timeout_ms: u32,
+        headers: Option<&HashMap<String, String>>,
+    ) -> anyhow::Result<DownloadRequest> {
+        self.policy.validate(url)?;
+        if timeout_ms == 0 || timeout_ms > 60_000 {
+            anyhow::bail!("download timeout must be 1..60000 ms");
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(u64::from(timeout_ms));
+        let permit = Arc::clone(&self.owners)
+            .try_acquire_owned()
+            .map_err(|_| anyhow::anyhow!("DOWNLOAD_BUSY"))?;
+        let key = cache_key_hash(url, headers);
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = state.entries.get_mut(&key) {
+            entry.expires_at = Instant::now() + Duration::from_secs(u64::from(cache_ttl_secs));
+            return Ok(DownloadRequest {
+                ready: Some(CacheLease(Arc::clone(&entry.file))),
+                pending: None,
+                receiver: None,
+                deadline,
+                _permit: permit,
+            });
+        }
+        if let Some(pending) = state.inflight.get(&key)
+            && !pending.cancel.is_cancelled()
+        {
+            pending.owners.fetch_add(1, Ordering::AcqRel);
+            return Ok(DownloadRequest {
+                ready: None,
+                pending: Some(Arc::clone(pending)),
+                receiver: Some(pending.result.subscribe()),
+                deadline,
+                _permit: permit,
+            });
+        }
+        // A cancelled instance must finish cleanup before the same key is reused.
+        if state.inflight.contains_key(&key)
+            || state.inflight.len() >= self.max_inflight
+            || state.entries.len() + state.inflight.len() + state.garbage.len() >= self.max_entries
+        {
+            anyhow::bail!("DOWNLOAD_BUSY");
+        }
+        let (result, receiver) = watch::channel(None);
+        let pending = Arc::new(Pending {
+            result,
+            cancel: CancellationToken::new(),
+            owners: AtomicUsize::new(1),
+        });
+        state.inflight.insert(key.clone(), Arc::clone(&pending));
+        drop(state);
+        let request = DownloadRequest {
+            pending: Some(Arc::clone(&pending)),
+            receiver: Some(receiver),
+            ready: None,
+            deadline,
+            _permit: permit,
+        };
+        let cache = self.clone();
+        let url = url.to_string();
+        let headers = headers.cloned();
+        let guard = DownloadGuard {
+            state: Arc::clone(&self.state),
+            key,
+            pending,
+            unpublished: Vec::new(),
+        };
+        tokio::spawn(async move {
+            cache.download(guard, url, headers, cache_ttl_secs).await;
+        });
+        Ok(request)
+    }
+
+    #[allow(dead_code)] // convenience API; sessions reserve before spawning
     pub async fn get_or_download(
         &self,
         url: &str,
         cache_ttl_secs: u32,
         timeout_ms: u32,
-        headers: Option<&std::collections::HashMap<String, String>>,
-    ) -> anyhow::Result<PathBuf> {
-        let key = cache_key_hash(url, headers);
+        headers: Option<&HashMap<String, String>>,
+    ) -> anyhow::Result<CacheLease> {
+        let request = self.start_download(url, cache_ttl_secs, timeout_ms, headers)?;
+        request.wait().await
+    }
 
-        // Check if already cached or in-flight
-        let maybe_rx = {
-            let mut state = self.state.lock().await;
-            if let Some(entry) = state.entries.get_mut(&key) {
-                entry.ref_count += 1;
-                entry.expires_at =
-                    std::time::Instant::now() + Duration::from_secs(cache_ttl_secs as u64);
-                return Ok(entry.path.clone());
-            }
-            // Check for in-flight download
-            if let Some(tx) = state.inflight.get(&key) {
-                Some(tx.subscribe())
-            } else {
-                // Register ourselves as the downloader
-                let (tx, _) = broadcast::channel(4);
-                state.inflight.insert(key.clone(), tx);
-                None
+    fn reserve_disk(&self) -> anyhow::Result<Arc<DiskReservation>> {
+        self.disk_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |bytes| {
+                bytes
+                    .checked_add(self.max_download_bytes)
+                    .filter(|next| *next <= self.max_cache_bytes)
+            })
+            .map_err(|_| anyhow::anyhow!("CACHE_FULL"))?;
+        Ok(Arc::new(DiskReservation {
+            _directory_lock: Arc::clone(&self.directory_lock),
+            total: Arc::clone(&self.disk_bytes),
+            bytes: AtomicU64::new(self.max_download_bytes),
+        }))
+    }
+
+    async fn download(
+        &self,
+        mut guard: DownloadGuard,
+        url: String,
+        headers: Option<HashMap<String, String>>,
+        ttl: u32,
+    ) {
+        let cancel = guard.pending.cancel.clone();
+        let result = tokio::select! {
+            _ = cancel.cancelled() => Err(anyhow::anyhow!("download cancelled")),
+            result = tokio::time::timeout(Duration::from_secs(60), self.download_file(&mut guard, &url, headers.as_ref())) => {
+                result.unwrap_or_else(|_| Err(anyhow::anyhow!("Download timeout including queue time")))
             }
         };
-
-        // If another task is already downloading, wait for it
-        if let Some(mut rx) = maybe_rx {
-            return match rx.recv().await {
-                Ok(Ok(path)) => {
-                    let mut state = self.state.lock().await;
-                    if let Some(entry) = state.entries.get_mut(&key) {
-                        entry.ref_count += 1;
-                    } else {
-                        // Entry was evicted between broadcast and our lock acquisition.
-                        // Re-insert so the file is tracked and won't be cleaned up under us.
-                        state.entries.insert(
-                            key,
-                            CacheEntry {
-                                path: path.clone(),
-                                expires_at: std::time::Instant::now()
-                                    + Duration::from_secs(cache_ttl_secs as u64),
-                                ref_count: 1,
-                            },
-                        );
-                    }
-                    Ok(path)
+        match result {
+            Ok(file) => {
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                if !cancel.is_cancelled() {
+                    state.entries.insert(
+                        guard.key.clone(),
+                        CacheEntry {
+                            file: Arc::clone(&file),
+                            expires_at: Instant::now() + Duration::from_secs(u64::from(ttl)),
+                        },
+                    );
+                    guard.unpublished.clear();
+                    guard
+                        .pending
+                        .result
+                        .send_replace(Some(Ok(CacheLease(file))));
                 }
-                Ok(Err(e)) => Err(anyhow::anyhow!("{e}")),
-                Err(_) => Err(anyhow::anyhow!("Download notification channel closed")),
-            };
+            }
+            Err(error) => {
+                guard
+                    .pending
+                    .result
+                    .send_replace(Some(Err(error.to_string())));
+            }
         }
+        drop(guard);
+        self.cleanup().await;
+    }
 
-        // We are the downloader — acquire semaphore to limit concurrency
-        let _permit = match self.download_semaphore.acquire().await {
-            Ok(permit) => permit,
-            Err(_) => {
-                // Clean up inflight entry so future requests don't hang
-                let mut state = self.state.lock().await;
-                state.inflight.remove(&key);
-                return Err(anyhow::anyhow!("Download semaphore closed"));
-            }
-        };
-
-        let ext = url_extension(url);
-        let filename = format!("{key}{ext}");
-        let path = self.cache_dir.join(&filename);
-
-        info!(url = url, path = %path.display(), "downloading file to cache");
-
-        // Wrap the entire download (connect + headers + body) in a single timeout
-        // to prevent slow/dribbling servers from blocking indefinitely.
-        let max_dl_bytes = self.max_download_bytes;
-        let timeout = Duration::from_millis(timeout_ms as u64);
-        let headers = headers.cloned();
-        let result = tokio::time::timeout(timeout, async {
-            let mut request = self.http_client.get(url);
-            if let Some(ref hdrs) = headers {
-                for (name, value) in hdrs {
-                    request = request.header(name, value);
-                }
-            }
-            let mut response = request
-                .send()
-                .await
-                .map_err(|e| anyhow::anyhow!("Download failed: {e}"))?;
-
-            if !response.status().is_success() {
-                anyhow::bail!("Download failed with status {}", response.status());
-            }
-
-            // Check content length if available
-            let max_size = max_dl_bytes;
-            if let Some(len) = response.content_length()
-                && len > max_size
-            {
-                anyhow::bail!("File too large: {len} bytes (max {max_size})");
-            }
-
-            // Stream the body with a size limit to prevent OOM when Content-Length is absent.
-            // Pre-allocate using Content-Length when available (capped to max_size).
-            let initial_capacity = response
-                .content_length()
-                .map(|len| len.min(max_size) as usize)
-                .unwrap_or(0);
-            let mut body_bytes = Vec::with_capacity(initial_capacity);
-            while let Some(chunk) = response
-                .chunk()
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to read response body: {e}"))?
-            {
-                body_bytes.extend_from_slice(&chunk);
-                if body_bytes.len() as u64 > max_size {
-                    anyhow::bail!("Downloaded file too large (max {max_size} bytes)");
-                }
-            }
-
-            tokio::fs::write(&path, &body_bytes).await?;
-            Ok(path.clone())
+    async fn download_file(
+        &self,
+        guard: &mut DownloadGuard,
+        url: &str,
+        headers: Option<&HashMap<String, String>>,
+    ) -> anyhow::Result<Arc<CachedFile>> {
+        let acquired = self.download_semaphore.acquire().await;
+        let _active = acquired.map_err(|_| anyhow::anyhow!("download service stopped"))?;
+        let reservation = self.reserve_disk()?;
+        let path = self.cache_dir.join(format!(
+            "rtpbridge-cache-{}{}",
+            uuid::Uuid::new_v4(),
+            url_extension(url)
+        ));
+        let cached = Arc::new(CachedFile {
+            path: path.clone(),
+            key: guard.key.clone(),
+            reservation,
+        });
+        let temporary = Arc::new(CachedFile {
+            path: path.with_extension("part"),
+            key: guard.key.clone(),
+            reservation: Arc::clone(&cached.reservation),
+        });
+        guard.unpublished = vec![Arc::clone(&temporary), Arc::clone(&cached)];
+        let held = Arc::clone(&temporary);
+        let opened = crate::storage::run(move || {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&held.path)?;
+            Ok(file)
         })
-        .await
-        .unwrap_or_else(|_| Err(anyhow::anyhow!("Download timeout after {timeout_ms}ms")));
-
-        // Clean up orphaned file on failure: if the download wrote a file but
-        // then timed out or failed after writing, delete it so it doesn't
-        // accumulate outside the cache's tracking.
-        if result.is_err() {
-            let _ = tokio::fs::remove_file(&path).await;
-        }
-
-        // Notify waiters and clean up inflight entry
+        .await;
+        let mut file = opened?;
+        let received = self.policy.response(url, headers).await;
+        let mut response = received?;
+        if response
+            .content_length()
+            .is_some_and(|bytes| bytes > self.max_download_bytes)
         {
-            let mut state = self.state.lock().await;
-            if let Some(tx) = state.inflight.remove(&key) {
-                let _ = tx.send(
-                    result
-                        .as_ref()
-                        .map(|p| p.clone())
-                        .map_err(|e| e.to_string()),
-                );
-            }
-            if let Ok(ref p) = result {
-                state.entries.insert(
-                    key,
-                    CacheEntry {
-                        path: p.clone(),
-                        expires_at: std::time::Instant::now()
-                            + Duration::from_secs(cache_ttl_secs as u64),
-                        ref_count: 1,
-                    },
-                );
-            }
+            anyhow::bail!("File too large");
         }
-
-        result
+        let mut bytes = 0u64;
+        loop {
+            let received = response.chunk().await;
+            let Some(chunk) =
+                received.map_err(|_| anyhow::anyhow!("failed to read playback body"))?
+            else {
+                break;
+            };
+            bytes = bytes
+                .checked_add(chunk.len() as u64)
+                .filter(|bytes| *bytes <= self.max_download_bytes)
+                .ok_or_else(|| anyhow::anyhow!("Downloaded file too large"))?;
+            let held = Arc::clone(&temporary);
+            let written = crate::storage::run(move || {
+                let _held = held; // retain the disk reservation through a cancelled/stalled write
+                file.write_all(&chunk)?;
+                Ok(file)
+            })
+            .await;
+            file = written?;
+        }
+        let held = Arc::clone(&temporary);
+        let flushed = crate::storage::run(move || {
+            let _held = held;
+            file.flush()?;
+            Ok(())
+        })
+        .await;
+        flushed?;
+        let from = Arc::clone(&temporary);
+        let to = Arc::clone(&cached);
+        let published = crate::storage::run(move || {
+            std::fs::rename(&from.path, &to.path)?;
+            Ok(())
+        })
+        .await;
+        published?;
+        cached.reservation.shrink(bytes);
+        Ok(cached)
     }
 
-    /// Release a reference to a cached file
-    pub async fn release(&self, url: &str) {
-        let key = url_hash(url);
-        let mut state = self.state.lock().await;
-        if let Some(entry) = state.entries.get_mut(&key) {
-            entry.ref_count = entry.ref_count.saturating_sub(1);
-        }
-    }
-
-    /// Run cleanup: remove expired entries with no active references.
-    /// Also evicts oldest unreferenced entries if the cache exceeds max_entries.
-    /// Call this periodically (e.g., every 5 minutes).
     pub async fn cleanup(&self) {
-        // Collect paths to delete while holding the lock, then delete outside it
-        // to avoid blocking get_or_download/release during slow filesystem I/O.
-        let paths_to_delete = {
-            let now = std::time::Instant::now();
-            let mut state = self.state.lock().await;
-            let mut paths = Vec::new();
-
-            // Remove expired entries
-            let expired: Vec<String> = state
+        let garbage = {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let now = Instant::now();
+            let keys: Vec<_> = state
                 .entries
                 .iter()
-                .filter(|(_, e)| e.ref_count == 0 && e.expires_at <= now)
-                .map(|(k, _)| k.clone())
+                .filter(|(_, entry)| entry.expires_at <= now && Arc::strong_count(&entry.file) == 1)
+                .map(|(key, _)| key.clone())
                 .collect();
-
-            for key in expired {
+            for key in keys {
                 if let Some(entry) = state.entries.remove(&key) {
-                    debug!(path = %entry.path.display(), "removing expired cache entry");
-                    paths.push(entry.path);
+                    state.garbage.push(entry.file);
                 }
             }
-
-            // Evict oldest unreferenced entries if over max size
-            if self.max_entries > 0 && state.entries.len() > self.max_entries {
-                let mut evictable: Vec<(String, std::time::Instant)> = state
-                    .entries
-                    .iter()
-                    .filter(|(_, e)| e.ref_count == 0)
-                    .map(|(k, e)| (k.clone(), e.expires_at))
-                    .collect();
-                evictable.sort_by_key(|(_, exp)| *exp);
-
-                let to_evict = state.entries.len() - self.max_entries;
-                for (key, _) in evictable.into_iter().take(to_evict) {
-                    if let Some(entry) = state.entries.remove(&key) {
-                        debug!(path = %entry.path.display(), "evicting cache entry (over max size)");
-                        paths.push(entry.path);
-                    }
-                }
-            }
-
-            paths
-        }; // lock dropped here
-
-        for path in paths_to_delete {
-            if let Err(e) = tokio::fs::remove_file(&path).await {
-                warn!(path = %path.display(), error = %e, "failed to remove cache file");
+            // Keep every file accounted until deletion is confirmed. Cloning
+            // claims prevents concurrent cleanup from selecting the same file;
+            // cancelling this future only drops claims, never cache ownership.
+            state
+                .garbage
+                .iter()
+                .filter(|file| Arc::strong_count(file) == 1)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for file in garbage {
+            let held = Arc::clone(&file);
+            let removed = crate::storage::run(move || match std::fs::remove_file(&held.path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error.into()),
+            })
+            .await;
+            if removed.is_ok() {
+                self.state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .garbage
+                    .retain(|entry| !Arc::ptr_eq(entry, &file));
             }
         }
     }
 
-    /// Start a background cleanup task that stops on shutdown.
     pub fn start_cleanup_task(
         self: &Arc<Self>,
         interval_secs: u64,
@@ -326,18 +519,42 @@ impl FileCache {
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        cache.cleanup().await;
+                        tokio::select! {
+                            _ = cache.cleanup() => {},
+                            _ = shutdown.wait_for_shutdown() => break,
+                        }
                     }
-                    _ = shutdown.wait_for_shutdown() => {
-                        debug!("file cache cleanup task stopping due to shutdown");
-                        break;
-                    }
+                    _ = shutdown.wait_for_shutdown() => break,
                 }
             }
+            for pending in cache
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .inflight
+                .values()
+            {
+                pending.cancel.cancel();
+            }
+            let cleanup = async {
+                loop {
+                    let done = cache
+                        .state
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .inflight
+                        .is_empty();
+                    cache.cleanup().await;
+                    if done {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            };
+            let _ = tokio::time::timeout(Duration::from_secs(2), cleanup).await;
         })
     }
 }
-
 /// Check if a source string is a URL (vs local file path)
 pub fn is_url(source: &str) -> bool {
     source.starts_with("http://") || source.starts_with("https://")
@@ -349,9 +566,7 @@ pub fn cache_key(url: &str) -> String {
 }
 
 fn url_hash(url: &str) -> String {
-    use sha1::Digest;
-    let hash = sha1::Sha1::digest(url.as_bytes());
-    hex_lower(&hash)
+    cache_key_hash(url, None)
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -370,17 +585,19 @@ fn cache_key_hash(
     url: &str,
     headers: Option<&std::collections::HashMap<String, String>>,
 ) -> String {
-    use sha1::Digest;
-    let mut hasher = sha1::Sha1::new();
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update((url.len() as u64).to_be_bytes());
     hasher.update(url.as_bytes());
+    hasher.update((headers.map_or(0, |headers| headers.len()) as u64).to_be_bytes());
     if let Some(hdrs) = headers {
         // Sort keys for deterministic hashing
         let mut pairs: Vec<_> = hdrs.iter().collect();
         pairs.sort_by_key(|(k, _)| *k);
         for (k, v) in pairs {
-            hasher.update(b"\x00");
+            hasher.update((k.len() as u64).to_be_bytes());
             hasher.update(k.as_bytes());
-            hasher.update(b"\x00");
+            hasher.update((v.len() as u64).to_be_bytes());
             hasher.update(v.as_bytes());
         }
     }
@@ -393,6 +610,12 @@ fn url_extension(url: &str) -> String {
     Path::new(path)
         .extension()
         .and_then(|e| e.to_str())
+        .filter(|e| {
+            matches!(
+                *e,
+                "wav" | "mp3" | "ogg" | "oga" | "opus" | "flac" | "aiff" | "aif"
+            )
+        })
         .map(|e| format!(".{e}"))
         .unwrap_or_else(|| ".bin".to_string())
 }
@@ -400,6 +623,87 @@ fn url_extension(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_interrupts_a_stalled_periodic_cleanup() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Arc::new(FileCache::new(directory.path().into()).unwrap());
+        let path = directory.path().join("expired.wav");
+        std::fs::write(&path, b"data").unwrap();
+        cache
+            .state
+            .lock()
+            .unwrap()
+            .garbage
+            .push(fake_file(&cache, path.clone()));
+        let blocked = crate::storage::block_workers().await;
+        let shutdown = crate::shutdown::ShutdownCoordinator::new();
+        let cleanup = cache.start_cleanup_task(60, shutdown.clone());
+        tokio::task::yield_now().await;
+        shutdown.initiate_shutdown();
+        let stopped = tokio::time::timeout(Duration::from_secs(3), cleanup).await;
+        let stopped = stopped.expect("periodic cleanup must observe shutdown during storage IO");
+        stopped.unwrap();
+        assert!(path.exists());
+        assert_eq!(cache.state.lock().unwrap().garbage.len(), 1);
+        drop(blocked);
+    }
+
+    #[tokio::test]
+    async fn cancelled_cleanup_keeps_files_and_budgets_tracked() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Arc::new(FileCache::new(directory.path().into()).unwrap());
+        let path = directory.path().join("expired.wav");
+        std::fs::write(&path, b"data").unwrap();
+        let file = fake_file(&cache, path.clone());
+        file.reservation.bytes.store(4, Ordering::Relaxed);
+        cache.disk_bytes.store(4, Ordering::Relaxed);
+        cache.state.lock().unwrap().garbage.push(file);
+
+        let blocked = crate::storage::block_workers().await;
+        let held = Arc::clone(&cache);
+        let cleanup = tokio::spawn(async move { held.cleanup().await });
+        tokio::task::yield_now().await;
+        assert!(!cleanup.is_finished());
+        cleanup.abort();
+        let cancelled = cleanup.await;
+        assert!(cancelled.unwrap_err().is_cancelled());
+        assert!(path.exists());
+        assert_eq!(cache.state.lock().unwrap().garbage.len(), 1);
+        assert_eq!(cache.disk_bytes.load(Ordering::Relaxed), 4);
+
+        drop(blocked);
+        let retried = tokio::time::timeout(Duration::from_secs(2), async {
+            while path.exists() || cache.disk_bytes.load(Ordering::Relaxed) != 0 {
+                cache.cleanup().await;
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        retried.unwrap();
+        assert!(cache.state.lock().unwrap().garbage.is_empty());
+    }
+
+    fn fake_file(cache: &FileCache, path: PathBuf) -> Arc<CachedFile> {
+        Arc::new(CachedFile {
+            path,
+            key: "fixture".into(),
+            reservation: Arc::new(DiskReservation {
+                _directory_lock: Arc::clone(&cache.directory_lock),
+                total: Arc::clone(&cache.disk_bytes),
+                bytes: AtomicU64::new(0),
+            }),
+        })
+    }
+
+    #[test]
+    fn cache_key_fields_have_unambiguous_boundaries() {
+        let headers = HashMap::from([("Authorization".into(), "secret".into())]);
+        assert_ne!(
+            cache_key_hash("https://media.test/file", Some(&headers)),
+            cache_key_hash("https://media.test/file\0Authorization\0secret", None)
+        );
+    }
 
     #[test]
     fn test_is_url() {
@@ -424,7 +728,7 @@ mod tests {
         let h1 = url_hash("https://example.com/test.wav");
         let h2 = url_hash("https://example.com/test.wav");
         assert_eq!(h1, h2);
-        assert_eq!(h1.len(), 40);
+        assert_eq!(h1.len(), 64);
     }
 
     #[test]
@@ -443,7 +747,8 @@ mod tests {
         let request_count = Arc::new(AtomicU32::new(0));
         let count_clone = Arc::clone(&request_count);
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bound = tokio::net::TcpListener::bind("127.0.0.1:0").await;
+        let listener = bound.unwrap();
         let server_addr = listener.local_addr().unwrap();
 
         let server_handle = tokio::spawn(async move {
@@ -470,7 +775,9 @@ mod tests {
 
         let cache_dir = PathBuf::from("/tmp/rtpbridge-cache-test");
         let _ = std::fs::remove_dir_all(&cache_dir);
-        let cache = FileCache::new(cache_dir.clone()).unwrap();
+        let cache = FileCache::new(cache_dir.clone())
+            .unwrap()
+            .with_policy(DownloadPolicy::loopback_only());
         let url = format!("http://{}/test.wav", server_addr);
 
         // Spawn multiple concurrent downloads for the same URL
@@ -515,17 +822,18 @@ mod tests {
         let cache_dir = PathBuf::from("/tmp/rtpbridge-cache-cleanup-missing-test");
         let _ = std::fs::remove_dir_all(&cache_dir);
         std::fs::create_dir_all(&cache_dir).unwrap();
-        let cache = FileCache::new(cache_dir.clone()).unwrap();
+        let cache = FileCache::new(cache_dir.clone())
+            .unwrap()
+            .with_policy(DownloadPolicy::loopback_only());
 
         // Insert an entry pointing to a file that doesn't exist
         {
-            let mut state = cache.state.lock().await;
+            let mut state = cache.state.lock().unwrap();
             state.entries.insert(
                 "ghost_key".to_string(),
                 CacheEntry {
-                    path: cache_dir.join("nonexistent.wav"),
+                    file: fake_file(&cache, cache_dir.join("nonexistent.wav")),
                     expires_at: std::time::Instant::now() - Duration::from_secs(1),
-                    ref_count: 0,
                 },
             );
             // Also insert a valid entry that should survive
@@ -534,9 +842,8 @@ mod tests {
             state.entries.insert(
                 "valid_key".to_string(),
                 CacheEntry {
-                    path: valid_path,
+                    file: fake_file(&cache, valid_path),
                     expires_at: std::time::Instant::now() + Duration::from_secs(3600),
-                    ref_count: 0,
                 },
             );
         }
@@ -544,7 +851,7 @@ mod tests {
         // Cleanup should not panic even though the file is missing
         cache.cleanup().await;
 
-        let state = cache.state.lock().await;
+        let state = cache.state.lock().unwrap();
         assert!(
             state.entries.get("ghost_key").is_none(),
             "expired entry with missing file should be removed"
@@ -573,13 +880,12 @@ mod tests {
             std::fs::write(&fake_path, b"fake audio content").unwrap();
             assert!(fake_path.exists(), "file should exist before cleanup");
 
-            let mut state = cache.state.lock().await;
+            let mut state = cache.state.lock().unwrap();
             state.entries.insert(
                 "expired_key".to_string(),
                 CacheEntry {
-                    path: fake_path.clone(),
+                    file: fake_file(&cache, fake_path.clone()),
                     expires_at: std::time::Instant::now() - Duration::from_secs(60),
-                    ref_count: 0,
                 },
             );
         }
@@ -587,7 +893,7 @@ mod tests {
         cache.cleanup().await;
 
         // Verify the entry is removed from the cache state
-        let state = cache.state.lock().await;
+        let state = cache.state.lock().unwrap();
         assert!(
             state.entries.get("expired_key").is_none(),
             "expired entry should be removed from cache state"
@@ -625,7 +931,7 @@ mod tests {
             "filename should not contain '\\': {filename}"
         );
         // Hash should be a 16-char hex string
-        assert_eq!(hash.len(), 40, "hash should be 40 hex characters");
+        assert_eq!(hash.len(), 64, "hash should be 40 hex characters");
         assert!(
             hash.chars().all(|c| c.is_ascii_hexdigit()),
             "hash should only contain hex digits: {hash}"
@@ -634,7 +940,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_download_http_404() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bound = tokio::net::TcpListener::bind("127.0.0.1:0").await;
+        let listener = bound.unwrap();
         let addr = listener.local_addr().unwrap();
 
         let server = tokio::spawn(async move {
@@ -649,7 +956,9 @@ mod tests {
 
         let cache_dir = PathBuf::from("/tmp/rtpbridge-cache-404-test");
         let _ = std::fs::remove_dir_all(&cache_dir);
-        let cache = FileCache::new(cache_dir.clone()).unwrap();
+        let cache = FileCache::new(cache_dir.clone())
+            .unwrap()
+            .with_policy(DownloadPolicy::loopback_only());
         let url = format!("http://{}/missing.wav", addr);
 
         let result = cache.get_or_download(&url, 60, 5000, None).await;
@@ -665,7 +974,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_download_timeout() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bound = tokio::net::TcpListener::bind("127.0.0.1:0").await;
+        let listener = bound.unwrap();
         let addr = listener.local_addr().unwrap();
 
         // Server accepts but never responds
@@ -679,7 +989,9 @@ mod tests {
 
         let cache_dir = PathBuf::from("/tmp/rtpbridge-cache-timeout-test");
         let _ = std::fs::remove_dir_all(&cache_dir);
-        let cache = FileCache::new(cache_dir.clone()).unwrap();
+        let cache = FileCache::new(cache_dir.clone())
+            .unwrap()
+            .with_policy(DownloadPolicy::loopback_only());
         let url = format!("http://{}/slow.wav", addr);
 
         let result = cache.get_or_download(&url, 60, 500, None).await; // 500ms timeout
@@ -691,7 +1003,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_download_oversized_content_length() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bound = tokio::net::TcpListener::bind("127.0.0.1:0").await;
+        let listener = bound.unwrap();
         let addr = listener.local_addr().unwrap();
 
         let server = tokio::spawn(async move {
@@ -707,7 +1020,9 @@ mod tests {
 
         let cache_dir = PathBuf::from("/tmp/rtpbridge-cache-oversize-test");
         let _ = std::fs::remove_dir_all(&cache_dir);
-        let cache = FileCache::new(cache_dir.clone()).unwrap();
+        let cache = FileCache::new(cache_dir.clone())
+            .unwrap()
+            .with_policy(DownloadPolicy::loopback_only());
         let url = format!("http://{}/huge.wav", addr);
 
         let result = cache.get_or_download(&url, 60, 5000, None).await;
@@ -725,7 +1040,8 @@ mod tests {
     async fn test_concurrent_download_dedup_failure() {
         // When multiple callers request the same URL and the download fails,
         // ALL waiters should receive the error — not hang indefinitely.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bound = tokio::net::TcpListener::bind("127.0.0.1:0").await;
+        let listener = bound.unwrap();
         let server_addr = listener.local_addr().unwrap();
 
         let server = tokio::spawn(async move {
@@ -774,7 +1090,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_download_http_500() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bound = tokio::net::TcpListener::bind("127.0.0.1:0").await;
+        let listener = bound.unwrap();
         let addr = listener.local_addr().unwrap();
 
         let server = tokio::spawn(async move {
@@ -789,7 +1106,9 @@ mod tests {
 
         let cache_dir = PathBuf::from("/tmp/rtpbridge-cache-500-test");
         let _ = std::fs::remove_dir_all(&cache_dir);
-        let cache = FileCache::new(cache_dir.clone()).unwrap();
+        let cache = FileCache::new(cache_dir.clone())
+            .unwrap()
+            .with_policy(DownloadPolicy::loopback_only());
         let url = format!("http://{}/error.wav", addr);
 
         let result = cache.get_or_download(&url, 60, 5000, None).await;
@@ -818,6 +1137,113 @@ mod tests {
             filename.ends_with(".bin"),
             "URL with no extension should get .bin fallback: {filename}"
         );
-        assert_eq!(hash.len(), 40, "hash should be 40 hex characters");
+        assert_eq!(hash.len(), 64, "hash should be 40 hex characters");
+    }
+
+    async fn fixture_server() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let bound = tokio::net::TcpListener::bind("127.0.0.1:0").await;
+        let listener = bound.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&requests);
+        let task = tokio::spawn(async move {
+            loop {
+                let accepted = listener.accept().await;
+                let Ok((mut socket, _)) = accepted else {
+                    break;
+                };
+                count.fetch_add(1, Ordering::Relaxed);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut request = [0; 4096];
+                    let _ = socket.read(&mut request).await;
+                    let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndata").await;
+                });
+            }
+        });
+        (format!("http://{address}/audio.wav"), requests, task)
+    }
+
+    #[tokio::test]
+    async fn leases_release_exact_header_variants_and_do_not_delete_live_files() {
+        let (url, requests, server) = fixture_server().await;
+        let directory = tempfile::tempdir().unwrap();
+        let cache = FileCache::new(directory.path().into())
+            .unwrap()
+            .with_policy(DownloadPolicy::loopback_only());
+        let headers = HashMap::from([("Authorization".into(), "Bearer fixture".into())]);
+        let downloaded = cache.get_or_download(&url, 0, 5000, None).await;
+        let plain = downloaded.unwrap();
+        let downloaded = cache.get_or_download(&url, 0, 5000, Some(&headers)).await;
+        let authenticated = downloaded.unwrap();
+        assert_ne!(plain.key(), authenticated.key());
+        assert_eq!(requests.load(Ordering::Relaxed), 2);
+        let plain_path = plain.to_path_buf();
+        let auth_path = authenticated.to_path_buf();
+        cache.cleanup().await;
+        assert!(plain_path.exists() && auth_path.exists());
+        drop(authenticated);
+        cache.cleanup().await;
+        assert!(plain_path.exists());
+        assert!(!auth_path.exists());
+        drop(plain);
+        cache.cleanup().await;
+        assert!(!plain_path.exists());
+        assert_eq!(cache.disk_bytes.load(Ordering::Acquire), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cancelled_owner_does_not_cancel_a_shared_download() {
+        let (url, requests, server) = fixture_server().await;
+        let directory = tempfile::tempdir().unwrap();
+        let cache = FileCache::new(directory.path().into())
+            .unwrap()
+            .with_policy(DownloadPolicy::loopback_only());
+        let first = cache.start_download(&url, 0, 5000, None).unwrap();
+        let second = cache.start_download(&url, 0, 5000, None).unwrap();
+        drop(first);
+        let completed = second.wait().await;
+        let lease = completed.unwrap();
+        assert!(lease.exists());
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+        drop(lease);
+        cache.cleanup().await;
+        assert_eq!(cache.disk_bytes.load(Ordering::Acquire), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn admission_and_last_owner_cancellation_bound_queued_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut cache = FileCache::new(directory.path().into())
+            .unwrap()
+            .with_policy(DownloadPolicy::loopback_only());
+        cache.owners = Arc::new(Semaphore::new(1));
+        let acquired = cache.download_semaphore.acquire_many(16).await;
+        let active = acquired.unwrap();
+        let request = cache
+            .start_download("http://127.0.0.1:9/audio.wav", 0, 20, None)
+            .unwrap();
+        assert!(
+            cache
+                .start_download("http://127.0.0.1:9/other.wav", 0, 20, None)
+                .is_err()
+        );
+        let result = request.wait().await;
+        assert!(result.unwrap_err().to_string().contains("timeout"));
+        let cancelled = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if cache.state.lock().unwrap().inflight.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(cancelled.is_ok());
+        assert_eq!(cache.owners.available_permits(), 1);
+        assert_eq!(cache.disk_bytes.load(Ordering::Acquire), 0);
+        drop(active);
     }
 }

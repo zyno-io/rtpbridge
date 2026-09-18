@@ -3,8 +3,8 @@
 This is an opt-in black-box end-to-end harness for long-running media continuity
 tests. It is not part of `cargo test`.
 
-The runner creates a deterministic scenario with RTP <-> WebRTC,
-WebRTC <-> WebRTC, and RTP <-> RTP calls. It samples rtpbridge stats, RTP peer
+The runner creates a deterministic scenario with RTP ↔ WebRTC,
+WebRTC ↔ WebRTC, and RTP ↔ RTP calls. It samples rtpbridge stats, RTP peer
 counters, and browser WebRTC `getStats()` counters while it runs scheduled ICE
 restarts, RTP re-INVITEs, hold music insertion/removal, endpoint replacement,
 transfer parking, and deliberate media impairments.
@@ -43,7 +43,7 @@ Artifacts are written under `artifacts/<timestamp>-seed-<seed>/`.
 
 ## Local Smoke
 
-Build rtpbridge first:
+Install the native dependencies using the [build instructions](../../docs/guide/getting-started.md#build), including the patched OpenSSL library and `OPENSSL_DIR`/`OPENSSL_STATIC` exports. Then build rtpbridge from the repository root:
 
 ```bash
 cargo build
@@ -115,6 +115,8 @@ When `--control-url` is omitted, the runner starts `--rtpbridge-bin` with a
 temporary config and temporary media/cache/recording directories.
 
 ## Assertions
+
+Quality violations are written to `timeline.jsonl` as `quality.failure` events while the run is active, as well as included in the final verdict. Load samples include `runner_event_loop_delay_ms` (maximum, p99 and mean per sample window) to help distinguish delayed Node peers from bridge processing. These diagnostics do not change any quality thresholds.
 
 The runner fails when:
 

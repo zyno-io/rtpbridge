@@ -9,14 +9,16 @@ use crate::media::resample::Resampler;
 use super::endpoint::RoutedRtpPacket;
 
 /// Per-source decode state inside a destination mixer.
+#[allow(dead_code)] // legacy 20 ms encoded feed remains available to library users
 struct SourceState {
-    decoder: Box<dyn AudioDecoder>,
+    decoder: Option<Box<dyn AudioDecoder>>,
     /// Resamples from source sample_rate to dest sample_rate (None if same).
     resampler: Option<Resampler>,
     /// Decoded + resampled PCM for the current frame.
     pcm_buffer: Vec<i16>,
     /// Whether this source contributed to the current frame.
     contributed: bool,
+    queued: std::collections::VecDeque<std::sync::Arc<Vec<i16>>>,
 }
 
 /// Per-destination audio mixer for multi-party conferences.
@@ -37,6 +39,7 @@ pub struct DestinationMixer {
     sources: HashMap<EndpointId, SourceState>,
     /// Accumulated mixed PCM.
     mix_buffer: Vec<i16>,
+    accumulator: Vec<i64>,
     /// Encoder output buffer.
     encode_buffer: Vec<u8>,
     /// Monotonically increasing RTP timestamp for output.
@@ -52,6 +55,10 @@ pub struct DestinationMixer {
 }
 
 impl DestinationMixer {
+    pub fn matches_output(&self, codec: AudioCodec, payload_type: u8) -> bool {
+        self.dest_codec == codec && self.dest_pt == payload_type
+    }
+
     /// Create a new mixer that outputs encoded audio for `dest_codec`.
     pub fn new(dest_codec: AudioCodec, dest_pt: u8) -> Result<Self> {
         let encoder = codec::make_encoder(dest_codec)?;
@@ -64,6 +71,7 @@ impl DestinationMixer {
             encoder,
             sources: HashMap::new(),
             mix_buffer: vec![0i16; frame_samples],
+            accumulator: vec![0; frame_samples],
             encode_buffer: Vec::with_capacity(frame_samples * 2),
             rtp_timestamp: rand::random(),
             frame_samples,
@@ -74,6 +82,7 @@ impl DestinationMixer {
     }
 
     /// Ensure a decoder exists for the given source, creating one if needed.
+    #[allow(dead_code)]
     fn ensure_source(
         &mut self,
         source_id: EndpointId,
@@ -92,10 +101,11 @@ impl DestinationMixer {
             self.sources.insert(
                 source_id,
                 SourceState {
-                    decoder,
+                    decoder: Some(decoder),
                     resampler,
                     pcm_buffer: Vec::with_capacity(self.frame_samples),
                     contributed: false,
+                    queued: std::collections::VecDeque::new(),
                 },
             );
         }
@@ -107,6 +117,7 @@ impl DestinationMixer {
     /// If this source already contributed to the current accumulation, a new
     /// frame period has started — the previous frame is mixed, encoded, and
     /// queued before the new packet is processed.
+    #[allow(dead_code)]
     pub fn feed(
         &mut self,
         source_id: EndpointId,
@@ -126,7 +137,11 @@ impl DestinationMixer {
         let source = self.ensure_source(source_id, source_codec)?;
 
         // Decode to PCM
-        source.decoder.decode(payload, &mut source.pcm_buffer)?;
+        source
+            .decoder
+            .as_mut()
+            .expect("legacy decoder")
+            .decode(payload, &mut source.pcm_buffer)?;
 
         // Resample if needed
         if let Some(ref mut resampler) = source.resampler {
@@ -135,34 +150,78 @@ impl DestinationMixer {
             source.pcm_buffer = resampled;
         }
 
-        // Pad or truncate to exact frame size
-        source.pcm_buffer.resize(frame_samples, 0);
+        anyhow::ensure!(
+            source.pcm_buffer.len() == frame_samples,
+            "feed requires 20 ms input; use source framing and feed_pcm for variable durations"
+        );
         source.contributed = true;
 
         Ok(())
     }
 
+    /// Production path: each source has already been decoded and resampled once.
+    /// Up to 240 ms per source is retained; overload is an explicit error.
+    pub fn feed_pcm(
+        &mut self,
+        source_id: EndpointId,
+        samples: std::sync::Arc<Vec<i16>>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            samples.len() == self.frame_samples,
+            "mixer requires one 20 ms PCM frame"
+        );
+        let source = self
+            .sources
+            .entry(source_id)
+            .or_insert_with(|| SourceState {
+                decoder: None,
+                resampler: None,
+                pcm_buffer: Vec::new(),
+                contributed: false,
+                queued: std::collections::VecDeque::new(),
+            });
+        anyhow::ensure!(source.queued.len() < 12, "mixer source queue full");
+        source.queued.push_back(samples);
+        Ok(())
+    }
+
+    pub fn has_pending(&self) -> bool {
+        self.sources
+            .values()
+            .any(|source| source.contributed || !source.queued.is_empty())
+    }
+
     /// Mix all contributed sources into an output packet and queue it.
     fn flush_frame(&mut self) -> Result<()> {
+        for source in self.sources.values_mut() {
+            if let Some(samples) = source.queued.pop_front() {
+                source.pcm_buffer.clear();
+                source.pcm_buffer.extend_from_slice(&samples);
+                source.contributed = true;
+            }
+        }
         let any_contributed = self.sources.values().any(|s| s.contributed);
         if !any_contributed {
             return Ok(());
         }
 
         // Zero the mix buffer
-        self.mix_buffer.iter_mut().for_each(|s| *s = 0);
+        self.accumulator.fill(0);
 
         // Sum all contributing sources with saturation
         for source in self.sources.values() {
             if source.contributed {
                 for (i, &sample) in source.pcm_buffer.iter().enumerate() {
                     if i < self.mix_buffer.len() {
-                        self.mix_buffer[i] = saturating_add(self.mix_buffer[i], sample);
+                        self.accumulator[i] += sample as i64;
                     }
                 }
             }
         }
 
+        for (sample, sum) in self.mix_buffer.iter_mut().zip(&self.accumulator) {
+            *sample = (*sum).clamp(i16::MIN as i64, i16::MAX as i64) as i16;
+        }
         // Encode mixed PCM
         self.encoder
             .encode(&self.mix_buffer, &mut self.encode_buffer)?;
@@ -242,6 +301,7 @@ impl DestinationMixer {
 }
 
 /// Saturating i16 addition (avoids wrap-around distortion).
+#[cfg(test)]
 #[inline]
 fn saturating_add(a: i16, b: i16) -> i16 {
     (a as i32 + b as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16
@@ -283,6 +343,27 @@ mod tests {
         let mut out = Vec::new();
         enc.encode(&pcm, &mut out).unwrap();
         out
+    }
+
+    #[test]
+    fn sum_clamps_once_independent_of_source_order() {
+        for values in [[30000, 30000, -30000], [-30000, 30000, 30000]] {
+            let mut mixer =
+                DestinationMixer::new(AudioCodec::L16 { sample_rate: 8000 }, 127).unwrap();
+            for value in values {
+                mixer
+                    .feed_pcm(eid(), std::sync::Arc::new(vec![value; 160]))
+                    .unwrap();
+            }
+            let packets = mixer.flush().unwrap();
+            assert_eq!(packets.len(), 1);
+            assert!(
+                packets[0]
+                    .payload
+                    .chunks_exact(2)
+                    .all(|bytes| i16::from_le_bytes([bytes[0], bytes[1]]) == 30000)
+            );
+        }
     }
 
     #[test]

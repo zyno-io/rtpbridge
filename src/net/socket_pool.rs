@@ -145,6 +145,7 @@ pub struct MediaBinding {
 /// from the configured `media_ip` list and shared across all sessions.
 pub struct MediaBindings {
     bindings: Vec<MediaBinding>,
+    pub source_networks: Arc<[ipnet::IpNet]>,
 }
 
 impl MediaBindings {
@@ -160,7 +161,10 @@ impl MediaBindings {
             let pool = Arc::new(SocketPool::new(ip, port_start, port_end)?);
             bindings.push(MediaBinding { ip, pool });
         }
-        Ok(Self { bindings })
+        Ok(Self {
+            bindings,
+            source_networks: Arc::from([]),
+        })
     }
 
     /// Exact-family lookup: the binding for the requested family, or `None` if

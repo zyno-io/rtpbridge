@@ -1,0 +1,16 @@
+name: Native dependencies
+description: Install libopus and build checksum-verified static OpenSSL
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: sudo apt-get update -qq && sudo apt-get install -y -qq libopus-dev > /dev/null
+    - uses: actions/cache@v4
+      with:
+        path: target/openssl
+        key: openssl-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-openssl.sh') }}
+    - shell: bash
+      run: |
+        sh scripts/build-openssl.sh "$GITHUB_WORKSPACE/target/openssl"
+        echo "OPENSSL_DIR=$GITHUB_WORKSPACE/target/openssl" >> "$GITHUB_ENV"
+        echo "OPENSSL_STATIC=1" >> "$GITHUB_ENV"

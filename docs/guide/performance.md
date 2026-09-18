@@ -1,160 +1,68 @@
-# Performance Tuning
+# Performance and capacity
 
-## Codec Selection
+Capacity depends on the negotiated codecs, fanout, native codec libraries, packet duration, storage, and host scheduler. Measure the intended workload on the deployment host; this project does not establish a universal sessions-per-core or bytes-per-session figure.
 
-The choice of codec has a significant impact on CPU usage due to transcoding overhead. rtpbridge supports three codecs with different characteristics:
+## Media work
 
-| Codec | Sample Rate | Bandwidth (20ms ptime) | CPU Cost | Quality |
-|-------|-------------|----------------------|----------|---------|
-| PCMU (G.711) | 8 kHz | 64 kbps | Minimal | Narrowband (telephone) |
-| G.722 | 16 kHz | 64 kbps | Low | Wideband |
-| Opus | 48 kHz | ~24 kbps (VBR) | High | Fullband |
+A destination with one source and the same codec forwards packets without decoding unless VAD or fax analysis is active. A destination with multiple sources mixes PCM even when all participants use the same codec. WebRTC currently negotiates Opus; selecting G.722 for its WebRTC side is not supported.
 
-### Transcoding Impact
+| Codec | PCM rate | RTP clock | Payload for 20 ms |
+| --- | --- | --- | --- |
+| PCMU | 8 kHz | 8 kHz | 160 bytes |
+| G.722 | 16 kHz | 8 kHz | 160 bytes |
+| Opus | 48 kHz | 48 kHz | Variable; encoder targets 24 kbps |
+| Internal L16 | 8, 16 or 48 kHz | Same as PCM | 320, 640 or 1920 bytes |
 
-When two endpoints in a session use different codecs, rtpbridge transcodes every packet through a decode-resample-encode pipeline. The cost depends on the codec pair:
+Sources that require PCM are decoded once per input packet. VAD, fax analysis, transcoders and mixers share that decode; destinations at the same PCM rate share the source's resampling result. Each mixed destination still needs its own sum and encoder. The mixer uses a wide sum and clamps the final sample once.
 
-| Path | Relative Cost | Notes |
-|------|--------------|-------|
-| Same codec (passthrough) | ~0 | No transcoding, packets forwarded directly |
-| PCMU <-> G.722 | Low | Resample 8 kHz <-> 16 kHz + codec |
-| PCMU <-> Opus | High | Resample 8 kHz <-> 48 kHz + Opus encode/decode |
-| G.722 <-> Opus | High | Resample 16 kHz <-> 48 kHz + Opus encode/decode |
+For 20 participants each sending 50 packets/s, shared decoding requires 1,000 input decodes/s, compared with 19,000 in the previous per-destination implementation. This is a work-count reduction, not a claim of a 19× CPU speedup. Summation, encoding, encryption, socket IO and allocation still contribute to total cost.
 
-Opus encoding is the most expensive operation. If you control both sides, prefer matching codecs to avoid transcoding entirely.
+Decoded short packets accumulate and long packets produce multiple 20 ms frames; they are not truncated or silently padded. Supported native codec packets are bounded to 120 ms. RTP is reordered before stateful decoding. SSRC, sequence or timestamp discontinuities reset a partial source frame. Same-codec forwarding retains the original packet duration.
 
-### Recommendations
+The linear resampler preserves block duration and continuity with one input sample of delay. It is intended for voice and has no anti-alias filter. Test audio quality before using it for music.
 
-- **Homogeneous deployments** — If all endpoints use the same codec, there's zero transcoding overhead. This is the most efficient configuration.
-- **WebRTC to PSTN** — WebRTC typically uses Opus; PSTN uses PCMU. This is the most expensive transcoding path. If CPU is a concern, consider G.722 as a compromise for the WebRTC side.
-- **Opus bitrate** — rtpbridge uses 24 kbps for Opus encoding (VoIP application mode). This is fixed and optimized for voice.
+## Bounded storage and sockets
 
-## Ptime Values
+These process limits complement the configured session, endpoint, connection and packet-channel limits:
 
-Ptime (packetization time) determines how many milliseconds of audio each RTP packet carries. rtpbridge uses 20ms ptime, which means:
+| Resource | Bound | Saturation behavior |
+| --- | --- | --- |
+| Storage/decode workers | 4 threads, 64 waiting jobs | `STORAGE_BUSY` |
+| Playback system DNS lookups | 4 jobs, including cancelled requests whose resolver call is still running | `DNS_BUSY` |
+| File decoder streams | 64, including shared playback | `PLAYBACK_BUSY` |
+| Nonshared playback prefetch | 4 frames per stream | Decoder waits; session keeps running |
+| Recording writers | 32 threads | `RECORDING_BUSY` |
+| Queued recording payload | 1 MiB per recording, 16 MiB process total, plus packet-count limit | Recording packets drop; counters increase |
+| Recording HTTP downloads | 4, one 64 KiB buffer each | HTTP 503 |
+| WebSocket writer backlog | 16 messages and 1 MiB per socket | Connection closes |
+| WebSocket control input | 16 requests and 1 MiB total | Connection closes |
+| WebSocket audio input | 256 KiB per endpoint | Connection closes on overflow |
+| Concurrent transfers | 64 coordinators, 10-second deadline | `TRANSFER_BUSY` or `TRANSFER_TIMEOUT` |
 
-| Codec | Samples per Packet | Bytes per Packet | Packets per Second |
-|-------|-------------------|------------------|-------------------|
-| PCMU | 160 | 160 | 50 |
-| G.722 | 320 | 160 | 50 |
-| Opus | 960 | ~60 (VBR) | 50 |
+A timeout cannot interrupt a filesystem syscall. Work already running retains its file lease and admission permit until it actually finishes. Recording flush timeout stops observation; the bounded writer continues draining. Stalled storage therefore consumes finite worker capacity and can cause subsequent storage requests to fail, while sessions continue processing media.
 
-At 50 packets/second per direction, a two-party session generates 100 packets/second of routing work. A three-party session (full mesh) generates 300 packets/second.
+URL downloads default to 16 active transfers, 64 pending distinct keys, 256 request owners, 1,000 cache entries and a 1 GiB cache budget. Each active transfer reserves `max_file_download_bytes` before opening its temporary file and reduces the reservation to actual size after completion. With the default 100 MiB per-file maximum, the disk budget can reject work before all 16 network slots are occupied. Leased files are never evicted. See [configuration](./configuration.md) for migration and tuning.
 
-## Resource Sizing
+These bounds are not a RAM sizing estimate. Also account for codec state, endpoint maps, routing edges, WebRTC/TLS state, OS socket buffers, queued events and allocator overhead. Increasing session or endpoint limits increases worst-case CPU and memory; an endpoint limit is not a CPU reservation.
 
-### CPU
+## Ports and recording storage
 
-CPU usage is dominated by:
-1. **Transcoding** — Opus encode/decode is the primary CPU consumer
-2. **Packet routing** — Negligible per-packet cost
-3. **SRTP** — Encrypt/decrypt adds modest overhead per packet
+WebRTC allocates one UDP socket per configured address family. Plain RTP/SRTP allocates an even/odd RTP/RTCP pair from `rtp_port_range`. The default range, 30000–39999, contains 5,000 pairs per configured family. File, tone, bridge and WebSocket endpoints consume no RTP ports.
 
-**Rules of thumb:**
-- Passthrough sessions (same codec, no SRTP): ~100-200 per CPU core
-- PCMU<->Opus transcoding sessions: ~50-100 per CPU core
-- Actual numbers depend heavily on hardware; benchmark your specific deployment
+An IPv4 PCMU source at 50 packets/s records approximately 11.5 KB/s before codec descriptors and RTCP: 160 payload bytes + 12 RTP + 42 Ethernet/IP/UDP + 16 PCAP record header. Multiply by recorded sources and retention time. Packet sizes, IPv6, Opus bitrate, overlapping recordings and filesystem overhead change this figure.
 
-### Memory
+Monitor `dropped_packets` when stopping recordings. A recording stop response marks the session's stop boundary; it does not prove the writer has flushed. A download of an active recording captures its opened-handle length and can end with a partial PCAP record. Stop and allow flushing before exporting a finalized recording.
 
-Memory usage is modest:
-- ~128 MB base footprint
-- ~1-5 KB per session (routing tables, state)
-- ~10-50 KB per active transcoding pipeline (codec state, resample buffers)
-- ~1 KB per active recording (channel buffer overhead)
+## Measurement
 
-512 MB is sufficient for most deployments. 1 GB provides comfortable headroom for thousands of sessions.
-
-### Network
-
-Each endpoint consumes:
-- 1 UDP socket for WebRTC endpoints, on an OS-assigned port
-- 2 UDP sockets for plain RTP/SRTP endpoints, allocated as an even/odd RTP/RTCP pair from `rtp_port_range`
-- Bandwidth proportional to codec bitrate and ptime
-
-For plain RTP endpoints, each endpoint uses one even/odd pair from `rtp_port_range`. The default range (30000-39999) provides 10,000 ports, which supports up to 5,000 concurrent plain RTP endpoints.
-
-### Disk I/O (Recordings)
-
-Each active recording writes PCAP data at approximately:
-- PCMU: ~10 KB/s (160 bytes payload + 42 bytes headers per packet, 50 pps)
-- Opus: ~5 KB/s (variable payload + 42 bytes headers per packet, 50 pps)
-
-A continuous 24-hour recording at PCMU rates (~10 KB/s) produces approximately 864 MB. Plan disk provisioning accordingly for long-lived sessions.
-
-For heavy recording workloads, use a separate volume with adequate IOPS. If the recording writer falls behind, packets are dropped from the recording (media routing is unaffected).
-
-### Recording Flush Timeout
-
-When a recording is stopped, the background writer task must flush buffered data to disk. The `recording_flush_timeout_secs` configuration (default: 10) controls how long to wait for this flush. If the flush does not complete in time, the task is aborted and the PCAP file may be truncated. Increase this value for slow storage (NFS, network-attached block devices):
-
-```toml
-recording_flush_timeout_secs = 30  # 30s for slow NFS
-```
-
-## Configuration Tuning
-
-### Port Range
-
-The default `rtp_port_range = [30000, 39999]` provides 10,000 ports, or 5,000 RTP/RTCP pairs. Increase this if you need more concurrent plain RTP endpoints:
-
-```toml
-rtp_port_range = [20000, 49999]  # 30,000 ports = 15,000 RTP/RTCP pairs
-```
-
-The start port must be even (RTP uses even/odd port pairs) and >= 1024.
-
-### Session Limits
-
-Set limits to protect against resource exhaustion:
-
-```toml
-max_sessions = 5000                 # Hard cap on concurrent sessions
-max_endpoints_per_session = 10      # Prevent runaway endpoint creation
-max_recordings_per_session = 100    # Cap disk usage per session
-```
-
-Set to 0 for unlimited (not recommended in production).
-
-### WebSocket Tuning
-
-```toml
-ws_max_message_size_kb = 256    # Max WebSocket message size
-max_sdp_size_kb = 64            # Max SDP offer/answer size
-```
-
-Increase `max_sdp_size_kb` if you have endpoints with many codec lines or ICE candidates. The default of 64 KB handles virtually all real-world SDPs.
-
-### Disconnect and Idle Timeouts
-
-```toml
-disconnect_timeout_secs = 30        # Time to keep orphaned sessions alive
-session_idle_timeout_secs = 0       # 0 = disabled; auto-destroy idle sessions
-```
-
-In production, consider setting `session_idle_timeout_secs` to a reasonable value (e.g., 300) to prevent leaked sessions from consuming resources.
-
-### File Descriptors
-
-Each session can consume multiple file descriptors (UDP sockets, recording files). Set the process fd limit accordingly:
+Run the benchmark with the same native libraries and release profile used in deployment:
 
 ```bash
-ulimit -n 65536
+cargo bench --bench mixing_bench
 ```
 
-Or in your systemd unit:
+The harness compares shared decoding with the retained per-destination decode path in the same executable for 2, 3, 10 and 20 participants using PCMU, G.722, Opus and mixed codecs. Its two-participant case exercises the PCM path for comparison; an ordinary same-codec two-party call uses passthrough. This microbenchmark excludes network, encryption, session scheduling and storage and is not a full server capacity test.
 
-```ini
-[Service]
-LimitNOFILE=65536
-```
+Use `rtpbridge_audio_packets_decoded_total` to check decoder work under live fanout. Measure CPU, RSS, allocations, media-loop delay, packet loss, playout drops, recording drops, and output continuity. Run the [soak harness](https://github.com/zyno-io/rtpbridge/tree/main/e2e/soak50#readme) for lifecycle and browser/TURN coverage, including transfers and renegotiation.
 
-For large deployments (thousands of sessions), you may need 100,000+.
-
-## Scaling
-
-rtpbridge is a single-process server. To scale beyond a single instance:
-
-- **Horizontal scaling** — Run multiple instances behind a load balancer. Sessions are independent and don't share state between instances. Route all WebSocket connections for a given session to the same instance (sticky sessions).
-- **Vertical scaling** — rtpbridge uses tokio's multi-threaded runtime and scales well across CPU cores. More cores = more concurrent transcoding.
-- **Shutdown draining** — Use graceful shutdown (`shutdown_max_wait_secs`) to drain sessions before stopping an instance. See [Deployment](./deployment.md) for Kubernetes configuration.
+A measured comparison against `7614703`, including its workload limits and uncertainty, is available in the [remediation results](../security-performance-remediation-results.md#conference-processing-measurements). It measures codec/mixer processing, not a production scheduling or capacity limit.

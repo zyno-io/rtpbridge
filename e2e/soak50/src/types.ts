@@ -260,4 +260,5 @@ export interface LoadSample {
   process_count: number;
   process_groups: LoadProcessGroupSample[];
   processes: LoadProcessSample[];
+  runner_event_loop_delay_ms?: { max: number; p99: number; mean: number };
 }

@@ -1,43 +1,32 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{broadcast, watch};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
 
-/// Manages shared file playback across sessions.
-/// When multiple sessions play the same file with shared=true,
-/// they share a single decode pipeline and receive PCM frames
-/// from a broadcast channel.
+use super::file_cache::CacheLease;
+
 pub struct SharedPlaybackManager {
     state: Arc<Mutex<SharedState>>,
 }
-
 struct SharedState {
-    /// source path → shared playback entry
     entries: HashMap<String, SharedEntry>,
 }
-
 struct SharedEntry {
-    /// Broadcast sender for PCM frames
+    generation: uuid::Uuid,
     tx: broadcast::Sender<Arc<Vec<i16>>>,
-    /// Number of active subscribers
+    terminal: watch::Receiver<Option<Result<(), String>>>,
     ref_count: u32,
-    /// Handle to the decode task (kept alive to prevent task cancellation)
-    #[allow(dead_code)]
-    task: Option<tokio::task::JoinHandle<()>>,
-    /// Cooperative cancellation token for graceful shutdown
     cancel: CancellationToken,
 }
 
-/// A subscriber to a shared playback
 pub struct SharedPlaybackSubscriber {
     pub rx: broadcast::Receiver<Arc<Vec<i16>>>,
     source: String,
+    generation: uuid::Uuid,
     manager: Arc<Mutex<SharedState>>,
+    terminal: watch::Receiver<Option<Result<(), String>>>,
     cleaned_up: bool,
-    /// Captured at construction time so Drop works even after runtime shutdown.
-    runtime_handle: Option<tokio::runtime::Handle>,
 }
 
 impl Default for SharedPlaybackManager {
@@ -45,7 +34,6 @@ impl Default for SharedPlaybackManager {
         Self::new()
     }
 }
-
 impl SharedPlaybackManager {
     pub fn new() -> Self {
         Self {
@@ -55,13 +43,7 @@ impl SharedPlaybackManager {
         }
     }
 
-    /// Subscribe to shared playback of a file.
-    /// If this is the first subscriber, starts the decode task.
-    /// Returns a subscriber that receives PCM frames via broadcast.
-    ///
-    /// `start_ms` and `loop_count` are only used when starting a new shared
-    /// decode task (first subscriber). Subsequent subscribers join the
-    /// already-running stream.
+    #[allow(dead_code)] // convenience API for embedded users
     pub async fn subscribe(
         &self,
         source: &str,
@@ -69,237 +51,245 @@ impl SharedPlaybackManager {
         start_ms: u64,
         loop_count: Option<u32>,
     ) -> anyhow::Result<SharedPlaybackSubscriber> {
-        let mut state = self.state.lock().await;
+        self.subscribe_with_lease(source, sample_rate, start_ms, loop_count, None)
+            .await
+    }
 
+    pub async fn subscribe_with_lease(
+        &self,
+        source: &str,
+        sample_rate: u32,
+        start_ms: u64,
+        loop_count: Option<u32>,
+        lease: Option<CacheLease>,
+    ) -> anyhow::Result<SharedPlaybackSubscriber> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = state.entries.get_mut(source) {
-            // Existing shared playback — just subscribe
+            if entry.ref_count >= 1024 {
+                anyhow::bail!("SHARED_PLAYBACK_BUSY");
+            }
             entry.ref_count += 1;
-            let rx = entry.tx.subscribe();
             return Ok(SharedPlaybackSubscriber {
-                rx,
-                source: source.to_string(),
+                rx: entry.tx.subscribe(),
+                source: source.into(),
+                generation: entry.generation,
                 manager: Arc::clone(&self.state),
+                terminal: entry.terminal.clone(),
                 cleaned_up: false,
-                runtime_handle: tokio::runtime::Handle::try_current().ok(),
             });
         }
-
-        // New shared playback — start decode task.
-        // 128 frames ≈ 2.56s at 20ms ptime — enough buffer for transient subscriber lag.
-        let (tx, rx) = broadcast::channel::<Arc<Vec<i16>>>(128);
-        let tx_clone = tx.clone();
-        let source_owned = source.to_string();
+        if state.entries.len() >= 64 {
+            anyhow::bail!("SHARED_PLAYBACK_BUSY");
+        }
+        if !matches!(sample_rate, 8000 | 16000 | 48000) {
+            anyhow::bail!("unsupported shared playback rate");
+        }
+        let admission = crate::storage::admit_stream()?;
+        let generation = uuid::Uuid::new_v4();
+        let (tx, rx) = broadcast::channel(128);
+        let (terminal, terminal_rx) = watch::channel(None);
         let cancel = CancellationToken::new();
-        let cancel_clone = cancel.clone();
-
-        let state_clone = Arc::clone(&self.state);
-        let key_clone = source.to_string();
-        let task = tokio::spawn(async move {
-            shared_decode_task(
-                &source_owned,
-                tx_clone,
+        state.entries.insert(
+            source.into(),
+            SharedEntry {
+                generation,
+                tx: tx.clone(),
+                terminal: terminal_rx.clone(),
+                ref_count: 1,
+                cancel: cancel.clone(),
+            },
+        );
+        let guard = DecodeGuard {
+            manager: Arc::clone(&self.state),
+            source: source.into(),
+            generation,
+            terminal,
+        };
+        let subscriber = SharedPlaybackSubscriber {
+            rx,
+            source: source.into(),
+            generation,
+            manager: Arc::clone(&self.state),
+            terminal: terminal_rx,
+            cleaned_up: false,
+        };
+        tokio::spawn(async move {
+            decode(
+                guard,
+                tx,
+                cancel,
                 sample_rate,
-                cancel_clone,
                 start_ms,
                 loop_count,
-                state_clone,
-                key_clone,
+                lease,
+                admission,
             )
             .await;
         });
-
-        state.entries.insert(
-            source.to_string(),
-            SharedEntry {
-                tx: tx.clone(),
-                ref_count: 1,
-                task: Some(task),
-                cancel,
-            },
-        );
-
-        Ok(SharedPlaybackSubscriber {
-            rx,
-            source: source.to_string(),
-            manager: Arc::clone(&self.state),
-            cleaned_up: false,
-            runtime_handle: tokio::runtime::Handle::try_current().ok(),
-        })
+        Ok(subscriber)
     }
 
-    /// Unsubscribe from shared playback.
-    /// Decrements ref_count and stops the decode task when no subscribers remain.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub async fn unsubscribe(&self, source: &str) {
-        let mut state = self.state.lock().await;
+    #[cfg(test)]
+    async fn unsubscribe(&self, source: &str) {
+        let mut state = self.state.lock().unwrap();
         if let Some(entry) = state.entries.get_mut(source) {
-            entry.ref_count = entry.ref_count.saturating_sub(1);
+            entry.ref_count -= 1;
             if entry.ref_count == 0 {
-                // Last subscriber — signal cooperative shutdown
                 entry.cancel.cancel();
                 state.entries.remove(source);
-                debug!(source = %crate::control::logging::source_summary(source), "shared playback stopped (no subscribers)");
             }
         }
     }
 }
 
 impl SharedPlaybackSubscriber {
-    /// Explicitly clean up this subscriber. Prefer calling this over relying on Drop,
-    /// as Drop cannot reliably decrement ref_count outside a tokio runtime context.
     pub async fn cleanup(mut self) {
+        self.release();
+    }
+    pub fn error(&self) -> Option<String> {
+        self.terminal
+            .borrow()
+            .as_ref()
+            .and_then(|result| result.as_ref().err())
+            .cloned()
+    }
+    fn release(&mut self) {
+        if self.cleaned_up {
+            return;
+        }
         self.cleaned_up = true;
-        let mut state = self.manager.lock().await;
-        if let Some(entry) = state.entries.get_mut(&self.source) {
+        let mut state = self.manager.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = state.entries.get_mut(&self.source)
+            && entry.generation == self.generation
+        {
             entry.ref_count = entry.ref_count.saturating_sub(1);
             if entry.ref_count == 0 {
                 entry.cancel.cancel();
                 state.entries.remove(&self.source);
-                debug!(source = %crate::control::logging::source_summary(&self.source), "shared playback stopped (no subscribers)");
             }
         }
     }
 }
-
-// NOTE: Drop-spawned cleanup is best-effort. If the tokio runtime is shutting down,
-// the ref_count decrement may be lost. Callers should use cleanup() for reliable cleanup.
 impl Drop for SharedPlaybackSubscriber {
     fn drop(&mut self) {
-        if self.cleaned_up {
-            return;
+        self.release();
+    }
+}
+
+struct DecodeGuard {
+    manager: Arc<Mutex<SharedState>>,
+    source: String,
+    generation: uuid::Uuid,
+    terminal: watch::Sender<Option<Result<(), String>>>,
+}
+impl Drop for DecodeGuard {
+    fn drop(&mut self) {
+        let unfinished = self.terminal.borrow().is_none();
+        if unfinished {
+            self.terminal
+                .send_replace(Some(Err("playback initialization or decode failed".into())));
         }
-        let source = self.source.clone();
-        let manager = Arc::clone(&self.manager);
-        // Spawn cleanup since drop can't be async.
-        // Use the handle captured at construction time so cleanup works even
-        // after the thread-local runtime context has been torn down.
-        let handle = self
-            .runtime_handle
-            .take()
-            .or_else(|| tokio::runtime::Handle::try_current().ok());
-        match handle {
-            Some(handle) => {
-                handle.spawn(async move {
-                    let mut state = manager.lock().await;
-                    if let Some(entry) = state.entries.get_mut(&source) {
-                        entry.ref_count = entry.ref_count.saturating_sub(1);
-                        if entry.ref_count == 0 {
-                            entry.cancel.cancel();
-                            state.entries.remove(&source);
-                        }
-                    }
-                });
-            }
-            None => {
-                // No tokio runtime at construction or drop time.
-                // This is expected during process shutdown; the OS will reclaim resources.
-                debug!(source = %crate::control::logging::source_summary(&source), "SharedPlaybackSubscriber dropped outside tokio runtime, ref_count not decremented");
-            }
+        let mut state = self.manager.lock().unwrap_or_else(|e| e.into_inner());
+        if state
+            .entries
+            .get(&self.source)
+            .is_some_and(|entry| entry.generation == self.generation)
+        {
+            state.entries.remove(&self.source);
         }
     }
 }
 
-/// Background task that decodes an audio file and broadcasts PCM frames.
-/// Stops cooperatively when the cancellation token is cancelled (last subscriber left).
-/// On exit (EOF, error, or cancellation), removes its entry from `SharedState` so
-/// future `subscribe()` calls create a fresh decode task.
 #[allow(clippy::too_many_arguments)]
-async fn shared_decode_task(
-    source: &str,
+async fn decode(
+    guard: DecodeGuard,
     tx: broadcast::Sender<Arc<Vec<i16>>>,
-    sample_rate: u32,
     cancel: CancellationToken,
+    sample_rate: u32,
     start_ms: u64,
     loop_count: Option<u32>,
-    state: Arc<Mutex<SharedState>>,
-    key: String,
+    lease: Option<CacheLease>,
+    admission: tokio::sync::OwnedSemaphorePermit,
 ) {
-    use crate::session::endpoint_file::FileEndpoint;
-
-    let id = uuid::Uuid::new_v4();
-    let source_str = source.to_string();
-    let source_owned = source.to_string();
-    let mut endpoint = match tokio::task::spawn_blocking(move || {
-        FileEndpoint::open(id, &source_owned, start_ms, loop_count, 0.0)
-    })
-    .await
-    {
-        Ok(Ok(ep)) => ep,
-        Ok(Err(e)) => {
-            tracing::warn!(source = %crate::control::logging::source_summary(&source_str), error = %e, "failed to open shared playback file");
-            return;
-        }
-        Err(e) => {
-            tracing::warn!(source = %crate::control::logging::source_summary(&source_str), error = %e, "spawn_blocking failed for shared playback");
-            return;
-        }
+    let source = guard.source.clone();
+    let opened = tokio::select! {
+        _ = cancel.cancelled() => return,
+        opened = crate::storage::run_with_deadline(move || {
+            let mut endpoint = crate::session::endpoint_file::FileEndpoint::open(uuid::Uuid::new_v4(), &source, start_ms, loop_count, 0.0)?;
+            endpoint.cache_lease = lease;
+            endpoint.storage_admission = Some(admission);
+            Ok(endpoint)
+        }) => opened,
     };
-
-    // Read 20ms of audio at the file's native rate, then resample to the requested rate.
+    let Ok(mut endpoint) = opened else {
+        return;
+    };
     let file_rate = endpoint.sample_rate();
-    let file_ptime_samples = (file_rate as usize) / 50; // 20ms at file's native rate
-    let needs_resample = file_rate != sample_rate && file_rate > 0 && sample_rate > 0;
-    let mut resampler = if needs_resample {
-        Some(crate::media::resample::Resampler::new(
-            file_rate,
-            sample_rate,
-        ))
-    } else {
-        None
-    };
-
-    let interval = tokio::time::Duration::from_millis(20);
-    let mut timer = tokio::time::interval(interval);
-    // Delay (not Burst) to avoid rapid catch-up after slow next_pcm() calls
+    let samples = file_rate as usize / 50;
+    let mut resampler = (file_rate != sample_rate)
+        .then(|| crate::media::resample::Resampler::new(file_rate, sample_rate));
+    let mut timer = tokio::time::interval(std::time::Duration::from_millis(20));
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
     loop {
-        tokio::select! {
-            _ = cancel.cancelled() => {
-                debug!(source = source, "shared decode task cancelled (no subscribers)");
-                break;
-            }
-            _ = timer.tick() => {}
-        }
-
-        match endpoint.next_pcm(file_ptime_samples) {
+        tokio::select! { _ = cancel.cancelled() => break, _ = timer.tick() => {} }
+        let decoded = tokio::select! {
+            _ = cancel.cancelled() => break,
+            decoded = crate::storage::run_with_deadline(move || {
+                let pcm = endpoint.next_pcm(samples).map(|pcm| {
+                    if let Some(resampler) = &mut resampler {
+                        let mut output = Vec::new(); resampler.process(&pcm, &mut output); output
+                    } else { pcm }
+                });
+                Ok((endpoint, resampler, pcm))
+            }) => decoded,
+        };
+        let Ok((next_endpoint, next_resampler, pcm)) = decoded else {
+            return;
+        };
+        endpoint = next_endpoint;
+        resampler = next_resampler;
+        match pcm {
             Some(pcm) => {
-                let pcm = if let Some(ref mut rs) = resampler {
-                    let mut buf = Vec::new();
-                    rs.process(&pcm, &mut buf);
-                    buf
-                } else {
-                    pcm
-                };
                 if tx.send(Arc::new(pcm)).is_err() {
-                    if tx.receiver_count() == 0 {
-                        break;
-                    }
-                    warn!(
-                        source = source,
-                        "shared playback: all receivers lagged, frame dropped"
-                    );
+                    break;
                 }
             }
             None => {
+                guard
+                    .terminal
+                    .send_replace(Some(match endpoint.playback_error.take() {
+                        Some(error) => Err(error),
+                        None => Ok(()),
+                    }));
                 break;
             }
         }
     }
-
-    // Clean up the entry so future subscribe() calls create a fresh decode task.
-    // The entry's `tx` is dropped when we remove it, causing all active rx.recv()
-    // calls to return RecvError — subscribers see this and stop reading.
-    {
-        let mut st = state.lock().await;
-        st.entries.remove(&key);
-    }
-    debug!(source = source, "shared decode task ended");
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_storage_terminates_shared_playback() {
+        let blocked = crate::storage::block_workers().await;
+        let manager = SharedPlaybackManager::new();
+        let subscribed = manager.subscribe("queued.wav", 8000, 0, None).await;
+        let mut subscriber = subscribed.unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(11)).await;
+        let terminal = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            subscriber.terminal.changed(),
+        )
+        .await;
+        terminal
+            .expect("stalled storage must report a terminal error")
+            .unwrap();
+        assert!(subscriber.error().is_some());
+        assert!(manager.state.lock().unwrap().entries.is_empty());
+        drop(blocked);
+    }
 
     #[tokio::test]
     async fn test_shared_subscribe_and_unsubscribe() {
@@ -319,7 +309,7 @@ mod tests {
 
         // Check state: 2 subscribers
         {
-            let state = mgr.state.lock().await;
+            let state = mgr.state.lock().unwrap();
             let entry = state.entries.get(wav_path).unwrap();
             assert_eq!(entry.ref_count, 2, "should have 2 subscribers");
         }
@@ -327,7 +317,7 @@ mod tests {
         // Unsubscribe one
         mgr.unsubscribe(wav_path).await;
         {
-            let state = mgr.state.lock().await;
+            let state = mgr.state.lock().unwrap();
             let entry = state.entries.get(wav_path).unwrap();
             assert_eq!(
                 entry.ref_count, 1,
@@ -338,7 +328,7 @@ mod tests {
         // Unsubscribe last — entry should be removed
         mgr.unsubscribe(wav_path).await;
         {
-            let state = mgr.state.lock().await;
+            let state = mgr.state.lock().unwrap();
             assert!(
                 state.entries.get(wav_path).is_none(),
                 "entry should be removed when last subscriber leaves"
@@ -388,7 +378,7 @@ mod tests {
 
         // Verify 2 subscribers
         {
-            let state = mgr.state.lock().await;
+            let state = mgr.state.lock().unwrap();
             assert_eq!(state.entries.get(wav_path).unwrap().ref_count, 2);
         }
 
@@ -406,7 +396,7 @@ mod tests {
 
         // Entry should be gone
         {
-            let state = mgr.state.lock().await;
+            let state = mgr.state.lock().unwrap();
             assert!(
                 state.entries.get(wav_path).is_none(),
                 "entry should be removed after all subscribers disconnect"
@@ -429,7 +419,7 @@ mod tests {
 
         // Entry should be gone
         {
-            let state = mgr.state.lock().await;
+            let state = mgr.state.lock().unwrap();
             assert!(
                 state.entries.get(wav_path).is_none(),
                 "entry should be removed"
@@ -439,7 +429,7 @@ mod tests {
         // Re-subscribe — should create a new entry with ref_count=1
         let _sub2 = mgr.subscribe(wav_path, 8000, 0, None).await.unwrap();
         {
-            let state = mgr.state.lock().await;
+            let state = mgr.state.lock().unwrap();
             let entry = state.entries.get(wav_path).unwrap();
             assert_eq!(entry.ref_count, 1, "re-subscribe should create fresh entry");
         }
@@ -460,7 +450,7 @@ mod tests {
         let _sub2 = mgr.subscribe(wav_path, 8000, 0, None).await.unwrap();
 
         {
-            let state = mgr.state.lock().await;
+            let state = mgr.state.lock().unwrap();
             assert_eq!(state.entries.get(wav_path).unwrap().ref_count, 2);
         }
 
@@ -468,7 +458,7 @@ mod tests {
         sub1.cleanup().await;
 
         {
-            let state = mgr.state.lock().await;
+            let state = mgr.state.lock().unwrap();
             let entry = state.entries.get(wav_path).unwrap();
             assert_eq!(
                 entry.ref_count, 1,
@@ -481,7 +471,7 @@ mod tests {
         // We verify by checking the count is still 1 after a brief delay.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         {
-            let state = mgr.state.lock().await;
+            let state = mgr.state.lock().unwrap();
             let entry = state.entries.get(wav_path).unwrap();
             assert_eq!(
                 entry.ref_count, 1,
@@ -517,7 +507,7 @@ mod tests {
 
         // After all subscribe/unsubscribe cycles, the entry should be gone
         {
-            let state = mgr.state.lock().await;
+            let state = mgr.state.lock().unwrap();
             assert!(
                 state.entries.get(wav_path).is_none(),
                 "all subscribers removed — entry should be gone"
@@ -569,7 +559,7 @@ mod tests {
 
         // Entry should be removed by the decode task's cleanup
         {
-            let state = mgr.state.lock().await;
+            let state = mgr.state.lock().unwrap();
             assert!(
                 state.entries.get(wav_path).is_none(),
                 "entry should be removed after file finishes playing"
@@ -588,6 +578,38 @@ mod tests {
     }
 
     /// Generate a minimal 8kHz mono 16-bit WAV
+    #[tokio::test]
+    async fn dropping_finished_generation_cannot_cancel_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("generation.wav");
+        let path = path.to_str().unwrap();
+        generate_test_wav_8k(path, 0.04);
+        let manager = SharedPlaybackManager::new();
+        let first = manager.subscribe(path, 8000, 0, Some(0)).await;
+        let mut first = first.unwrap();
+        let finished = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while first.terminal.borrow().is_none() {
+                let changed = first.terminal.changed().await;
+                changed.unwrap();
+            }
+        })
+        .await;
+        assert!(finished.is_ok());
+        let second = manager.subscribe(path, 8000, 0, None).await;
+        let mut second = second.unwrap();
+        assert_ne!(first.generation, second.generation);
+        drop(first);
+        {
+            let state = manager.state.lock().unwrap();
+            let current = state.entries.get(path).unwrap();
+            assert_eq!(current.generation, second.generation);
+            assert_eq!(current.ref_count, 1);
+            assert!(!current.cancel.is_cancelled());
+        }
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(2), second.rx.recv()).await;
+        assert!(!frame.unwrap().unwrap().is_empty());
+    }
+
     fn generate_test_wav_8k(path: &str, duration_secs: f64) {
         use std::io::Write;
         let sample_rate: u32 = 8000;

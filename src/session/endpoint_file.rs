@@ -34,7 +34,12 @@ pub struct FileEndpoint {
     pub config: EndpointConfig,
     pub state: EndpointState,
     pub stats: EndpointStats,
+    pub(crate) playback_error: Option<String>,
+    pub(crate) storage_admission: Option<tokio::sync::OwnedSemaphorePermit>,
+    pub(crate) cache_lease: Option<crate::playback::file_cache::CacheLease>,
+    pub(crate) download_cancel: tokio_util::sync::CancellationToken,
 
+    worker: Option<PlaybackWorker>,
     reader: Option<Box<dyn symphonia::core::formats::FormatReader>>,
     decoder: Option<Box<dyn symphonia::core::codecs::audio::AudioDecoder>>,
     track_id: Option<u32>,
@@ -53,12 +58,6 @@ pub struct FileEndpoint {
     /// Source path (for re-opening on loop)
     source_path: String,
 
-    /// True when the file hit EOF during looping and needs an async reopen.
-    /// Available for callers that want to preempt the sync rewind in `next_pcm`
-    /// by calling `async_rewind()` via `spawn_blocking` first.
-    #[allow(dead_code)]
-    pub needs_rewind: bool,
-
     /// Linear gain factor (precomputed from dB value at creation time)
     gain_factor: f32,
 
@@ -71,7 +70,191 @@ pub struct FileEndpoint {
     pub(crate) shared_sub: Option<crate::playback::shared_playback::SharedPlaybackSubscriber>,
 }
 
+impl std::fmt::Debug for FileEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileEndpoint")
+            .field("id", &self.id)
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
+}
+
+type PlaybackFrame = (u64, Result<Vec<i16>, Option<String>>);
+struct PlaybackWorker {
+    frames: tokio::sync::mpsc::Receiver<PlaybackFrame>,
+    commands: tokio::sync::mpsc::Sender<SeekRequest>,
+    epoch: u64,
+}
+struct SeekRequest {
+    position: u64,
+    epoch: u64,
+    reply: tokio::sync::oneshot::Sender<anyhow::Result<()>>,
+}
+
 impl FileEndpoint {
+    #[allow(clippy::too_many_arguments)]
+    pub async fn prepare(
+        id: EndpointId,
+        source: String,
+        media_dir: Option<std::path::PathBuf>,
+        lease: Option<crate::playback::file_cache::CacheLease>,
+        shared_manager: std::sync::Arc<crate::playback::shared_playback::SharedPlaybackManager>,
+        shared: bool,
+        start_ms: u64,
+        loop_count: Option<u32>,
+        gain_db: f32,
+    ) -> anyhow::Result<Self> {
+        let resolved = crate::storage::run(move || {
+            if lease.is_none() {
+                let base = media_dir.ok_or_else(|| {
+                    anyhow::anyhow!("Local file playback is disabled (no media_dir configured)")
+                })?;
+                let base = base.canonicalize()?;
+                let path = std::path::Path::new(&source).canonicalize()?;
+                anyhow::ensure!(
+                    path.starts_with(base),
+                    "File path is outside the allowed media directory"
+                );
+                anyhow::ensure!(
+                    path.metadata()?.is_file(),
+                    "playback input must be a regular file"
+                );
+                Ok((path.to_string_lossy().into_owned(), lease))
+            } else {
+                Ok((source, lease))
+            }
+        })
+        .await;
+        let (source, lease) = resolved?;
+        if shared {
+            let subscribed = shared_manager
+                .subscribe_with_lease(&source, 8000, start_ms, loop_count, lease)
+                .await;
+            let sub = subscribed?;
+            Ok(Self::new_shared(id, &source, sub, gain_db))
+        } else {
+            let admission = crate::storage::admit_stream()?;
+            let opened = crate::storage::run(move || {
+                let mut endpoint = Self::open(id, &source, start_ms, loop_count, gain_db)?;
+                endpoint.cache_lease = lease;
+                endpoint.storage_admission = Some(admission);
+                Ok(endpoint)
+            })
+            .await;
+            let endpoint = opened?;
+            Ok(endpoint.into_worker())
+        }
+    }
+
+    /// The session owns only a bounded PCM receiver. Decoder, file handle, cache
+    /// lease and admission remain on the storage side through real completion.
+    pub fn into_worker(mut self) -> Self {
+        let (frames, receiver) = tokio::sync::mpsc::channel(4);
+        let (commands, mut command_rx) = tokio::sync::mpsc::channel::<SeekRequest>(4);
+        let mut outer = Self::new_buffering(self.id, 0.0);
+        outer.state = EndpointState::Playing;
+        outer.sample_rate = self.sample_rate;
+        outer.source_path = self.source_path.clone();
+        outer.gain_factor = self.gain_factor;
+        outer.loop_count = self.loop_count;
+        outer.start_ms = self.start_ms;
+        outer.worker = Some(PlaybackWorker {
+            frames: receiver,
+            commands,
+            epoch: 0,
+        });
+        let cancel = outer.download_cancel.clone();
+        tokio::spawn(async move {
+            let mut epoch = 0;
+            let mut at_eof = false;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    Some(request) = command_rx.recv() => {
+                        let work = crate::storage::run(move || {
+                            // EOF may have been prefetched while the session is
+                            // still playing or paused. It can still request a seek.
+                            let finished = self.state == EndpointState::Finished;
+                            if finished { self.state = EndpointState::Playing; }
+                            let result = self.seek(request.position);
+                            if finished && result.is_err() { self.state = EndpointState::Finished; }
+                            Ok((self, result, request))
+                        });
+                        let completed = tokio::time::timeout(std::time::Duration::from_secs(10), work).await;
+                        match completed {
+                            Ok(Ok((core, result, request))) => {
+                                self = core;
+                                epoch = request.epoch;
+                                at_eof = false;
+                                let _ = request.reply.send(result);
+                            }
+                            _ => { let _ = frames.send((epoch, Err(Some("playback seek failed".into())))).await; break; }
+                        }
+                    }
+                    permit = frames.reserve(), if !at_eof => {
+                        let Ok(permit) = permit else { break };
+                        let work = crate::storage::run(move || {
+                            let samples = self.next_pcm((self.sample_rate() / 50) as usize);
+                            let error = self.playback_error.clone();
+                            Ok((self, samples, error))
+                        });
+                        let completed = tokio::time::timeout(std::time::Duration::from_secs(10), work).await;
+                        match completed {
+                            Ok(Ok((core, samples, error))) => {
+                                self = core;
+                                match samples {
+                                    Some(samples) => { permit.send((epoch, Ok(samples))); }
+                                    None => {
+                                        let failed = error.is_some();
+                                        permit.send((epoch, Err(error)));
+                                        if failed { break; }
+                                        // Keep seek service until the session observes EOF.
+                                        at_eof = true;
+                                    }
+                                }
+                            }
+                            _ => { permit.send((epoch, Err(Some("playback read failed".into())))); break; }
+                        }
+                    }
+                }
+            }
+        });
+        outer
+    }
+
+    pub fn request_seek(
+        &mut self,
+        position: u64,
+        reply: tokio::sync::oneshot::Sender<anyhow::Result<()>>,
+    ) {
+        if !matches!(self.state, EndpointState::Playing | EndpointState::Paused) {
+            let _ = reply.send(Err(anyhow::anyhow!("Cannot seek in current state")));
+            return;
+        }
+        let Some(worker) = self.worker.as_mut() else {
+            let result = self.seek(position);
+            let _ = reply.send(result);
+            return;
+        };
+        let epoch = worker.epoch.wrapping_add(1);
+        match worker.commands.try_send(SeekRequest {
+            position,
+            epoch,
+            reply,
+        }) {
+            Ok(()) => {
+                worker.epoch = epoch;
+            }
+            Err(error) => {
+                let _ = error
+                    .into_inner()
+                    .reply
+                    .send(Err(anyhow::anyhow!("PLAYBACK_BUSY")));
+            }
+        }
+    }
+
     /// Open a local audio file for playback
     pub fn open(
         id: EndpointId,
@@ -89,6 +272,11 @@ impl FileEndpoint {
             },
             state: EndpointState::Playing,
             stats: EndpointStats::new(),
+            playback_error: None,
+            storage_admission: None,
+            cache_lease: None,
+            download_cancel: tokio_util::sync::CancellationToken::new(),
+            worker: None,
             reader: Some(reader),
             decoder: Some(decoder),
             track_id: Some(track_id),
@@ -99,7 +287,6 @@ impl FileEndpoint {
             start_ms,
             paused: false,
             source_path: source_path.to_string(),
-            needs_rewind: false,
             gain_factor: db_to_linear(gain_db),
             shared: false,
             shared_sub: None,
@@ -122,6 +309,11 @@ impl FileEndpoint {
             },
             state: EndpointState::Buffering,
             stats: EndpointStats::new(),
+            playback_error: None,
+            storage_admission: None,
+            cache_lease: None,
+            download_cancel: tokio_util::sync::CancellationToken::new(),
+            worker: None,
             reader: None,
             decoder: None,
             track_id: None,
@@ -132,7 +324,6 @@ impl FileEndpoint {
             start_ms: 0,
             paused: false,
             source_path: String::new(),
-            needs_rewind: false,
             gain_factor: db_to_linear(gain_db),
             shared: false,
             shared_sub: None,
@@ -153,6 +344,11 @@ impl FileEndpoint {
             },
             state: EndpointState::Playing,
             stats: EndpointStats::new(),
+            playback_error: None,
+            storage_admission: None,
+            cache_lease: None,
+            download_cancel: tokio_util::sync::CancellationToken::new(),
+            worker: None,
             reader: None,
             decoder: None,
             track_id: None,
@@ -163,7 +359,6 @@ impl FileEndpoint {
             start_ms: 0,
             paused: false,
             source_path: source_path.to_string(),
-            needs_rewind: false,
             gain_factor: db_to_linear(gain_db),
             shared: true,
             shared_sub: Some(sub),
@@ -181,6 +376,7 @@ impl FileEndpoint {
     }
 
     /// Initialize a buffering endpoint with a downloaded file, transitioning to Playing state.
+    #[allow(dead_code)] // synchronous core API; production prepares on storage workers
     pub fn initialize(
         &mut self,
         path: &str,
@@ -214,6 +410,32 @@ impl FileEndpoint {
             return None;
         }
 
+        if let Some(worker) = self.worker.as_mut() {
+            while let Ok((epoch, frame)) = worker.frames.try_recv() {
+                if epoch != worker.epoch {
+                    continue;
+                }
+                match frame {
+                    Ok(samples) => {
+                        self.stats.record_outbound(samples.len() * 2);
+                        return Some(samples);
+                    }
+                    Err(error) => {
+                        self.playback_error = error;
+                        self.state = EndpointState::Finished;
+                        self.download_cancel.cancel();
+                        return None;
+                    }
+                }
+            }
+            if worker.frames.is_closed() && worker.frames.is_empty() {
+                self.playback_error = Some("playback worker stopped".into());
+                self.state = EndpointState::Finished;
+                self.download_cancel.cancel();
+            }
+            return None;
+        }
+
         // Shared playback: receive PCM from broadcast channel instead of local decode
         if let Some(ref mut sub) = self.shared_sub {
             match sub.rx.try_recv() {
@@ -241,6 +463,7 @@ impl FileEndpoint {
                 }
                 Err(broadcast::error::TryRecvError::Empty) => return None,
                 Err(broadcast::error::TryRecvError::Closed) => {
+                    self.playback_error = sub.error();
                     self.state = EndpointState::Finished;
                     return None;
                 }
@@ -248,7 +471,7 @@ impl FileEndpoint {
         }
 
         // Fill buffer if needed (limit iterations to prevent busy-loop on pathological files)
-        const MAX_DECODE_ITERATIONS: usize = 1024;
+        const MAX_DECODE_ITERATIONS: usize = 64;
         let mut iterations = 0;
         while self.pcm_buffer.len() - self.pcm_pos < target_samples {
             iterations += 1;
@@ -258,22 +481,38 @@ impl FileEndpoint {
                 return None;
             }
             if !self.decode_next_packet() {
+                if self.playback_error.is_some() {
+                    self.state = EndpointState::Finished;
+                    return None;
+                }
                 // End of file — handle looping
                 if let Some(ref mut count) = self.loop_count {
                     if *count == 0 {
                         self.state = EndpointState::Finished;
-                        return None;
+                        let mut tail = self.pcm_buffer[self.pcm_pos..].to_vec();
+                        self.pcm_pos = self.pcm_buffer.len();
+                        if tail.is_empty() {
+                            return None;
+                        }
+                        // Only EOF pads a final partial output frame. Preserve
+                        // every decoded sample and finish on the next poll.
+                        tail.resize(target_samples, 0);
+                        if self.gain_factor != 1.0 {
+                            apply_gain(&mut tail, self.gain_factor);
+                        }
+                        self.stats.record_outbound(tail.len() * 2);
+                        return Some(tail);
                     }
                     *count = count.saturating_sub(1);
                 }
-                // Sync rewind (fallback). The async caller in media_session.rs
-                // preempts this by checking needs_rewind and calling async_rewind()
-                // via spawn_blocking before the next poll cycle.
+                let tail = self.pcm_buffer[self.pcm_pos..].to_vec();
+                // Production calls this core from a bounded storage worker.
                 if let Err(e) = self.rewind() {
                     warn!(endpoint_id = %self.id, error = %e, "failed to rewind for loop");
                     self.state = EndpointState::Finished;
                     return None;
                 }
+                self.pcm_buffer.extend_from_slice(&tail);
             }
         }
 
@@ -363,7 +602,6 @@ impl FileEndpoint {
         }
     }
 
-    #[allow(dead_code)] // kept as sync fallback; production uses async_rewind
     fn rewind(&mut self) -> anyhow::Result<()> {
         // Re-open the file (symphonia seek to 0 may not work for all formats)
         let (reader, decoder, track_id, sample_rate) = open_audio_file(&self.source_path)?;
@@ -373,30 +611,6 @@ impl FileEndpoint {
         self.sample_rate = Some(sample_rate);
         self.pcm_buffer.clear();
         self.pcm_pos = 0;
-
-        if self.start_ms > 0 {
-            self.seek(self.start_ms)?;
-        }
-        Ok(())
-    }
-
-    /// Asynchronously rewind the file using `spawn_blocking` to avoid
-    /// blocking the session task on slow storage (NFS, network drives).
-    /// Callers can check `needs_rewind` and call this before the next `next_pcm()`.
-    #[allow(dead_code)]
-    pub async fn async_rewind(&mut self) -> anyhow::Result<()> {
-        let path = self.source_path.clone();
-        let (reader, decoder, track_id, sample_rate) =
-            tokio::task::spawn_blocking(move || open_audio_file(&path))
-                .await
-                .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??;
-        self.reader = Some(reader);
-        self.decoder = Some(decoder);
-        self.track_id = Some(track_id);
-        self.sample_rate = Some(sample_rate);
-        self.pcm_buffer.clear();
-        self.pcm_pos = 0;
-        self.needs_rewind = false;
 
         if self.start_ms > 0 {
             self.seek(self.start_ms)?;
@@ -418,7 +632,7 @@ impl FileEndpoint {
             Some(t) => t,
             None => return false,
         };
-        loop {
+        for _ in 0..64 {
             let packet = match reader.next_packet() {
                 Ok(Some(p)) => p,
                 Ok(None) => return false, // EOF
@@ -443,6 +657,11 @@ impl FileEndpoint {
                         continue;
                     }
 
+                    if ch == 0 || ch > 8 || n_frames > 384_000 {
+                        self.playback_error =
+                            Some("decoded audio block exceeds resource limit".into());
+                        return false;
+                    }
                     let mut samples: Vec<i16> = Vec::with_capacity(n_frames * ch);
                     audio_buf.copy_to_vec_interleaved(&mut samples);
 
@@ -466,6 +685,8 @@ impl FileEndpoint {
                 Err(_) => continue,
             }
         }
+        self.playback_error = Some("audio decode work limit exceeded".into());
+        false
     }
 }
 
@@ -492,7 +713,16 @@ fn get_codecs() -> &'static symphonia::core::codecs::registry::CodecRegistry {
 
 /// Open a local audio file for symphonia decode
 fn open_audio_file(path: &str) -> anyhow::Result<AudioFileComponents> {
-    let file = File::open(path)?;
+    // NONBLOCK prevents named pipes from hanging even if a local path is swapped.
+    let file: File = rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NONBLOCK,
+        rustix::fs::Mode::empty(),
+    )?
+    .into();
+    if !file.metadata()?.is_file() {
+        anyhow::bail!("playback input must be a regular file");
+    }
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
 
     let mut hint = Hint::new();
@@ -520,15 +750,110 @@ fn open_audio_file(path: &str) -> anyhow::Result<AudioFileComponents> {
         .sample_rate
         .ok_or_else(|| anyhow::anyhow!("Unknown sample rate"))?;
 
+    anyhow::ensure!(
+        (8000..=192000).contains(&sample_rate),
+        "unsupported file sample rate"
+    );
+    anyhow::ensure!(
+        audio_params
+            .channels
+            .as_ref()
+            .is_none_or(|channels| (1..=8).contains(&channels.count())),
+        "unsupported file channel count"
+    );
+    anyhow::ensure!(
+        audio_params
+            .max_frames_per_packet
+            .is_none_or(|frames| frames <= 384000),
+        "audio packet exceeds decode limit"
+    );
     let decoder = get_codecs().make_audio_decoder(audio_params, &AudioDecoderOptions::default())?;
 
     Ok((reader, decoder, track_id, sample_rate))
+}
+
+impl Drop for FileEndpoint {
+    fn drop(&mut self) {
+        self.download_cancel.cancel();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn short_file_tail_is_preserved_across_loops_and_padded_only_at_eof() {
+        for (duration, loops) in [(0.005, 3), (0.025, 1)] {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            let path = file.path().to_str().unwrap();
+            test_wav(path, duration);
+            let mut endpoint = FileEndpoint::new_buffering(uuid::Uuid::new_v4(), 0.0);
+            endpoint.initialize(path, 0, Some(loops)).unwrap();
+            let samples_per_pass = (duration * 8000.0) as usize;
+            let mut expected = Vec::new();
+            for _ in 0..=loops {
+                expected.extend((0..samples_per_pass).map(|i| {
+                    (f64::sin(2.0 * std::f64::consts::PI * 440.0 * i as f64 / 8000.0) * 16000.0)
+                        as i16
+                }));
+            }
+            expected.resize(expected.len().div_ceil(160) * 160, 0);
+            let mut actual = Vec::new();
+            while let Some(frame) = endpoint.next_pcm(160) {
+                actual.extend(frame);
+                assert!(actual.len() <= expected.len());
+            }
+            assert_eq!(actual, expected, "duration={duration}, loops={loops}");
+        }
+    }
+
+    #[tokio::test]
+    async fn double_check_seek_before_prefetched_eof_is_consumed() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_str().unwrap();
+        test_wav(path, 0.04);
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let mut core = FileEndpoint::open(uuid::Uuid::new_v4(), path, 0, Some(0), 0.0).unwrap();
+        core.storage_admission = Some(budget.clone().try_acquire_owned().unwrap());
+        let mut endpoint = core.into_worker();
+        let prefetched = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while endpoint.worker.as_ref().unwrap().frames.len() < 3 {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        prefetched.unwrap();
+        endpoint.pause().unwrap();
+        let (reply, response) = tokio::sync::oneshot::channel();
+        endpoint.request_seek(0, reply);
+        let result = response.await;
+        result
+            .unwrap()
+            .expect("prefetching EOF cannot end a still-live endpoint's seek service");
+        endpoint.resume().unwrap();
+        let mut samples = Vec::new();
+        let finished = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while endpoint.state != EndpointState::Finished {
+                if let Some(frame) = endpoint.next_pcm(160) {
+                    samples.extend(frame);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            while budget.available_permits() != 1 {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        finished.unwrap();
+        assert_eq!(
+            samples.len(),
+            320,
+            "only the two frames after the seek are emitted"
+        );
+        assert!(endpoint.playback_error.is_none());
+    }
 
     /// Generate a minimal WAV file with a sine tone
     fn test_wav(path: &str, duration_secs: f64) {

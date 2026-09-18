@@ -205,7 +205,7 @@ fn test_srtp_reset_sequence_state_preserves_keys() {
 }
 
 #[test]
-fn test_srtcp_reset_recv_state_accepts_restarted_low_index() {
+fn test_srtcp_same_key_restart_stays_rejected() {
     // SRTCP analogue of the SRTP test: peer restarts with a fresh SRTCP
     // index of 0 after RTCP BYE / hold. Without reset_recv_state(), the
     // replay window rejects the restarted low-index packets.
@@ -232,10 +232,9 @@ fn test_srtcp_reset_recv_state_accepts_restarted_low_index() {
         "sanity: low-index SRTCP on a stale context should be rejected before reset"
     );
 
-    unprotect_ctx.reset_recv_state();
-    unprotect_ctx
-        .unprotect_rtcp(&restart_srtcp)
-        .expect("restarted low-index SRTCP should decrypt after reset");
+    assert!(unprotect_ctx.unprotect_rtcp(&restart_srtcp).is_err());
+    let current = protect_ctx.protect_rtcp(&rtcp).unwrap();
+    assert!(unprotect_ctx.unprotect_rtcp(&current).is_ok());
 }
 
 #[test]
@@ -594,24 +593,10 @@ fn test_srtp_key_29_bytes_rejected() {
 }
 
 #[test]
-fn test_srtp_key_31_bytes_accepted() {
-    // 31 bytes is 1 byte MORE than required (30). The extra byte should be
-    // silently ignored — the context should initialize and work correctly.
-    let key_material = [0xBB; 31];
-    let key_b64 = crate::session::endpoint_rtp::base64_encode(&key_material);
-    let result = SrtpContext::from_sdes_key(&key_b64);
-    assert!(
-        result.is_ok(),
-        "31-byte key material should be accepted (extra byte ignored)"
-    );
-
-    // Verify it can protect/unprotect roundtrip
-    let mut protect_ctx = SrtpContext::from_sdes_key(&key_b64).unwrap();
-    let mut unprotect_ctx = SrtpContext::from_sdes_key(&key_b64).unwrap();
-    let rtp = crate::media::rtp::RtpHeader::build(0, 1, 160, 0x12345678, false, &[0xAA; 160]);
-    let srtp = protect_ctx.protect(&rtp).unwrap();
-    let decrypted = unprotect_ctx.unprotect(&srtp).unwrap();
-    assert_eq!(decrypted, rtp, "roundtrip with 31-byte key should work");
+fn test_srtp_key_31_bytes_rejected() {
+    let key_b64 = crate::session::endpoint_rtp::base64_encode(&[0xBB; 31]);
+    assert!(SrtpContext::from_sdes_key(&key_b64).is_err());
+    assert!(SrtcpContext::from_sdes_key(&key_b64).is_err());
 }
 
 #[test]

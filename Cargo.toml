@@ -1,6 +1,6 @@
 [package]
 name = "rtpbridge"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.94"
 description = "High-performance RTP media routing server"
@@ -19,7 +19,7 @@ tokio-tungstenite = { version = "0.29", features = ["rustls-tls-native-roots"] }
 futures-util = "0.3"
 tokio-rustls = "0.26"
 rustls = "0.23"
-rustls-pemfile = "2"
+rustls-pki-types = { version = "1", features = ["std"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -36,12 +36,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # Utilities
 uuid = { version = "1", features = ["v4", "serde"] }
 dashmap = "6"
+ipnet = { version = "2", features = ["serde"] }
+url = "2"
+rustix = { version = "1", features = ["fs"] }
 thiserror = "2"
+tempfile = "3"
 anyhow = "1"
 rand = "0.10"
 
 # WebRTC
-str0m = { version = "0.21", default-features = false, features = ["openssl", "vendored"] }
+str0m = { version = "0.21", default-features = false, features = ["openssl"] }
 
 # Codecs
 xlaw = "0.0.3"
@@ -79,17 +83,13 @@ time = { version = "0.3", features = ["formatting"] }
 # Metrics
 prometheus-client = "0.24"
 
-[features]
-vendored-openssl = ["openssl/vendored"]
-
 [dependencies.openssl]
 version = "0.10"
-optional = true
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 portpicker = "0.1"
 criterion = { version = "0.8", features = ["html_reports"] }
-tempfile = "3"
 rcgen = "0.13"
 
 [[bench]]
@@ -106,6 +106,10 @@ harness = false
 
 [[bench]]
 name = "pcap_bench"
+harness = false
+
+[[bench]]
+name = "mixing_bench"
 harness = false
 
 [profile.release]

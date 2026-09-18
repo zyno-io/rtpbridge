@@ -18,7 +18,7 @@ pub struct FileRtpState {
 }
 
 /// Poll file endpoints for PCM output. Produces RoutedRtpPackets and emits
-/// file.finished events when playback completes.
+/// file.finished events when playback completes. Returns whether routes changed.
 pub fn poll_file_endpoints(
     endpoints: &mut HashMap<EndpointId, Endpoint>,
     file_rtp_states: &mut HashMap<EndpointId, FileRtpState>,
@@ -27,7 +27,8 @@ pub fn poll_file_endpoints(
     dropped_events: &AtomicU64,
     metrics: &crate::metrics::Metrics,
     packets_out: &mut Vec<RoutedRtpPacket>,
-) {
+) -> bool {
+    let mut finished = false;
     for ep in endpoints.values_mut() {
         if let Endpoint::File(fep) = ep {
             if fep.state != EndpointState::Playing {
@@ -56,7 +57,9 @@ pub fn poll_file_endpoints(
                 }
                 let target_samples = (file_rate / 50) as usize; // 20ms at file's native rate
                 let was_playing = fep.state == EndpointState::Playing;
-                if let Some(pcm) = fep.next_pcm(target_samples) {
+                let pcm = fep.next_pcm(target_samples);
+                let has_pcm = pcm.is_some();
+                if let Some(pcm) = pcm {
                     // Emit native-rate L16 (PT 127, little-endian — matching this
                     // repo's L16 convention). The per-edge transcode/mixer then
                     // encodes to each destination at full quality (G.722@16k,
@@ -96,7 +99,9 @@ pub fn poll_file_endpoints(
                     state.seq_no = state.seq_no.wrapping_add(1);
                     // L16 RTP clock == sample rate, so advance by the sample count.
                     state.timestamp = state.timestamp.wrapping_add(samples);
-                } else if was_playing && fep.state == EndpointState::Finished {
+                }
+                if was_playing && fep.state == EndpointState::Finished {
+                    finished = true;
                     super::media_session::emit_event_with_priority(
                         event_tx,
                         critical_event_tx,
@@ -108,20 +113,26 @@ pub fn poll_file_endpoints(
                                 .unwrap_or_default()
                                 .as_millis()
                                 as u64,
-                            reason: "completed".to_string(),
-                            error: None,
+                            reason: if fep.playback_error.is_some() {
+                                "error"
+                            } else {
+                                "completed"
+                            }
+                            .to_string(),
+                            error: fep.playback_error.take(),
                         },
                         dropped_events,
                         metrics,
                     );
                     break;
-                } else {
+                } else if !has_pcm {
                     // No data available yet (e.g., shared playback buffer empty)
                     break;
                 }
             }
         }
     }
+    finished
 }
 
 #[cfg(test)]
@@ -402,7 +413,9 @@ mod tests {
         let path = "/tmp/rtpbridge-filepoll-finished.wav";
         test_wav(path, 0.01); // 10ms < 20ms ptime
 
-        let (id, ep) = make_file_endpoint(path);
+        let id = uuid::Uuid::new_v4();
+        let file = FileEndpoint::open(id, path, 0, Some(0), 0.0).unwrap();
+        let ep = Endpoint::File(Box::new(file));
         let mut endpoints = HashMap::new();
         endpoints.insert(id, ep);
         let mut file_rtp_states = HashMap::new();
@@ -411,12 +424,12 @@ mod tests {
 
         // Create event channel to capture the finished event
         let (event_tx, mut event_rx) = mpsc::channel(16);
-        let (critical_tx, _critical_rx) = mpsc::channel(16);
+        let (critical_tx, mut critical_rx) = mpsc::channel(16);
 
         // First poll: file has < 20ms of audio; next_pcm returns Some (partial frame)
         // then on next poll it returns None (finished)
         let mut packets_out = Vec::new();
-        poll_file_endpoints(
+        let finished = poll_file_endpoints(
             &mut endpoints,
             &mut file_rtp_states,
             &Some(event_tx.clone()),
@@ -424,6 +437,13 @@ mod tests {
             &dropped,
             &metrics,
             &mut packets_out,
+        );
+
+        assert!(finished);
+        assert_eq!(
+            packets_out.len(),
+            1,
+            "completion preserves the last padded PCM frame"
         );
 
         // Force another poll to trigger the finished path
@@ -440,10 +460,16 @@ mod tests {
             &mut packets_out,
         );
 
-        // Check if finished event was emitted
-        if let Ok(event) = event_rx.try_recv() {
-            assert_eq!(event.event, "endpoint.file.finished");
-        }
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok())
+            .chain(std::iter::from_fn(|| critical_rx.try_recv().ok()))
+            .collect();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event == "endpoint.file.finished")
+                .count(),
+            1
+        );
         // The file endpoint should be in Finished state
         if let Endpoint::File(ref fep) = endpoints[&id] {
             assert_eq!(fep.state, EndpointState::Finished);

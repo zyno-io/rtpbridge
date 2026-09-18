@@ -625,6 +625,9 @@ pub struct InboundStats {
     /// because the session packet channel was full.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub channel_overflows: Option<u64>,
+    /// RTP/RTCP source-policy rejects; excluded from accepted-media counters.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rejected_source_packets: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]

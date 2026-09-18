@@ -16,6 +16,7 @@ pub mod routing;
 pub mod session_dtmf;
 pub mod stats;
 pub mod tone_poll;
+pub mod transfer;
 pub mod vad_tap;
 
 use dashmap::DashMap;
@@ -54,6 +55,7 @@ pub struct Session {
     pub cmd_tx: mpsc::Sender<SessionCommand>,
     /// Disconnect timeout handle (if orphaned)
     pub orphan_timeout: Option<tokio::task::JoinHandle<()>>,
+    orphan_generation: u64,
     /// Current endpoint count, updated atomically by the media session task
     pub endpoint_count: Arc<AtomicUsize>,
     /// Handle to the media session task (aborted on force-destroy)
@@ -141,6 +143,40 @@ impl SessionManager {
             session_count: AtomicUsize::new(0),
             ws_audio_registry: Arc::new(crate::control::ws_audio::WsAudioRegistry::new()),
         }))
+    }
+
+    /// Production constructor. Keep the explicit constructor available for embedded users.
+    pub fn from_config(
+        config: &crate::config::Config,
+        shutdown: ShutdownCoordinator,
+        file_cache: Arc<FileCache>,
+        metrics: Arc<Metrics>,
+    ) -> anyhow::Result<Arc<Self>> {
+        let mut manager = Self::new(
+            shutdown,
+            config.disconnect_timeout_secs,
+            config.media_ip.clone(),
+            config.rtp_port_range,
+            config.max_sessions,
+            config.max_endpoints_per_session,
+            config.max_recordings_per_session,
+            config.recording_flush_timeout_secs,
+            config.recording_channel_size,
+            config.max_sdp_size_kb,
+            config.session_idle_timeout_secs,
+            config.empty_session_timeout_secs,
+            config.media_timeout_secs,
+            config.transcode_cache_size,
+            config.media_dir.clone(),
+            file_cache,
+            metrics,
+            config.recording_dir.clone(),
+        )?;
+        let owned = Arc::get_mut(&mut manager).expect("new manager has one owner");
+        let bindings =
+            Arc::get_mut(&mut owned.media_bindings).expect("new bindings have one owner");
+        bindings.source_networks = config.rtp_source_networks.clone().into();
+        Ok(manager)
     }
 
     pub fn recording_dir(&self) -> &Path {
@@ -271,6 +307,7 @@ impl SessionManager {
             created_at_wall: chrono_now(),
             cmd_tx,
             orphan_timeout: None,
+            orphan_generation: 0,
             endpoint_count: endpoint_count_session,
             task_handle: Some(task_handle),
         };
@@ -343,22 +380,17 @@ impl SessionManager {
             return Err("SESSION_NOT_ORPHANED");
         }
 
+        let cmd_tx = entry.cmd_tx.clone();
+        let permit = cmd_tx.try_reserve().map_err(|_| "SESSION_BUSY")?;
+        entry.state = SessionState::Active;
+        entry.orphan_generation = entry.orphan_generation.wrapping_add(1);
+        permit.send(SessionCommand::Attach {
+            event_tx,
+            critical_event_tx,
+            dropped_events,
+        });
         if let Some(handle) = entry.orphan_timeout.take() {
             handle.abort();
-        }
-
-        entry.state = SessionState::Active;
-        let cmd_tx = entry.cmd_tx.clone();
-        if cmd_tx
-            .try_send(SessionCommand::Attach {
-                event_tx,
-                critical_event_tx,
-                dropped_events,
-            })
-            .is_err()
-        {
-            entry.state = SessionState::Orphaned;
-            return Err("SESSION_BUSY");
         }
 
         Ok(cmd_tx)
@@ -370,6 +402,11 @@ impl SessionManager {
                 warn!(session_id = %id, "detach command dropped (channel full/closed)");
             }
             entry.state = SessionState::Orphaned;
+            entry.orphan_generation = entry.orphan_generation.wrapping_add(1);
+            let generation = entry.orphan_generation;
+            if let Some(old) = entry.orphan_timeout.take() {
+                old.abort();
+            }
 
             let session_id = *id;
             let manager = Arc::clone(self);
@@ -381,16 +418,25 @@ impl SessionManager {
                 shutdown
                     .sleep_or_shutdown(std::time::Duration::from_secs(timeout_secs))
                     .await;
-                // Re-check state: if the session was re-attached in the meantime,
-                // don't destroy it (fixes race between attach and orphan timeout).
-                let should_destroy = manager
-                    .sessions
-                    .get(&session_id)
-                    .map(|s| s.state == SessionState::Orphaned)
-                    .unwrap_or(false);
-                if should_destroy {
+                // Removal and the generation check share the map's write lock,
+                // so attachment can neither race destruction nor cancel a newer orphan.
+                let expired = manager.sessions.remove_if(&session_id, |_, session| {
+                    session.state == SessionState::Orphaned
+                        && session.orphan_generation == generation
+                });
+                if let Some((_, mut session)) = expired {
                     warn!(session_id = %session_id, "orphan timeout expired, destroying session");
-                    manager.destroy_session(&session_id).ok();
+                    if let Some(handle) = session.task_handle.take() {
+                        handle.abort(); // The session guard releases all counters/resources.
+                    } else {
+                        let count = session.endpoint_count.load(Ordering::Acquire);
+                        for _ in 0..count {
+                            manager.metrics.endpoints_active.dec();
+                        }
+                        manager.session_count.fetch_sub(1, Ordering::AcqRel);
+                        manager.shutdown.session_ended();
+                        manager.metrics.sessions_active.dec();
+                    }
                 }
             });
 
@@ -520,13 +566,32 @@ mod tests {
             created_at_wall: chrono_now(),
             cmd_tx,
             orphan_timeout: None,
+            orphan_generation: 0,
             endpoint_count: Arc::new(AtomicUsize::new(0)),
             task_handle: None,
         };
         mgr.sessions.insert(id, session);
+        mgr.session_count.fetch_add(1, Ordering::AcqRel);
         mgr.shutdown.session_started();
         mgr.metrics.sessions_active.inc();
         (id, cmd_rx)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_attach_preserves_original_orphan_deadline() {
+        let mut manager = test_manager();
+        Arc::get_mut(&mut manager).unwrap().disconnect_timeout_secs = 1;
+        let (id, _receiver) = insert_session(&manager, SessionState::Active, 1);
+        manager.detach_session(&id); // fills the one-slot queue with Detach
+        tokio::task::yield_now().await;
+        let (events, _) = mpsc::channel(1);
+        let (critical, _) = mpsc::channel(1);
+        let result = manager.attach_session(&id, events, critical, Arc::new(AtomicU64::new(0)));
+        assert_eq!(result.unwrap_err(), "SESSION_BUSY");
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(manager.get_session_cmd_tx(&id).is_none());
+        assert_eq!(manager.session_count.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -667,3 +732,5 @@ mod tests {
         // If we reach here without hanging, the task was aborted successfully
     }
 }
+
+pub mod source_audio;

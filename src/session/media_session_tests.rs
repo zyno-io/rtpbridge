@@ -36,6 +36,7 @@ fn test_session_state() -> SessionState {
         tone_rtp_states: HashMap::new(),
         transcode_cache: HashMap::new(),
         url_sources: HashMap::new(),
+        reserved_transfers: HashSet::new(),
         fax_detectors: HashMap::new(),
         analysis_decoders: HashMap::new(),
         media_timeout_emitted: std::collections::HashSet::new(),
@@ -519,7 +520,7 @@ fn test_vad_stop_prunes_shared_decoder_when_no_fax() {
         .insert(eid, VadMonitor::new(16000, 0.5, 1000));
     state.analysis_decoders.insert(
         eid,
-        crate::media::codec::make_decoder(AudioCodec::G722).unwrap(),
+        crate::session::source_audio::SourceAudio::new(AudioCodec::G722).unwrap(),
     );
 
     state.handle_vad_stop(eid).unwrap();
@@ -541,7 +542,7 @@ fn test_vad_stop_keeps_shared_decoder_when_fax_active() {
     state.fax_detectors.insert(eid, FaxDetector::new(16000));
     state.analysis_decoders.insert(
         eid,
-        crate::media::codec::make_decoder(AudioCodec::G722).unwrap(),
+        crate::session::source_audio::SourceAudio::new(AudioCodec::G722).unwrap(),
     );
 
     state.handle_vad_stop(eid).unwrap();
@@ -915,7 +916,7 @@ async fn test_cleanup_endpoint_state_removes_analysis_decoder() {
     // Add a shared analysis decoder
     state.analysis_decoders.insert(
         eid,
-        crate::media::codec::make_decoder(AudioCodec::Pcmu).unwrap(),
+        crate::session::source_audio::SourceAudio::new(AudioCodec::Pcmu).unwrap(),
     );
     assert!(state.analysis_decoders.contains_key(&eid));
 
@@ -1234,9 +1235,7 @@ async fn test_url_sources_drained_on_cleanup() {
         .insert(eid2, "https://example.com/b.wav".to_string());
 
     // Simulate what the session shutdown code does
-    for (_eid, url) in state.url_sources.drain() {
-        state.file_cache.release(&url).await;
-    }
+    state.url_sources.clear();
 
     assert!(
         state.url_sources.is_empty(),
@@ -1370,6 +1369,49 @@ fn rtp_family_offer(is_v6: bool) -> String {
 }
 
 #[tokio::test]
+async fn conference_output_follows_codec_and_payload_type_changes() {
+    let mut state = test_session_state();
+    let (tx, _rx) = mpsc::channel(16);
+    let mut ids = Vec::new();
+    for _ in 0..3 {
+        let created = state
+            .handle_create_from_offer(
+                &tx,
+                &rtp_family_offer(false),
+                EndpointDirection::SendRecv,
+                None,
+            )
+            .await;
+        let (id, _) = created.unwrap();
+        ids.push(id);
+    }
+    state.rebuild_routing();
+    let destination = ids[0];
+    let mixer = state.mixers.get_mut(&destination).unwrap();
+    mixer.feed_pcm(ids[1], Arc::new(vec![1000; 160])).unwrap();
+    mixer.flush_tick().unwrap();
+    let before = mixer.drain().next().unwrap();
+    assert_eq!(before.payload_type, 0);
+    assert_eq!(before.payload.len(), 160);
+
+    if let Endpoint::Rtp(endpoint) = state.endpoints.get_mut(&destination).unwrap() {
+        let codec = endpoint.send_codec.as_mut().unwrap();
+        codec.name = "g722".into();
+        codec.pt = 109;
+        codec.clock_rate = 8000;
+    }
+    state.rebuild_routing();
+    let mixer = state.mixers.get_mut(&destination).unwrap();
+    // G.722 consumes 320 PCM samples per 20 ms, PCMU consumed 160.
+    mixer.feed_pcm(ids[1], Arc::new(vec![1000; 320])).unwrap();
+    mixer.flush_tick().unwrap();
+    let after = mixer.drain().next().unwrap();
+    assert_eq!(after.payload_type, 109);
+    assert_eq!(after.payload.len(), 160);
+    assert!(after.marker);
+}
+
+#[tokio::test]
 async fn test_create_from_offer_rejects_unbound_address_family() {
     // The default test session binds only IPv4. A plain-RTP offer with an
     // IPv6 c= line must be rejected, not answered with an unreachable IPv4
@@ -1435,4 +1477,250 @@ async fn test_create_from_offer_dual_stack_answers_matching_family() {
         answer4.contains("c=IN IP4"),
         "IPv4 offer must get an IPv4 answer; answer:\n{answer4}"
     );
+}
+
+async fn double_check_rtp_session(count: usize) -> (SessionState, Vec<EndpointId>) {
+    let mut state = test_session_state();
+    let (tx, _rx) = mpsc::channel(16);
+    let mut ids = Vec::new();
+    for _ in 0..count {
+        let created = state
+            .handle_create_from_offer(
+                &tx,
+                &rtp_family_offer(false),
+                EndpointDirection::SendRecv,
+                None,
+            )
+            .await;
+        ids.push(created.unwrap().0);
+    }
+    state.rebuild_routing();
+    (state, ids)
+}
+
+#[tokio::test]
+async fn completed_generators_leave_mixers_and_restore_direct_routing() {
+    for file in [false, true] {
+        let (mut state, ids) = double_check_rtp_session(2).await;
+        let source = EndpointId::new_v4();
+        let generator = if file {
+            // A decoder without more packets has the same EOF transition as a
+            // consumed file; the file-poll test separately covers its last PCM.
+            let mut endpoint = FileEndpoint::new_buffering(source, 0.0);
+            endpoint.state = EndpointState::Playing;
+            endpoint.loop_count = Some(0);
+            Endpoint::File(Box::new(endpoint))
+        } else {
+            Endpoint::Tone(Box::new(super::super::endpoint_tone::ToneEndpoint::new(
+                source,
+                super::super::endpoint_tone::ToneType::Beep,
+                None,
+                Some(0),
+            )))
+        };
+        state.endpoints.insert(source, generator);
+        state.rebuild_routing();
+        assert_eq!(state.mixers.len(), 2);
+        let (_, changed) = poll_and_route(
+            &mut state.endpoints,
+            &mut state.dtmf_state,
+            &state.sensitive_dtmf_endpoints,
+            &state.routing,
+            &state.event_tx,
+            &state.critical_event_tx,
+            &state.dropped_events,
+            &mut state.recording_mgr,
+            &mut state.vad_monitors,
+            &mut state.fax_detectors,
+            &mut state.analysis_decoders,
+            &state.metrics,
+            Vec::new(),
+            &mut state.file_rtp_states,
+            &mut state.tone_rtp_states,
+            &mut state.transcode_cache,
+            128,
+            &mut state.mixers,
+            &mut state.playout_buffers,
+            &state.playout_policy,
+            &mut state.mix_grid,
+        )
+        .await;
+        assert!(changed, "generator completion must update routing");
+        state.rebuild_routing();
+        assert!(state.mixers.is_empty());
+        assert!(state.routing.destinations(&source).is_none());
+        assert_eq!(
+            state.routing.destinations(&ids[0]),
+            Some(&HashSet::from([ids[1]]))
+        );
+    }
+}
+
+#[tokio::test]
+async fn double_check_tap_stop_preserves_pcm_needed_by_routing() {
+    for count in [2, 3] {
+        for fax in [false, true] {
+            let (mut state, ids) = double_check_rtp_session(count).await;
+            let source = ids[0];
+            if count == 2 {
+                if let Endpoint::Rtp(endpoint) = state.endpoints.get_mut(&ids[1]).unwrap() {
+                    let codec = endpoint.send_codec.as_mut().unwrap();
+                    codec.name = "g722".into();
+                    codec.pt = 9;
+                }
+                state.rebuild_routing();
+            }
+            if fax {
+                state.handle_fax_detect_start(source).unwrap();
+            } else {
+                state.handle_vad_start(source, 1000, 0.5).unwrap();
+            }
+            let mut audio =
+                crate::session::source_audio::SourceAudio::new(AudioCodec::Pcmu).unwrap();
+            let mut packet = RoutedRtpPacket {
+                source_endpoint_id: source,
+                payload_type: 0,
+                sequence_number: 1,
+                timestamp: 0,
+                ssrc: 7,
+                marker: false,
+                payload: vec![0xff; 80],
+            };
+            let pcm = audio.decode(&packet).unwrap();
+            assert!(audio.frames(&pcm, &[8000]).unwrap().is_empty());
+            state.analysis_decoders.insert(source, audio);
+            if fax {
+                state.handle_fax_detect_stop(source).unwrap();
+            } else {
+                state.handle_vad_stop(source).unwrap();
+            }
+            let audio = state
+                .analysis_decoders
+                .get_mut(&source)
+                .expect("a routed source still owns its buffered PCM after its tap stops");
+            packet.sequence_number += 1;
+            packet.timestamp += 80;
+            let pcm = audio.decode(&packet).unwrap();
+            let frames = audio.frames(&pcm, &[8000]).unwrap();
+            assert_eq!(frames.len(), 1, "both 10 ms halves must reach the encoder");
+        }
+    }
+}
+
+#[tokio::test]
+async fn double_check_codec_change_updates_playout_clock() {
+    for (name, pt, clock_rate) in [("opus", 111, 48000), ("g722", 9, 8000), ("PCMU", 96, 8000)] {
+        let (mut state, ids) = double_check_rtp_session(3).await;
+        let source = ids[0];
+        let now = Instant::now();
+        state.playout_buffers.get_mut(&source).unwrap().push(
+            RoutedRtpPacket {
+                source_endpoint_id: source,
+                payload_type: 0,
+                sequence_number: 600,
+                timestamp: 1_000_000,
+                ssrc: 7,
+                marker: false,
+                payload: vec![0xff; 160],
+            },
+            now,
+        );
+        if let Endpoint::Rtp(endpoint) = state.endpoints.get_mut(&source).unwrap() {
+            let codec = endpoint.send_codec.as_mut().unwrap();
+            codec.name = name.into();
+            codec.pt = pt;
+            codec.clock_rate = clock_rate;
+        }
+        state.rebuild_routing();
+        let buffer = state.playout_buffers.get_mut(&source).unwrap();
+        for sequence in 0..2u16 {
+            buffer.push(
+                RoutedRtpPacket {
+                    source_endpoint_id: source,
+                    payload_type: pt,
+                    sequence_number: sequence,
+                    timestamp: u32::from(sequence) * (clock_rate / 50),
+                    ssrc: 7,
+                    marker: false,
+                    payload: vec![0; 10],
+                },
+                now,
+            );
+        }
+        let first = buffer.drain_tick(now + Duration::from_millis(60)).unwrap();
+        assert_eq!(
+            first.sequence_number, 0,
+            "discard packets buffered under the old codec/PT"
+        );
+        let second = buffer
+            .drain_tick(now + Duration::from_millis(80))
+            .expect("the new source clock must produce its next packet 20 ms later");
+        assert_eq!(second.sequence_number, 1);
+    }
+}
+
+#[tokio::test]
+async fn double_check_duplicate_transfer_cannot_release_another_rollback_slot() {
+    let (mut state, ids) = double_check_rtp_session(1).await;
+    state.max_endpoints = 1;
+    let endpoint_id = ids[0];
+    let (packet_tx, _packet_rx) = mpsc::channel(16);
+    let first = Arc::new(std::sync::Mutex::new(
+        crate::session::transfer::TransferState::default(),
+    ));
+    let second = Arc::new(std::sync::Mutex::new(
+        crate::session::transfer::TransferState::default(),
+    ));
+    for (slot, should_succeed) in [(first.clone(), true), (second.clone(), false)] {
+        let (reply, response) = oneshot::channel();
+        state
+            .handle_command(
+                SessionCommand::PrepareTransfer {
+                    slot,
+                    endpoint_id,
+                    reply,
+                },
+                &packet_tx,
+            )
+            .await;
+        let response = response.await;
+        assert_eq!(response.unwrap().is_ok(), should_succeed);
+    }
+    state
+        .handle_command(
+            SessionCommand::FinishTransfer {
+                slot: second,
+                endpoint_id,
+            },
+            &packet_tx,
+        )
+        .await;
+    assert!(
+        state.reserved_transfers.contains(&endpoint_id),
+        "the first transfer must retain its rollback capacity"
+    );
+    let created = state
+        .handle_create_from_offer(
+            &packet_tx,
+            &rtp_family_offer(false),
+            EndpointDirection::SendRecv,
+            None,
+        )
+        .await;
+    assert!(
+        created.is_err(),
+        "rollback capacity cannot be used by a new endpoint"
+    );
+    first.lock().unwrap().cancelled = true;
+    state
+        .handle_command(
+            SessionCommand::FinishTransfer {
+                slot: first,
+                endpoint_id,
+            },
+            &packet_tx,
+        )
+        .await;
+    assert!(state.endpoints.contains_key(&endpoint_id));
+    assert!(state.reserved_transfers.is_empty());
 }

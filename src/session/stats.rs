@@ -28,6 +28,7 @@ pub struct RawRecvCounters {
     channel_capacity: AtomicU64,
     min_channel_capacity: AtomicU64,
     channel_overflows: AtomicU64,
+    source_rejections: AtomicU64,
     raw_rtp_packets: AtomicU64,
     raw_rtp_bytes: AtomicU64,
     raw_rtp_packets_lost: AtomicU64,
@@ -55,6 +56,7 @@ impl Default for RawRecvCounters {
             channel_capacity: AtomicU64::new(0),
             min_channel_capacity: AtomicU64::new(u64::MAX),
             channel_overflows: AtomicU64::new(0),
+            source_rejections: AtomicU64::new(0),
             raw_rtp_packets: AtomicU64::new(0),
             raw_rtp_bytes: AtomicU64::new(0),
             raw_rtp_packets_lost: AtomicU64::new(0),
@@ -108,6 +110,13 @@ impl RawRecvCounters {
         let delay_ms = duration_ms(delay);
         self.dequeue_delay_ms.store(delay_ms, Ordering::Relaxed);
         update_max(&self.max_dequeue_delay_ms, delay_ms);
+    }
+
+    pub fn record_source_rejection(&self) {
+        self.source_rejections.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn source_rejections(&self) -> u64 {
+        self.source_rejections.load(Ordering::Relaxed)
     }
 
     pub fn record_channel_overflow(&self) {

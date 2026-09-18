@@ -77,9 +77,9 @@ pub struct RtcpStats {
     expected_prior: u32,   // expected packets at last RR (for fraction_lost interval)
     received_prior: u32,   // received packets at last RR (for fraction_lost interval)
 
-    last_transit: i64,
-    /// Monotonic epoch for jitter arrival-time computation (avoids SystemTime NTP jumps)
-    epoch: std::time::Instant,
+    /// Previous monotonic arrival, RTP timestamp and clock rate. Use wrapping
+    /// RTP deltas before converting to time so timestamp rollover is harmless.
+    last_jitter_sample: Option<(std::time::Instant, u32, u32)>,
 
     // Send stats (for generating SR about what we send)
     pub packets_sent: u32,
@@ -131,8 +131,7 @@ impl RtcpStats {
             extended_max_seq: 0,
             expected_prior: 0,
             received_prior: 0,
-            last_transit: 0,
-            epoch: std::time::Instant::now(),
+            last_jitter_sample: None,
             packets_sent: 0,
             octets_sent: 0,
             our_last_sr_ntp_middle: 0,
@@ -180,7 +179,7 @@ impl RtcpStats {
             // Jitter is per-source: clear both the smoothed value and the
             // transit baseline so the new generation starts fresh rather than
             // inheriting (and slowly decaying) the old stream's jitter.
-            self.last_transit = 0;
+            self.last_jitter_sample = None;
             self.jitter = 0;
             // last_sr_* is NOT cleared here: it's keyed by last_sr_ssrc and
             // gated in build_sr_rr, so the old source's SR timing can never
@@ -196,17 +195,12 @@ impl RtcpStats {
             self.extended_max_seq = seq32;
             self.seq_initialized = true;
         } else {
-            // RFC 3550 A.1: detect rollover by comparing to the low 16 bits
-            let max_seq_lo = self.extended_max_seq & 0xFFFF;
-            let roc = self.extended_max_seq & 0xFFFF0000;
-
-            // If seq < max by more than half the space, it's a forward rollover
-            if seq32 < max_seq_lo && (max_seq_lo - seq32) > 0x8000 {
-                // Rollover: seq wrapped from 65535 to 0
-                self.extended_max_seq = roc.wrapping_add(0x10000) | seq32;
-            } else if seq32 > max_seq_lo {
-                // Normal forward progression
-                self.extended_max_seq = roc | seq32;
+            // Only a forward modular delta advances the high-water mark. A
+            // delayed pre-rollover packet belongs to the previous cycle even
+            // though its raw u16 sequence is larger than the current one.
+            let delta = seq.wrapping_sub(self.extended_max_seq as u16);
+            if delta != 0 && delta < 0x8000 {
+                self.extended_max_seq = self.extended_max_seq.wrapping_add(u32::from(delta));
             }
             // else: duplicate or reordered old packet — don't update max
         }
@@ -215,10 +209,19 @@ impl RtcpStats {
         // Use microsecond precision to avoid integer truncation for low clock rates.
         // E.g. clock_rate=8000, timestamp=1: 1*1_000_000/8000 = 125us (vs 0ms before).
         if clock_rate > 0 {
-            let arrival_us = self.epoch.elapsed().as_micros() as i64;
-            let transit = arrival_us - (timestamp as i64 * 1_000_000 / clock_rate as i64);
-            if self.last_transit != 0 {
-                let d = (transit - self.last_transit)
+            let now = std::time::Instant::now();
+            if let Some((previous_arrival, previous_timestamp, previous_rate)) =
+                self.last_jitter_sample
+                && previous_rate == clock_rate
+            {
+                let arrival_us = now
+                    .duration_since(previous_arrival)
+                    .as_micros()
+                    .min(i64::MAX as u128) as i64;
+                let timestamp_delta = timestamp.wrapping_sub(previous_timestamp) as i32;
+                let media_us = i64::from(timestamp_delta) * 1_000_000 / i64::from(clock_rate);
+                let d = arrival_us
+                    .saturating_sub(media_us)
                     .unsigned_abs()
                     .min(u32::MAX as u64) as u32;
                 // RFC 3550 A.8: J += (|D| - J) / 16. Must be signed — when |D| < J the
@@ -227,8 +230,10 @@ impl RtcpStats {
                 // dips below J.
                 let delta = (d as i64 - self.jitter as i64) >> 4;
                 self.jitter = (self.jitter as i64 + delta).max(0) as u32;
+            } else {
+                self.jitter = 0;
             }
-            self.last_transit = transit;
+            self.last_jitter_sample = Some((now, timestamp, clock_rate));
         }
     }
 
@@ -437,6 +442,78 @@ pub fn build_sr_rr(
 }
 
 /// Parse an RTCP compound packet, extracting SR and RR data
+/// Validate the entire datagram before applying any report/BYE state.
+/// Unknown feedback types may be skipped, but malformed trailing packets are rejected.
+pub fn valid_compound(mut data: &[u8]) -> bool {
+    if data.is_empty() {
+        return false;
+    }
+    while !data.is_empty() {
+        if data.len() < 4 || data[0] >> 6 != 2 || !(192..=223).contains(&data[1]) {
+            return false;
+        }
+        let size = (usize::from(u16::from_be_bytes([data[2], data[3]])) + 1) * 4;
+        if size > data.len() {
+            return false;
+        }
+        let mut content = &data[..size];
+        if data[0] & 0x20 != 0 {
+            let padding = usize::from(content[size - 1]);
+            if size != data.len() || padding == 0 || padding > size - 4 {
+                return false;
+            }
+            content = &content[..size - padding];
+        }
+        let count = usize::from(data[0] & 31);
+        match data[1] {
+            RTCP_SR if content.len() < 28 + count * 24 => return false,
+            RTCP_RR if content.len() < 8 + count * 24 => return false,
+            RTCP_BYE => {
+                let end = 4 + count * 4;
+                if count == 0 || content.len() < end {
+                    return false;
+                }
+                if content.len() > end && end + 1 + usize::from(content[end]) > content.len() {
+                    return false;
+                }
+            }
+            RTCP_SDES => {
+                let mut offset = 4;
+                for _ in 0..count {
+                    if offset + 4 > content.len() {
+                        return false;
+                    }
+                    offset += 4;
+                    loop {
+                        if offset >= content.len() {
+                            return false;
+                        }
+                        if content[offset] == 0 {
+                            offset = (offset + 4) & !3;
+                            break;
+                        }
+                        if offset + 2 > content.len() {
+                            return false;
+                        }
+                        offset += 2 + usize::from(content[offset + 1]);
+                        if offset > content.len() {
+                            return false;
+                        }
+                    }
+                }
+                if offset != content.len() {
+                    return false;
+                }
+            }
+            204..=206 if content.len() < 12 => return false,
+            207 if content.len() < 8 => return false,
+            _ => {}
+        }
+        data = &data[size..];
+    }
+    true
+}
+
 pub fn parse_rtcp(data: &[u8]) -> Vec<RtcpPacket> {
     let mut packets = Vec::new();
     let mut offset = 0;

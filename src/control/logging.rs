@@ -166,16 +166,12 @@ fn summarize_source(value: &Value) -> Value {
     };
 
     if let Ok(url) = reqwest::Url::parse(source) {
-        let query_keys = url
-            .query_pairs()
-            .map(|(key, _)| safe_query_key(&key))
-            .collect::<BTreeSet<_>>();
         return json!({
             "kind": "url",
             "scheme": url.scheme(),
             "host": redact_digit_runs(url.host_str().unwrap_or(REDACTED)),
-            "path": redact_digit_runs(url.path()),
-            "query_keys": query_keys,
+            "path": REDACTED,
+            "has_query": url.query().is_some(),
             "has_userinfo": !url.username().is_empty() || url.password().is_some(),
         });
     }
@@ -331,19 +327,6 @@ fn safe_token(value: &str) -> Value {
         Value::String(value.into())
     } else {
         Value::String(REDACTED.into())
-    }
-}
-
-fn safe_query_key(value: &str) -> String {
-    if value.len() <= 64
-        && value.starts_with(|character: char| character.is_ascii_alphabetic() || character == '_')
-        && value.chars().all(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
-        })
-    {
-        value.into()
-    } else {
-        REDACTED.into()
     }
 }
 
@@ -585,7 +568,7 @@ mod tests {
         assert!(!output.contains(PASSWORD));
         assert!(output.contains("media~~~~~~~~~~~~~~~~.example.test"));
         assert!(output.contains("authorization"));
-        assert!(output.contains("token"));
+        assert!(output.contains("has_query"));
     }
 
     #[test]
@@ -657,5 +640,11 @@ mod tests {
         let output = serialized(response_body("endpoint.create_websocket", &response));
         assert!(!output.contains(PASSWORD));
         assert!(output.contains(REDACTED));
+    }
+    #[test]
+    fn source_summary_omits_credentials_in_paths_and_query_keys() {
+        let token = "OpaqueCredentialSentinel";
+        let source = format!("https://media.example/{token}?{token}={token}");
+        assert!(!source_summary(&source).to_string().contains(token));
     }
 }

@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use rustls::ServerConfig;
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
@@ -28,7 +29,7 @@ pub fn build_tls_acceptor(tls: &TlsConfig) -> anyhow::Result<TlsAcceptor> {
     let cert_file = File::open(&tls.cert_path)
         .with_context(|| format!("open TLS certificate {:?}", tls.cert_path))?;
     let mut cert_reader = BufReader::new(cert_file);
-    let certificates = rustls_pemfile::certs(&mut cert_reader)
+    let certificates = CertificateDer::pem_reader_iter(&mut cert_reader)
         .collect::<Result<Vec<_>, _>>()
         .context("parse TLS certificate PEM")?;
     if certificates.is_empty() {
@@ -38,9 +39,8 @@ pub fn build_tls_acceptor(tls: &TlsConfig) -> anyhow::Result<TlsAcceptor> {
     let key_file = File::open(&tls.key_path)
         .with_context(|| format!("open TLS private key {:?}", tls.key_path))?;
     let mut key_reader = BufReader::new(key_file);
-    let private_key = rustls_pemfile::private_key(&mut key_reader)
-        .context("parse TLS private-key PEM")?
-        .context("TLS private-key PEM contains no supported private key")?;
+    let private_key =
+        PrivateKeyDer::from_pem_reader(&mut key_reader).context("parse TLS private-key PEM")?;
 
     let config = ServerConfig::builder()
         .with_no_client_auth()
@@ -193,6 +193,8 @@ struct RequestHead {
     method: String,
     target: String,
     authorization: Option<String>,
+    host: Option<String>,
+    has_origin: bool,
     is_websocket_upgrade: bool,
 }
 
@@ -234,6 +236,24 @@ async fn handle_incoming(
     };
 
     let audio = classify_audio_path(&request.target);
+    let privileged = if request.is_websocket_upgrade {
+        audio.is_none()
+    } else {
+        request_requires_hmac(&request.target)
+    };
+    if privileged
+        && authenticator.is_none()
+        && (request.has_origin
+            || peer_addr.ip().to_canonical().is_loopback()
+                && !is_loopback_host(request.host.as_deref()))
+    {
+        let response = http_json_response(
+            "403 Forbidden",
+            r#"{"error":"browser control requires an authenticated backend"}"#,
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(5), stream.write_all(&response)).await;
+        return;
+    }
     if !request.is_websocket_upgrade {
         if request_requires_hmac(&request.target)
             && !is_authorized(
@@ -243,19 +263,41 @@ async fn handle_incoming(
                 &request.target,
             )
         {
-            let _ = stream.write_all(&http_unauthorized_response()).await;
+            let _ = tokio::time::timeout(
+                Duration::from_secs(5),
+                stream.write_all(&http_unauthorized_response()),
+            )
+            .await;
             return;
         }
-        let response = handle_http_request(
-            &request.method,
-            &request.target,
-            &manager,
-            &metrics,
-            &recording_dir,
-            max_recording_download_bytes,
-        )
-        .await;
-        let _ = stream.write_all(&response).await;
+        let operation = async {
+            let path_only = request.target.split('?').next().unwrap_or(&request.target);
+            if request.method == "GET"
+                && path_only.starts_with("/recordings/")
+                && path_only != "/recordings/"
+            {
+                stream_recording(
+                    &mut stream,
+                    path_only,
+                    recording_dir.clone(),
+                    max_recording_download_bytes,
+                )
+                .await
+            } else {
+                let response = handle_http_request(
+                    &request.method,
+                    &request.target,
+                    &manager,
+                    &metrics,
+                    &recording_dir,
+                    max_recording_download_bytes,
+                )
+                .await;
+                let written = stream.write_all(&response).await;
+                written.map_err(anyhow::Error::from)
+            }
+        };
+        let _ = tokio::time::timeout(Duration::from_secs(120), operation).await;
         return;
     }
 
@@ -269,7 +311,11 @@ async fn handle_incoming(
             &request.target,
         )
     {
-        let _ = stream.write_all(&http_unauthorized_response()).await;
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            stream.write_all(&http_unauthorized_response()),
+        )
+        .await;
         return;
     }
 
@@ -365,11 +411,23 @@ fn parse_request_head(data: &[u8]) -> Option<RequestHead> {
     }
 
     let mut authorization = None;
+    let mut host = None;
+    let mut has_origin = false;
     let mut is_websocket_upgrade = false;
     for line in lines {
         let (name, value) = line.split_once(':')?;
         if name.eq_ignore_ascii_case("authorization") {
+            if authorization.is_some() {
+                return None;
+            }
             authorization = Some(value.trim().to_string());
+        } else if name.eq_ignore_ascii_case("host") {
+            if host.is_some() {
+                return None;
+            }
+            host = Some(value.trim().to_string());
+        } else if name.eq_ignore_ascii_case("origin") {
+            has_origin = true;
         } else if name.eq_ignore_ascii_case("upgrade")
             && value.trim().eq_ignore_ascii_case("websocket")
         {
@@ -380,8 +438,34 @@ fn parse_request_head(data: &[u8]) -> Option<RequestHead> {
         method,
         target,
         authorization,
+        host,
+        has_origin,
         is_websocket_upgrade,
     })
+}
+
+fn is_loopback_host(host: Option<&str>) -> bool {
+    use tokio_tungstenite::tungstenite::http::uri::Authority;
+    let Some(authority) = host.and_then(|host| host.parse::<Authority>().ok()) else {
+        return false;
+    };
+    let host = authority.host();
+    let valid_suffix = authority.as_str().strip_prefix(host).is_some_and(|suffix| {
+        suffix.is_empty()
+            || suffix
+                .strip_prefix(':')
+                .is_some_and(|port| port.parse::<u16>().is_ok())
+    });
+    if !valid_suffix {
+        return false;
+    }
+    host.eq_ignore_ascii_case("localhost")
+        || host.eq_ignore_ascii_case("localhost.")
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.to_canonical().is_loopback())
 }
 
 fn request_requires_hmac(target: &str) -> bool {
@@ -424,6 +508,7 @@ fn http_json_response(status: &str, body: &str) -> Vec<u8> {
     .into_bytes()
 }
 
+#[cfg(test)]
 fn http_binary_response(status: &str, content_type: &str, body: &[u8]) -> Vec<u8> {
     let header = format!(
         "HTTP/1.1 {status}\r\n\
@@ -537,12 +622,92 @@ async fn handle_http_request(
     http_json_response(status, &body)
 }
 
+/// Four downloads at a time, with one 64 KiB buffer per admitted transfer.
+/// Snapshot length comes from the opened handle; later appends are excluded.
+async fn stream_recording(
+    stream: &mut BoxedServerIo,
+    path: &str,
+    base: PathBuf,
+    maximum: u64,
+) -> anyhow::Result<()> {
+    use std::io::Read;
+    static DOWNLOADS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    let admission = Arc::clone(DOWNLOADS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(4))))
+        .try_acquire_owned();
+    let Ok(admission) = admission else {
+        let written = stream
+            .write_all(&http_json_response(
+                "503 Service Unavailable",
+                r#"{"error":"DOWNLOAD_BUSY"}"#,
+            ))
+            .await;
+        written?;
+        return Ok(());
+    };
+    let relative = percent_encoding::percent_decode_str(&path["/recordings/".len()..])
+        .decode_utf8()?
+        .into_owned();
+    let opened = crate::storage::run(move || {
+        let file = crate::storage::open_beneath(&base, std::path::Path::new(&relative))?;
+        let length = file.metadata()?.len();
+        Ok((file, length, admission))
+    })
+    .await;
+    let (mut file, mut remaining, mut admission) = match opened {
+        Ok(opened) => opened,
+        Err(_) => {
+            let written = stream
+                .write_all(&http_json_response(
+                    "404 Not Found",
+                    r#"{"error":"recording not found"}"#,
+                ))
+                .await;
+            written?;
+            return Ok(());
+        }
+    };
+    if remaining > maximum {
+        let written = stream
+            .write_all(&http_json_response(
+                "413 Payload Too Large",
+                r#"{"error":"recording too large"}"#,
+            ))
+            .await;
+        written?;
+        return Ok(());
+    }
+    let header = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.tcpdump.pcap\r\nContent-Length: {remaining}\r\nConnection: close\r\n\r\n"
+    );
+    let written =
+        tokio::time::timeout(Duration::from_secs(5), stream.write_all(header.as_bytes())).await;
+    written??;
+    while remaining > 0 {
+        let count = remaining.min(64 * 1024) as usize;
+        let read = crate::storage::run(move || {
+            let mut buffer = vec![0; count];
+            let count = file.read(&mut buffer)?;
+            buffer.truncate(count);
+            Ok((file, buffer, admission))
+        });
+        let read_result = tokio::time::timeout(Duration::from_secs(10), read).await;
+        let (next_file, buffer, next_admission) = read_result??;
+        file = next_file;
+        admission = next_admission;
+        anyhow::ensure!(!buffer.is_empty(), "recording truncated during download");
+        remaining -= buffer.len() as u64;
+        let written = tokio::time::timeout(Duration::from_secs(5), stream.write_all(&buffer)).await;
+        written??;
+    }
+    Ok(())
+}
+
 /// Handle requests to /recordings and /recordings/<path>
 async fn handle_recording_request(
     method: &str,
     path: &str,
     recording_dir: &PathBuf,
-    max_recording_download_bytes: u64,
+    _max_recording_download_bytes: u64,
 ) -> Vec<u8> {
     let base_dir = recording_dir;
 
@@ -601,41 +766,26 @@ async fn handle_recording_request(
     }
 
     match method {
-        "GET" => {
-            // Check file size before reading to prevent OOM on large recordings
-            match tokio::fs::metadata(&canonical_path).await {
-                Ok(meta) if meta.len() > max_recording_download_bytes => {
-                    return http_json_response(
-                        "413 Payload Too Large",
-                        &format!(
-                            r#"{{"error":"recording too large ({} bytes, max {max_recording_download_bytes})"}}"#,
-                            meta.len()
-                        ),
-                    );
+        // GET file bodies are handled by stream_recording before this dispatcher.
+        "GET" => http_json_response("400 Bad Request", r#"{"error":"streaming required"}"#),
+        "DELETE" => {
+            let base_dir = canonical_base;
+            let relative = PathBuf::from(rel_path);
+            let removed = crate::storage::run(move || {
+                Ok(crate::storage::remove_beneath(&base_dir, &relative))
+            })
+            .await;
+            match removed {
+                Ok(Ok(())) => http_json_response("200 OK", r#"{"deleted":true}"#),
+                Ok(Err(_)) => {
+                    http_json_response("404 Not Found", r#"{"error":"recording not found"}"#)
                 }
-                Err(_) => {
-                    return http_json_response(
-                        "404 Not Found",
-                        r#"{"error":"recording not found"}"#,
-                    );
-                }
-                _ => {}
-            }
-            match tokio::fs::read(&canonical_path).await {
-                Ok(data) => http_binary_response("200 OK", "application/vnd.tcpdump.pcap", &data),
-                Err(_) => http_json_response("404 Not Found", r#"{"error":"recording not found"}"#),
+                Err(_) => http_json_response(
+                    "500 Internal Server Error",
+                    r#"{"error":"failed to delete recording"}"#,
+                ),
             }
         }
-        "DELETE" => match tokio::fs::remove_file(&canonical_path).await {
-            Ok(()) => http_json_response("200 OK", r#"{"deleted":true}"#),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                http_json_response("404 Not Found", r#"{"error":"recording not found"}"#)
-            }
-            Err(_) => http_json_response(
-                "500 Internal Server Error",
-                r#"{"error":"failed to delete recording"}"#,
-            ),
-        },
         _ => http_json_response(
             "405 Method Not Allowed",
             r#"{"error":"method not allowed"}"#,
@@ -770,6 +920,45 @@ mod tests {
     }
 
     #[test]
+    fn loopback_hosts_and_browser_headers_are_unambiguous() {
+        for host in [
+            "localhost",
+            "LOCALHOST.:9100",
+            "127.0.0.1:9100",
+            "[::1]:9100",
+            "[::ffff:127.0.0.1]:9100",
+        ] {
+            assert!(is_loopback_host(Some(host)), "{host}");
+        }
+        for host in [
+            "attacker.invalid",
+            "localhost.attacker.invalid",
+            "192.0.2.1",
+            "",
+            "127.0.0.1:bad",
+        ] {
+            assert!(!is_loopback_host(Some(host)), "{host}");
+        }
+        assert!(!is_loopback_host(None));
+        let request =
+            parse_request_head(b"GET / HTTP/1.1\r\nHost: localhost\r\noRiGiN: null\r\n\r\n")
+                .unwrap();
+        assert!(request.has_origin);
+        assert!(
+            parse_request_head(
+                b"GET / HTTP/1.1\r\nHost: localhost\r\nHost: attacker.invalid\r\n\r\n"
+            )
+            .is_none()
+        );
+        assert!(
+            parse_request_head(
+                b"GET / HTTP/1.1\r\nAuthorization: first\r\nAuthorization: second\r\n\r\n"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
     fn detects_websocket_upgrade_and_audio_capability_path() {
         let input = b"GET /audio/550e8400-e29b-41d4-a716-446655440000 HTTP/1.1\r\nUpgrade: websocket\r\n\r\n";
         let request = parse_request_head(input).expect("request should parse");
@@ -891,6 +1080,43 @@ mod tests {
             resp_str.contains("403 Forbidden") || resp_str.contains("404 Not Found"),
             "path traversal should be blocked: {}",
             resp_str
+        );
+    }
+
+    #[tokio::test]
+    async fn recording_stream_snapshots_length_without_whole_file_buffering() {
+        use std::io::Write;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("active.pcap");
+        let expected = vec![0x5a; 2 * 1024 * 1024];
+        std::fs::write(&path, &expected).unwrap();
+        let (server, mut peer) = tokio::io::duplex(1024);
+        let base = directory.path().to_path_buf();
+        let download = tokio::spawn(async move {
+            let mut stream: BoxedServerIo = Box::new(server);
+            stream_recording(
+                &mut stream,
+                "/recordings/active.pcap",
+                base,
+                4 * 1024 * 1024,
+            )
+            .await
+        });
+        let mut received = Vec::new();
+        while !received.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            let byte = peer.read_u8().await;
+            received.push(byte.unwrap());
+        }
+        let header_length = received.len();
+        let mut append = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        append.write_all(b"later append excluded").unwrap();
+        let read = peer.read_to_end(&mut received).await;
+        read.unwrap();
+        let completed = download.await;
+        completed.unwrap().unwrap();
+        assert_eq!(&received[header_length..], expected);
+        assert!(
+            String::from_utf8_lossy(&received[..header_length]).contains("Content-Length: 2097152")
         );
     }
 

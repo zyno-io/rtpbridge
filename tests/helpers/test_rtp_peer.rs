@@ -15,6 +15,7 @@ pub struct TestRtpPeer {
     pub local_addr: SocketAddr,
     pub remote_addr: Option<SocketAddr>,
     ssrc: u32,
+    pub activation_pt: u8,
     seq_no: u16,
     timestamp: u32,
     packets_received: Arc<AtomicU64>,
@@ -50,6 +51,7 @@ impl TestRtpPeer {
             local_addr,
             remote_addr: None,
             ssrc: rand::random(),
+            activation_pt: 0,
             seq_no: 0,
             timestamp: 0,
             packets_received: Arc::new(AtomicU64::new(0)),
@@ -248,7 +250,24 @@ impl TestRtpPeer {
     /// `remote_ssrc` before it will send anything back.
     pub async fn activate(&mut self) {
         let silence = vec![0xFFu8; 160]; // mu-law silence
-        self.send_pcmu(&silence).await;
+        if self.activation_pt == 111 {
+            use rtpbridge::media::codec::{AudioEncoder, OpusEncoder};
+            let mut encoder = OpusEncoder::new().unwrap();
+            let mut payload = Vec::new();
+            encoder.encode(&[0; 960], &mut payload).unwrap();
+            let packet =
+                build_rtp_packet(111, self.seq_no, self.timestamp, self.ssrc, false, &payload);
+            if let Some(address) = self.remote_addr {
+                let sent = self.socket.send_to(&packet, address).await;
+                sent.unwrap();
+            }
+            self.seq_no = self.seq_no.wrapping_add(1);
+            self.timestamp = self.timestamp.wrapping_add(960);
+        } else if self.activation_pt == 9 {
+            self.send_g722(&silence).await;
+        } else {
+            self.send_pcmu(&silence).await;
+        }
     }
 
     /// Build a plain RTP/AVP SDP offer with G.722 codec

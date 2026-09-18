@@ -12,7 +12,7 @@ async fn test_transfer_rtp_endpoint() {
     let mut client_a = TestControlClient::connect(&server.addr).await;
     let mut client_b = TestControlClient::connect(&server.addr).await;
 
-    let r_a = client_a.request_ok("session.create", json!({})).await;
+    let _r_a = client_a.request_ok("session.create", json!({})).await;
     let r_b = client_b.request_ok("session.create", json!({})).await;
     let session_b_id = r_b["session_id"].as_str().unwrap().to_string();
 

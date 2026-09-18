@@ -1,7 +1,9 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Instant;
 
-use futures_util::{SinkExt, StreamExt};
+use crate::control::ws_io::{NetworkTasks, Writer};
+use futures_util::StreamExt;
+use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, mpsc};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
@@ -159,6 +161,9 @@ impl WebSocketEndpoint {
             .take()
             .ok_or_else(|| anyhow::anyhow!("websocket endpoint outbound channel already taken"))?;
 
+        let completion = cmd_tx
+            .try_reserve_owned()
+            .map_err(|_| anyhow::anyhow!("WS_BUSY"))?;
         self.connected = true;
         self.state = EndpointState::Connected;
 
@@ -166,7 +171,7 @@ impl WebSocketEndpoint {
             ws,
             outbound_rx,
             packet_tx,
-            cmd_tx,
+            completion,
             self.id,
             self.sample_rate,
             self.flush_frames,
@@ -180,8 +185,11 @@ impl WebSocketEndpoint {
     /// Cancel and await the IO task (used on explicit teardown / transfer paths).
     pub async fn stop_io_task(&mut self) {
         self.cancel.cancel();
-        if let Some(handle) = self.io_task.take() {
-            let _ = handle.await;
+        if let Some(mut handle) = self.io_task.take() {
+            let stopped = tokio::time::timeout(Duration::from_secs(1), &mut handle).await;
+            if stopped.is_err() {
+                handle.abort();
+            }
         }
         self.cancel = CancellationToken::new();
     }
@@ -209,6 +217,7 @@ impl std::fmt::Debug for WebSocketEndpoint {
 }
 
 /// Decode L16 LE bytes to i16 samples (drops a trailing odd byte if present).
+#[cfg(test)]
 fn l16_to_samples(bytes: &[u8]) -> Vec<i16> {
     bytes
         .chunks_exact(2)
@@ -217,6 +226,7 @@ fn l16_to_samples(bytes: &[u8]) -> Vec<i16> {
 }
 
 /// Encode i16 samples to L16 LE bytes.
+#[cfg(test)]
 fn samples_to_l16(samples: &[i16], out: &mut Vec<u8>) {
     out.clear();
     out.reserve(samples.len() * 2);
@@ -225,134 +235,204 @@ fn samples_to_l16(samples: &[i16], out: &mut Vec<u8>) {
     }
 }
 
-/// Single combined IO task: pumps audio both directions over one WS, handles
-/// Ping/Pong/Close, reframes the wire stream into exact 20 ms L16 packets at the
-/// wire `sample_rate` (no resampling — the internal rate is the wire rate), and
-/// coalesces outbound frames per `flush_frames` (0 = passthrough). Owns the
-/// connection-limit permit for the socket's lifetime.
+struct Disconnect {
+    completion: Option<mpsc::OwnedPermit<SessionCommand>>,
+    endpoint_id: EndpointId,
+}
+impl Drop for Disconnect {
+    fn drop(&mut self) {
+        if let Some(completion) = self.completion.take() {
+            completion.send(SessionCommand::WebSocketDisconnected {
+                endpoint_id: self.endpoint_id,
+            });
+        }
+    }
+}
+
+/// Socket input and output are independent. Accepted PCM is paced to the media
+/// grid with a finite byte budget; overload closes the endpoint explicitly.
 #[allow(clippy::too_many_arguments)]
 async fn ws_io_task(
     ws: AudioWsStream,
     mut outbound_rx: mpsc::Receiver<Vec<u8>>,
     packet_tx: mpsc::Sender<InboundPacket>,
-    cmd_tx: mpsc::Sender<SessionCommand>,
+    completion: mpsc::OwnedPermit<SessionCommand>,
     endpoint_id: EndpointId,
     sample_rate: u32,
     flush_frames: usize,
     cancel: CancellationToken,
     _permit: OwnedSemaphorePermit,
 ) {
-    let (mut ws_tx, mut ws_rx) = ws.split();
-    let null_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
-
-    // 20 ms of audio at the wire rate (samples / bytes). The session's internal
-    // L16 format for this endpoint is the wire rate itself, so the IO task does
-    // no resampling — it only reframes into exact 20 ms chunks.
-    let frame_native = (sample_rate / 50) as usize;
-    let flush_bytes = flush_frames * frame_native * 2;
-
-    // Inbound: reassemble wire bytes into 20 ms L16 frames.
-    let mut in_samples: Vec<i16> = Vec::with_capacity(frame_native * 2);
-    let mut in_byte_rem: Vec<u8> = Vec::new(); // trailing odd byte across reads
-
-    // Outbound coalescing buffers.
-    let mut out_coalesce: Vec<u8> = Vec::new();
-    let mut native_buf: Vec<i16> = Vec::with_capacity(frame_native + 8);
-    let mut frame_bytes: Vec<u8> = Vec::with_capacity(frame_native * 2);
-
-    'io: loop {
+    let _disconnect = Disconnect {
+        completion: Some(completion),
+        endpoint_id,
+    };
+    let (sink, mut ws_rx) = ws.split();
+    let (writer, writer_task) = Writer::spawn(sink, cancel.clone());
+    let output_writer = writer.clone();
+    let output_cancel = cancel.clone();
+    let frame_bytes = (sample_rate / 50) as usize * 2;
+    let flush_bytes = flush_frames * frame_bytes;
+    let output_task = tokio::spawn(async move {
+        let mut coalesce = Vec::new();
+        loop {
+            let frame = tokio::select! {
+                _ = output_cancel.cancelled() => break,
+                frame = outbound_rx.recv() => match frame { Some(frame) => frame, None => break },
+            };
+            if flush_bytes == 0 {
+                let sent = output_writer.send(Message::Binary(frame.into())).await;
+                if sent.is_err() {
+                    break;
+                }
+            } else {
+                if frame.len() > 256 * 1024 || coalesce.len() + frame.len() > 256 * 1024 {
+                    break;
+                }
+                coalesce.extend_from_slice(&frame);
+                if coalesce.len() >= flush_bytes {
+                    let frame = std::mem::take(&mut coalesce);
+                    let sent = output_writer.send(Message::Binary(frame.into())).await;
+                    if sent.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        if !coalesce.is_empty() {
+            let _ = output_writer.send(Message::Binary(coalesce.into())).await;
+        }
+        output_cancel.cancel();
+    });
+    let _network = NetworkTasks {
+        cancel: cancel.clone(),
+        tasks: vec![writer_task, output_task],
+    };
+    let mut incoming = std::collections::VecDeque::<u8>::new();
+    let mut tick = tokio::time::interval(Duration::from_millis(20));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut ping = tokio::time::interval(Duration::from_secs(30));
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ping.tick().await;
+    let mut pending: Option<(Vec<u8>, tokio::time::Instant)> = None;
+    loop {
+        let deadline = pending
+            .as_ref()
+            .map(|(_, deadline)| *deadline)
+            .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(86400));
         tokio::select! {
-            _ = cancel.cancelled() => break 'io,
-
-            msg = ws_rx.next() => match msg {
+            _ = cancel.cancelled() => break,
+            _ = tokio::time::sleep_until(deadline), if pending.is_some() => break,
+            _ = ping.tick(), if pending.is_none() => {
+                let nonce = rand::random::<u64>().to_be_bytes().to_vec();
+                let sent = writer.send(Message::Ping(nonce.clone().into())).await;
+                if sent.is_err() { break; }
+                pending = Some((nonce, tokio::time::Instant::now() + Duration::from_secs(10)));
+            }
+            _ = tick.tick(), if incoming.len() >= frame_bytes => {
+                match packet_tx.try_reserve() {
+                    Ok(permit) => {
+                        let data = incoming.drain(..frame_bytes).collect();
+                        permit.send(InboundPacket { endpoint_id,
+                            source: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+                            data, recv_at: Instant::now(), is_rtcp: false, local: None,
+                        });
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => break,
+                    Err(_) => {} // Keep accepted bytes until the next tick.
+                }
+            }
+            message = ws_rx.next() => match message {
                 Some(Ok(Message::Binary(data))) => {
-                    // Reassemble samples, carrying any odd leftover byte.
-                    let mut bytes = std::mem::take(&mut in_byte_rem);
-                    bytes.extend_from_slice(&data[..]);
-                    let usable = bytes.len() - (bytes.len() % 2);
-                    for c in bytes[..usable].chunks_exact(2) {
-                        in_samples.push(i16::from_le_bytes([c[0], c[1]]));
+                    if data.len() > 256 * 1024 - incoming.len() {
+                        debug!(%endpoint_id, "WS_AUDIO_BACKPRESSURE");
+                        break;
                     }
-                    if usable < bytes.len() {
-                        in_byte_rem.push(bytes[usable]);
-                    }
-                    // Emit exact 20 ms L16 frames at the wire/native rate.
-                    while in_samples.len() >= frame_native {
-                        let frame: Vec<i16> = in_samples.drain(..frame_native).collect();
-                        let mut payload = Vec::with_capacity(frame_native * 2);
-                        samples_to_l16(&frame, &mut payload);
-                        let pkt = InboundPacket {
-                            endpoint_id,
-                            source: null_addr,
-                            data: payload,
-                            recv_at: Instant::now(),
-                            is_rtcp: false,
-                            local: None,
-                        };
-                        if packet_tx.send(pkt).await.is_err() {
-                            break 'io; // session gone
-                        }
-                    }
+                    incoming.extend(data.iter().copied());
                 }
-                Some(Ok(Message::Ping(p))) => {
-                    if ws_tx.send(Message::Pong(p)).await.is_err() {
-                        break 'io;
-                    }
+                Some(Ok(Message::Ping(data))) => {
+                    let sent = writer.send(Message::Pong(data)).await;
+                    if sent.is_err() { break; }
                 }
-                Some(Ok(Message::Close(_))) => break 'io,
-                Some(Ok(_)) => {} // Text / Pong / Frame — ignore
-                Some(Err(e)) => {
-                    debug!(endpoint_id = %endpoint_id, error = %e, "ws audio read error");
-                    break 'io;
+                Some(Ok(Message::Pong(data))) => {
+                    if pending.as_ref().is_some_and(|(nonce, _)| nonce.as_slice() == data.as_ref()) { pending = None; }
                 }
-                None => break 'io,
-            },
-
-            frame = outbound_rx.recv() => match frame {
-                Some(l16_frame) => {
-                    // Already native-rate L16; just guarantee an exact 20 ms frame.
-                    native_buf.clear();
-                    native_buf.extend(l16_to_samples(&l16_frame));
-                    native_buf.resize(frame_native, 0);
-                    samples_to_l16(&native_buf, &mut frame_bytes);
-                    if flush_bytes == 0 {
-                        if ws_tx
-                            .send(Message::Binary(frame_bytes.clone().into()))
-                            .await
-                            .is_err()
-                        {
-                            break 'io;
-                        }
-                    } else {
-                        out_coalesce.extend_from_slice(&frame_bytes);
-                        if out_coalesce.len() >= flush_bytes {
-                            let msg = std::mem::take(&mut out_coalesce);
-                            if ws_tx.send(Message::Binary(msg.into())).await.is_err() {
-                                break 'io;
-                            }
-                        }
-                    }
-                }
-                None => break 'io, // endpoint removed (outbound_tx dropped)
-            },
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                _ => {}
+            }
         }
     }
-
-    // Flush any partial coalesce buffer, then close cleanly.
-    if !out_coalesce.is_empty() {
-        let _ = ws_tx.send(Message::Binary(out_coalesce.into())).await;
-    }
-    let _ = ws_tx.send(Message::Close(None)).await;
-    // Awaited (not try_send): a dropped disconnect would leave the endpoint stuck
-    // `Connected` and routed forever. Resolves to Err harmlessly if the session is gone.
-    let _ = cmd_tx
-        .send(SessionCommand::WebSocketDisconnected { endpoint_id })
-        .await;
+    let _ = writer.send(Message::Close(None)).await;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::transport::{BoxedServerIo, PrefixedIo};
+    use futures_util::SinkExt;
+    use std::sync::Arc;
+    use tokio_tungstenite::{WebSocketStream, tungstenite::protocol::Role};
+
+    #[tokio::test(start_paused = true)]
+    async fn maximum_burst_survives_backpressure_and_keeps_20ms_pacing() {
+        let (socket, peer) = tokio::io::duplex(512 * 1024);
+        let io = PrefixedIo::new(Vec::new(), Box::new(socket) as BoxedServerIo);
+        let ws = WebSocketStream::from_raw_socket(io, Role::Server, None).await;
+        let mut peer = WebSocketStream::from_raw_socket(peer, Role::Client, None).await;
+        let mut endpoint = ep(8000, 0);
+        let (packets, mut received) = mpsc::channel(1);
+        let (commands, _commands_rx) = mpsc::channel(1);
+        let budget = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = Arc::clone(&budget).try_acquire_owned().unwrap();
+        endpoint.attach_io(ws, packets, commands, permit).unwrap();
+        let mut expected: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
+        let sent = peer.send(Message::Binary(expected.clone().into())).await;
+        sent.unwrap();
+        tokio::task::yield_now().await;
+        // Fill the media queue and force several unsuccessful drain attempts.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut actual = Vec::new();
+        let mut previous = tokio::time::Instant::now();
+        for index in 0..expected.len() / 320 {
+            let packet = received.recv().await;
+            let packet = packet.expect("accepted burst must remain connected");
+            let now = tokio::time::Instant::now();
+            if index >= 2 {
+                assert!(now - previous >= Duration::from_millis(20));
+            }
+            previous = now;
+            actual.extend(packet.data);
+        }
+        let padding = vec![0; 320 - expected.len() % 320];
+        expected.extend_from_slice(&padding);
+        let sent = peer.send(Message::Binary(padding.into())).await;
+        sent.unwrap();
+        let packet = received.recv().await;
+        actual.extend(packet.unwrap().data);
+        assert_eq!(actual, expected);
+        endpoint.stop_io_task().await;
+        assert_eq!(budget.available_permits(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn missing_pong_disconnects_once_and_releases_connection_admission() {
+        let (socket, _silent_peer) = tokio::io::duplex(4096);
+        let io = PrefixedIo::new(Vec::new(), Box::new(socket) as BoxedServerIo);
+        let ws = WebSocketStream::from_raw_socket(io, Role::Server, None).await;
+        let mut endpoint = ep(8000, 0);
+        let (packets, _received) = mpsc::channel(1);
+        let (commands, mut commands_rx) = mpsc::channel(1);
+        let budget = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = Arc::clone(&budget).try_acquire_owned().unwrap();
+        endpoint.attach_io(ws, packets, commands, permit).unwrap();
+        let disconnected = tokio::time::timeout(Duration::from_secs(41), commands_rx.recv()).await;
+        assert!(
+            matches!(disconnected.unwrap(), Some(SessionCommand::WebSocketDisconnected { endpoint_id }) if endpoint_id == endpoint.id)
+        );
+        endpoint.stop_io_task().await;
+        assert_eq!(budget.available_permits(), 1);
+        assert!(commands_rx.try_recv().is_err());
+    }
 
     fn ep(sample_rate: u32, flush_ms: u32) -> WebSocketEndpoint {
         WebSocketEndpoint::new(

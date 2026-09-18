@@ -1,9 +1,11 @@
+use anyhow::Context;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
 use std::time::{Instant, SystemTime};
 
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tracing::{debug, error, warn};
 
 use super::meta::StreamDescriptor;
@@ -33,6 +35,7 @@ pub struct StoppedRecordingInfo {
 /// Manages all recordings for a session
 pub struct RecordingManager {
     recordings: HashMap<RecordingId, Recording>,
+    pending_starts: usize,
     /// Maps endpoint_id → list of recording IDs capturing that endpoint
     endpoint_recordings: HashMap<EndpointId, Vec<RecordingId>>,
     /// Synthetic address index counter (saturates at u16::MAX - 1 to avoid collision with bridge marker 0xFFFF)
@@ -59,11 +62,87 @@ struct Recording {
     pub started_at: Instant,
     pub packet_count: u64,
     pub dropped_packet_count: u64,
-    pub tx: mpsc::Sender<RecordPacket>,
+    pub tx: mpsc::Sender<QueuedPacket>,
+    byte_budget: Arc<Semaphore>,
     pub task: tokio::task::JoinHandle<()>,
     /// Highest descriptor version already written into this recording, per
     /// endpoint. Guarantees descriptor-before-media ordering on the channel.
     pub last_written_version: HashMap<EndpointId, u64>,
+}
+
+struct QueuedPacket {
+    packet: RecordPacket,
+    _local: OwnedSemaphorePermit,
+    _global: OwnedSemaphorePermit,
+}
+
+impl Recording {
+    fn enqueue(&self, packet: RecordPacket) -> Result<(), mpsc::error::TrySendError<RecordPacket>> {
+        static BYTES: OnceLock<Arc<Semaphore>> = OnceLock::new();
+        let bytes = u32::try_from(packet.payload.len().saturating_add(64)).unwrap_or(u32::MAX);
+        let local = match Arc::clone(&self.byte_budget).try_acquire_many_owned(bytes) {
+            Ok(permit) => permit,
+            Err(_) => return Err(mpsc::error::TrySendError::Full(packet)),
+        };
+        let global =
+            match Arc::clone(BYTES.get_or_init(|| Arc::new(Semaphore::new(16 * 1024 * 1024))))
+                .try_acquire_many_owned(bytes)
+            {
+                Ok(permit) => permit,
+                Err(_) => return Err(mpsc::error::TrySendError::Full(packet)),
+            };
+        self.tx
+            .try_send(QueuedPacket {
+                packet,
+                _local: local,
+                _global: global,
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(queued) => {
+                    mpsc::error::TrySendError::Full(queued.packet)
+                }
+                mpsc::error::TrySendError::Closed(queued) => {
+                    mpsc::error::TrySendError::Closed(queued.packet)
+                }
+            })
+    }
+}
+
+#[derive(Debug)]
+pub struct PreparedRecording {
+    file: std::fs::File,
+    path: PathBuf,
+    admission: OwnedSemaphorePermit,
+}
+
+/// File creation is completed off the session task. Admission remains owned by
+/// the actual blocking operation, even when its caller stops waiting.
+pub async fn prepare(
+    base: PathBuf,
+    relative: PathBuf,
+    path: PathBuf,
+) -> anyhow::Result<PreparedRecording> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        anyhow::bail!("recording file_path must be absolute and must not contain '..' components");
+    }
+    static WRITERS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    let admission = Arc::clone(WRITERS.get_or_init(|| Arc::new(Semaphore::new(32))))
+        .try_acquire_owned()
+        .map_err(|_| anyhow::anyhow!("RECORDING_BUSY"))?;
+    crate::storage::run(move || {
+        let file = crate::storage::create_beneath(&base, &relative)
+            .context("Cannot create recording file")?;
+        Ok(PreparedRecording {
+            file,
+            path,
+            admission,
+        })
+    })
+    .await
 }
 
 impl Default for RecordingManager {
@@ -92,6 +171,7 @@ impl RecordingManager {
     ) -> Self {
         Self {
             recordings: HashMap::new(),
+            pending_starts: 0,
             endpoint_recordings: HashMap::new(),
             next_endpoint_index: 0,
             endpoint_indices: HashMap::new(),
@@ -107,46 +187,58 @@ impl RecordingManager {
     /// that the PCAP file can be created before returning success. Recording is
     /// one-directional: it captures what each source *produces* (inbound RTP/RTCP
     /// from real peers, and the RTP that internal generators emit).
+    #[allow(dead_code)] // convenience API for embedded users
     pub async fn start(
         &mut self,
         endpoint_id: Option<EndpointId>,
         file_path: String,
     ) -> anyhow::Result<RecordingId> {
-        if self.recordings.len() >= self.max_recordings {
-            let max = self.max_recordings;
-            anyhow::bail!("Maximum concurrent recordings ({max}) reached");
-        }
+        self.begin_start()?;
+        let path = PathBuf::from(file_path);
+        let base = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("recording file_path has no parent directory"))?
+            .to_path_buf();
+        let relative = path
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("recording file_path has no filename"))?
+            .into();
+        let prepared = prepare(base, relative, path).await;
+        self.complete_start(endpoint_id, prepared)
+    }
 
-        // Defense-in-depth: validate path even though the handler also checks.
-        let path = std::path::Path::new(&file_path);
-        if !path.is_absolute() {
-            anyhow::bail!("recording file_path must be absolute");
+    pub fn begin_start(&mut self) -> anyhow::Result<()> {
+        if self.recordings.len() + self.pending_starts >= self.max_recordings {
+            anyhow::bail!(
+                "Maximum concurrent recordings ({}) reached",
+                self.max_recordings
+            );
         }
-        for component in path.components() {
-            if matches!(component, std::path::Component::ParentDir) {
-                anyhow::bail!("recording file_path must not contain '..' components");
-            }
-        }
+        self.pending_starts += 1;
+        Ok(())
+    }
 
+    pub fn complete_start(
+        &mut self,
+        endpoint_id: Option<EndpointId>,
+        prepared: anyhow::Result<PreparedRecording>,
+    ) -> anyhow::Result<RecordingId> {
+        self.pending_starts = self.pending_starts.saturating_sub(1);
+        let prepared = prepared?;
         let id = RecordingId::new_v4();
-
-        // Validate file creation upfront so we don't return success
-        // for a recording that will silently fail in the background.
-        let path = PathBuf::from(&file_path);
-        let path_for_open = path.clone();
-        let file_path_for_err = file_path.clone();
-        let file = tokio::task::spawn_blocking(move || {
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path_for_open)
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to create recording file: {e}"))?
-        .map_err(|e| anyhow::anyhow!("Cannot create recording file '{file_path_for_err}': {e}"))?;
-
-        let (tx, rx) = mpsc::channel::<RecordPacket>(self.channel_size);
-        let task = tokio::spawn(recording_task(rx, file, path));
+        let file_path = prepared.path.to_string_lossy().into_owned();
+        let (tx, rx) = mpsc::channel::<QueuedPacket>(self.channel_size);
+        let (done, finished) = tokio::sync::oneshot::channel();
+        std::thread::Builder::new()
+            .name("rtp-recording".into())
+            .spawn(move || {
+                let _admission = prepared.admission;
+                recording_task(rx, prepared.file, prepared.path);
+                let _ = done.send(());
+            })?;
+        let task = tokio::spawn(async move {
+            let _ = finished.await;
+        });
 
         let recording = Recording {
             id,
@@ -156,6 +248,7 @@ impl RecordingManager {
             packet_count: 0,
             dropped_packet_count: 0,
             tx,
+            byte_budget: Arc::new(Semaphore::new(1024 * 1024)),
             task,
             last_written_version: HashMap::new(),
         };
@@ -183,7 +276,7 @@ impl RecordingManager {
                     payload,
                     timestamp: SystemTime::now(),
                 };
-                if rec.tx.try_send(pkt).is_ok() {
+                if rec.enqueue(pkt).is_ok() {
                     rec.packet_count += 1;
                     rec.last_written_version.insert(eid, version);
                 }
@@ -213,33 +306,15 @@ impl RecordingManager {
         // Do NOT abort — let the task flush the PCAP file cleanly.
         drop(recording.tx);
 
-        // Spawn a background waiter that gives the task time to flush.
-        // The task now explicitly flushes its BufWriter, so the configured
-        // timeout should be ample. If it still hasn't finished, abort as a
-        // last resort — but the explicit flush means data loss is unlikely.
+        // Observing a timeout cannot abort a running filesystem syscall. The
+        // writer retains its global permit until it actually finishes.
         let flush_timeout = std::time::Duration::from_secs(self.flush_timeout_secs);
         tokio::spawn(async move {
-            let task = recording.task;
-            tokio::pin!(task);
-            if tokio::time::timeout(flush_timeout, &mut task)
-                .await
-                .is_err()
-            {
+            let completed = tokio::time::timeout(flush_timeout, recording.task).await;
+            if completed.is_err() {
                 warn!(
-                    timeout_secs = flush_timeout.as_secs(),
-                    "recording task did not finish within flush timeout; \
-                     waiting up to 2x for hard abort"
+                    "recording flush deadline exceeded; writer remains bounded and file may be incomplete"
                 );
-                if tokio::time::timeout(flush_timeout, &mut task)
-                    .await
-                    .is_err()
-                {
-                    warn!(
-                        timeout_secs = flush_timeout.as_secs() * 2,
-                        "recording task exceeded hard abort deadline; aborting"
-                    );
-                    task.abort();
-                }
             }
         });
 
@@ -425,7 +500,7 @@ impl RecordingManager {
                         payload: dpayload.clone(),
                         timestamp: now,
                     };
-                    match rec.tx.try_send(dpkt) {
+                    match rec.enqueue(dpkt) {
                         Ok(()) => {
                             rec.packet_count += 1;
                             rec.last_written_version.insert(*endpoint_id, version);
@@ -445,7 +520,7 @@ impl RecordingManager {
                 }
             }
 
-            match rec.tx.try_send(media.clone_packet()) {
+            match rec.enqueue(media.clone_packet()) {
                 Ok(()) => rec.packet_count += 1,
                 Err(mpsc::error::TrySendError::Closed(_)) => {
                     dead_recordings.push(rec_id);
@@ -519,7 +594,7 @@ impl RecordingManager {
                             {
                                 warn!(
                                     timeout_secs = flush_timeout.as_secs() * 2,
-                                    "recording task exceeded hard abort deadline; aborting"
+                                    "recording flush deadline exceeded; stopping observation while the bounded writer finishes"
                                 );
                                 task.abort();
                             }
@@ -598,9 +673,8 @@ impl RecordPacket {
 }
 
 /// Background task that writes packets to a PCAP file.
-/// Note: PCAP writes go through BufWriter, so individual writes are fast (in-memory).
-/// The buffered data is flushed on channel close, which is the only potentially slow I/O.
-async fn recording_task(mut rx: mpsc::Receiver<RecordPacket>, file: std::fs::File, path: PathBuf) {
+/// Runs on a dedicated, admitted thread. BufWriter may flush on any packet.
+fn recording_task(mut rx: mpsc::Receiver<QueuedPacket>, file: std::fs::File, path: PathBuf) {
     let mut writer = match pcap_writer::create_pcap_writer(std::io::BufWriter::new(file)) {
         Ok(w) => w,
         Err(e) => {
@@ -609,8 +683,9 @@ async fn recording_task(mut rx: mpsc::Receiver<RecordPacket>, file: std::fs::Fil
         }
     };
 
-    while let Some(pkt) = rx.recv().await {
-        if let Err(e) = pcap_writer::write_record_packet(&mut writer, &pkt) {
+    while let Some(queued) = rx.blocking_recv() {
+        let pkt = &queued.packet;
+        if let Err(e) = pcap_writer::write_record_packet(&mut writer, pkt) {
             error!(path = %path.display(), error = %e, "PCAP write failed, stopping recording — packets may be lost");
             break;
         }

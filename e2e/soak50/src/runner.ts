@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import os from "node:os";
 import path from "node:path";
+import { monitorEventLoopDelay } from "node:perf_hooks";
 import { promisify } from "node:util";
 import { chromium, type Browser } from "playwright";
 
@@ -797,6 +798,7 @@ async function runMonitor(params: {
   shouldStop: () => boolean;
   fail: (reason: string, detail?: unknown, callId?: string) => Promise<void>;
 }): Promise<void> {
+  let reportedFailures = 0;
   while (!params.shouldStop()) {
     const active = params.runtimes.filter((runtime) => !runtime.destroyed && runtime.startedAtMs > 0);
     for (const runtime of active) {
@@ -825,6 +827,17 @@ async function runMonitor(params: {
           .map((endpoint) => ({ endpointId: endpoint.endpointId, peer: endpoint.peer })),
       );
     }
+    // Quality failures must be visible during the run, as well as in the final
+    // verdict. Do not duplicate them in the separate control-failure collection.
+    const qualityFailures = params.monitor.allFailures();
+    for (const failure of qualityFailures.slice(reportedFailures)) {
+      await params.reporter.event("quality.failure", {
+        call_id: failure.callId,
+        reason: failure.reason,
+        detail: failure.detail,
+      });
+    }
+    reportedFailures = qualityFailures.length;
     await sleep(params.options.sampleIntervalMs);
   }
 }
@@ -835,15 +848,28 @@ async function runLoadMonitor(params: {
   rtpbridgePid: () => number | undefined;
   shouldStop: () => boolean;
 }): Promise<void> {
-  while (!params.shouldStop()) {
-    try {
-      await params.reporter.appendLoadSample(await sampleLoad(params.rtpbridgePid(), params.options.loadPids));
-    } catch (error) {
-      await params.reporter.event("load.sample_failed", {
-        error: error instanceof Error ? error.message : String(error),
-      });
+  const delay = monitorEventLoopDelay({ resolution: 10 });
+  delay.enable();
+  try {
+    while (!params.shouldStop()) {
+      try {
+        const sample = await sampleLoad(params.rtpbridgePid(), params.options.loadPids);
+        sample.runner_event_loop_delay_ms = {
+          max: delay.max / 1_000_000,
+          p99: delay.percentile(99) / 1_000_000,
+          mean: delay.count > 0 ? delay.mean / 1_000_000 : 0,
+        };
+        delay.reset();
+        await params.reporter.appendLoadSample(sample);
+      } catch (error) {
+        await params.reporter.event("load.sample_failed", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+      await sleep(params.options.loadSampleIntervalMs);
     }
-    await sleep(params.options.loadSampleIntervalMs);
+  } finally {
+    delay.disable();
   }
 }
 

@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_call:
   push:
     branches: [main]
   pull_request:
@@ -23,7 +24,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.94
         with:
           components: clippy
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq libopus-dev > /dev/null
+      - uses: ./.github/actions/native-dependencies
       - run: cargo clippy -- -D warnings
 
   audit:
@@ -47,7 +48,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.94
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq libopus-dev > /dev/null
+      - uses: ./.github/actions/native-dependencies
       - run: cargo test --lib -- --test-threads=1
 
   test-integration:
@@ -57,7 +58,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.94
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq libopus-dev > /dev/null
+      - uses: ./.github/actions/native-dependencies
       - run: cargo test --test '*' -- --test-threads=1
 
   coverage:
@@ -67,7 +68,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.94
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq libopus-dev > /dev/null
+      - uses: ./.github/actions/native-dependencies
       - run: cargo install cargo-tarpaulin
       - run: cargo tarpaulin --out xml --skip-clean -- --test-threads=1
       - uses: codecov/codecov-action@v4
@@ -81,7 +82,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.94
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq libopus-dev > /dev/null
+      - uses: ./.github/actions/native-dependencies
       - run: cargo bench --no-run
 
   build-release:
@@ -91,7 +92,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.94
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq libopus-dev > /dev/null
+      - uses: ./.github/actions/native-dependencies
       - run: cargo build --release
       - run: cargo test --release --lib -- --test-threads=1
 
@@ -107,7 +108,7 @@ jobs:
 
   docker-push:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [fmt, clippy, audit, test-unit, test-integration, build-release]
+    needs: [fmt, clippy, audit, deny, test-unit, test-integration, build-release]
     runs-on: ubuntu-latest
     permissions:
       packages: write
@@ -123,21 +124,28 @@ jobs:
       - uses: docker/build-push-action@v6
         with:
           context: .
-          push: true
-          tags: ghcr.io/${{ github.repository }}:main
+          load: true
+          push: false
+          tags: ghcr.io/${{ github.repository }}:candidate
+          build-args: BUILD_VERSION=canary-${{ github.sha }}
 
       - name: Generate SBOM
         uses: anchore/sbom-action@v0
         with:
-          image: ghcr.io/${{ github.repository }}:main
+          image: ghcr.io/${{ github.repository }}:candidate
           artifact-name: sbom-main.spdx.json
           output-file: sbom.spdx.json
 
       - name: Scan container image
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: ghcr.io/${{ github.repository }}:main
+          image-ref: ghcr.io/${{ github.repository }}:candidate
           format: table
           exit-code: '1'
-          ignore-unfixed: true
+          ignore-unfixed: 'false'
           severity: CRITICAL,HIGH
+
+      - name: Publish the scanned candidate
+        run: |
+          docker tag ghcr.io/${{ github.repository }}:candidate ghcr.io/${{ github.repository }}:main
+          docker push ghcr.io/${{ github.repository }}:main

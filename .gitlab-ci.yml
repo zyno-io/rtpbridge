@@ -10,6 +10,12 @@ stages:
 
 .rust-base:
   image: rust:1.94-trixie
+  variables:
+    OPENSSL_DIR: "$CI_PROJECT_DIR/target/openssl"
+    OPENSSL_STATIC: "1"
+  needs:
+    - job: native:openssl
+      artifacts: true
   before_script:
     - apt-get update -qq && apt-get install -y -qq libopus-dev > /dev/null
     - rustup component add clippy rustfmt
@@ -21,6 +27,21 @@ stages:
     - if: $CI_COMMIT_TITLE =~ /^v\d+\.\d+\.\d+$/
       when: never
     - when: always
+
+native:openssl:
+  extends: .skip-tags
+  image: rust:1.94-trixie
+  stage: .pre
+  variables:
+    OPENSSL_DIR: "$CI_PROJECT_DIR/target/openssl"
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq build-essential ca-certificates curl libdigest-sha-perl perl > /dev/null
+  script:
+    - sh scripts/build-openssl.sh "$OPENSSL_DIR"
+  artifacts:
+    paths:
+      - target/openssl/
+    expire_in: 1 day
 
 lint:fmt:
   extends:

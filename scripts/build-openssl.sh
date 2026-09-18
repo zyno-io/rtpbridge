@@ -14,7 +14,11 @@ trap 'rm -rf "$work"' EXIT HUP INT TERM
 curl --fail --location --retry 3 --proto '=https' --tlsv1.2 \
     "https://github.com/openssl/openssl/releases/download/openssl-$version/openssl-$version.tar.gz" \
     -o "$work/openssl.tar.gz"
-actual=$(shasum -a 256 "$work/openssl.tar.gz")
+if command -v sha256sum >/dev/null 2>&1; then
+    actual=$(sha256sum "$work/openssl.tar.gz")
+else
+    actual=$(shasum -a 256 "$work/openssl.tar.gz")
+fi
 [ "${actual%% *}" = "$sha256" ] || { echo 'OpenSSL checksum mismatch' >&2; exit 1; }
 tar -xzf "$work/openssl.tar.gz" -C "$work"
 cd "$work/openssl-$version"

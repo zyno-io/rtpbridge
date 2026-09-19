@@ -4,7 +4,9 @@ Notable changes to rtpbridge are documented here. Changes under **Unreleased** h
 
 ## Unreleased
 
-No changes yet.
+### Fixed
+
+- Default `rtp_source_networks` to `["*"]` so direct RTP clients behind arbitrary NATs can establish their first media tuple. The first valid RTP or RTCP packet now locks the exact tuple immediately for both plain RTP and SRTP; later tuple changes require an accepted SDP renegotiation or direction reset.
 
 ## 0.2.0 - 2026-09-17
 

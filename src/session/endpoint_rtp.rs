@@ -149,12 +149,14 @@ pub struct RtpEndpoint {
     /// Whether rtcp-mux was negotiated (RTCP on same port as RTP)
     pub rtcp_mux: bool,
 
-    /// Symmetric RTP: time window for address learning (seconds)
-    addr_learn_window_secs: u64,
-    /// When the endpoint was created (for address learning window)
-    created_at: Instant,
-    /// Whether the remote address has been locked (learning window expired)
+    /// Whether a validated media packet has latched the exact remote RTP tuple.
     addr_locked: bool,
+    /// Packets received before this time cannot establish the next RTP tuple.
+    /// This prevents queued pre-negotiation datagrams from latching after a
+    /// re-INVITE or direction reset is applied by the session task.
+    rtp_latch_reset_at: Instant,
+    /// Equivalent reset barrier for a dedicated RTCP socket.
+    rtcp_latch_reset_at: Instant,
 
     /// Direction control mode:
     /// - Auto: follow SDP direction from re-INVITEs (endpoint.rtp.reinvite)
@@ -178,6 +180,7 @@ pub enum RtpMediaSecurity {
 
 impl RtpEndpoint {
     pub fn new(id: EndpointId, direction: EndpointDirection, socket_pair: SocketPair) -> Self {
+        let latch_reset_at = Instant::now();
         Self {
             id,
             config: EndpointConfig { direction },
@@ -190,7 +193,7 @@ impl RtpEndpoint {
 
             remote_rtp_addr: None,
             remote_rtcp_addr: None,
-            source_networks: Arc::from([]),
+            source_networks: crate::config::default_rtp_source_networks().into(),
             rtcp_addr_locked: false,
             our_ssrc: rand::random(),
             remote_ssrc: None,
@@ -219,9 +222,9 @@ impl RtpEndpoint {
             srtcp_rx: None,
             srtcp_rx_new: None,
             rtcp_mux: false,
-            addr_learn_window_secs: 5,
-            created_at: Instant::now(),
             addr_locked: false,
+            rtp_latch_reset_at: latch_reset_at,
+            rtcp_latch_reset_at: latch_reset_at,
             // Auto mode tracks remote SDP direction. An explicit non-default
             // direction at creation is treated as a manual override, so the
             // user's choice survives the initial offer/answer exchange.
@@ -854,16 +857,13 @@ impl RtpEndpoint {
 
         self.state = EndpointState::Connected;
 
-        // Re-anchor the symmetric-RTP learning window to answer time. As the
-        // offerer we don't know the peer's address (or get any media) until the
-        // answer arrives, which for a ringing phone can be many seconds after
-        // this endpoint was created — long enough that a window anchored at
-        // creation would already be closed, locking us to the (often private,
-        // NAT'd) SDP address and never latching the real source. `update_remote_sdp`
-        // resets the window for the same reason on re-INVITE; this also lets a
-        // post-rekey answer (which overwrites `remote_rtp_addr` from SDP above)
-        // re-latch the live source.
+        // A new answer deliberately reopens symmetric-RTP latching. The first
+        // validated packet after this point establishes the exact peer tuple.
         self.reset_addr_lock();
+        // Do not send to the newly advertised address until it has produced
+        // valid media. It may be a private pre-NAT SDP address, and an old SSRC
+        // must not keep outbound RTP enabled across the new negotiation.
+        self.remote_ssrc = None;
 
         Ok(())
     }
@@ -1033,7 +1033,7 @@ impl RtpEndpoint {
         } // Separate RTCP learns its own port; NAT need not preserve RTP+1.
     }
 
-    fn source_allowed(&self, source: SocketAddr, rtcp: bool) -> bool {
+    fn source_allowed(&self, source: SocketAddr, received_at: Instant, rtcp: bool) -> bool {
         if source.is_ipv6() != self.local_rtp_addr.is_ipv6() {
             return false;
         }
@@ -1045,32 +1045,51 @@ impl RtpEndpoint {
         let Some(expected) = expected else {
             return false;
         };
-        let ip = source.ip().to_canonical();
-        if ip != expected.ip().to_canonical()
-            && !self.source_networks.iter().any(|net| net.contains(&ip))
-        {
-            return false;
-        }
         let locked = if rtcp && !self.rtcp_mux {
             self.rtcp_addr_locked
         } else {
             self.addr_locked
         };
-        !locked || source == expected
+        if locked {
+            return source == expected;
+        }
+
+        let latch_reset_at = if rtcp && !self.rtcp_mux {
+            self.rtcp_latch_reset_at
+        } else {
+            self.rtp_latch_reset_at
+        };
+        if received_at < latch_reset_at {
+            return false;
+        }
+
+        let ip = source.ip().to_canonical();
+        ip == expected.ip().to_canonical()
+            || self
+                .source_networks
+                .iter()
+                .any(|network| network.contains(&ip))
     }
 
     /// Process an inbound RTP packet (SRTP decrypt if enabled)
+    #[cfg(test)]
     pub fn handle_rtp(&mut self, data: &[u8], source: SocketAddr) -> Option<RoutedRtpPacket> {
+        self.handle_rtp_at(data, source, Instant::now())
+    }
+
+    /// Process an inbound RTP packet at the instant its receive task accepted
+    /// it. The receive time prevents a queued pre-reset packet from becoming a
+    /// post-reset symmetric-RTP latch candidate.
+    pub(crate) fn handle_rtp_at(
+        &mut self,
+        data: &[u8],
+        source: SocketAddr,
+        received_at: Instant,
+    ) -> Option<RoutedRtpPacket> {
         // Check rekey switchover deadline
         self.check_rekey_switchover();
 
-        if !self.addr_locked
-            && self.remote_ssrc.is_some()
-            && self.created_at.elapsed() > Duration::from_secs(self.addr_learn_window_secs)
-        {
-            self.addr_locked = true;
-        }
-        if !self.source_allowed(source, false) {
+        if !self.source_allowed(source, received_at, false) {
             self.raw_recv.record_source_rejection();
             return None;
         }
@@ -1148,31 +1167,15 @@ impl RtpEndpoint {
         }
         let payload = header.payload(data);
 
-        // Only validated packets from approved sources may learn identity/addresses.
+        // Only validated packets from approved sources may learn identity.
         if self.remote_ssrc.is_none() {
             self.remote_ssrc = Some(header.ssrc);
             debug!(endpoint_id = %self.id, ssrc = header.ssrc, "learned remote SSRC");
-
-            if self.remote_rtp_addr != Some(source) {
-                if let Some(old) = self.remote_rtp_addr {
-                    tracing::info!(
-                        endpoint_id = %self.id,
-                        sdp_addr = %old,
-                        actual_addr = %source,
-                        "symmetric RTP: latched remote address from first packet (SDP mismatch, likely NAT)"
-                    );
-                } else {
-                    debug!(endpoint_id = %self.id, addr = %source, "learned remote address from first packet");
-                }
-                self.latch_remote_addr(source);
-            }
         } else if self.remote_ssrc != Some(header.ssrc) {
             // SSRC changed mid-call (e.g. a hold/re-INVITE that restarts the
             // RTP stream with a fresh SSRC). Track the new source so the RTCP
             // SR/RR we emit references it — `rtcp_stats` already re-baselines
-            // its sequence/loss/jitter on the same change. We do NOT re-latch
-            // the address here; a NAT rebind is handled by the windowed
-            // symmetric-RTP path below.
+            // its sequence/loss/jitter on the same change.
             debug!(
                 endpoint_id = %self.id,
                 old_ssrc = ?self.remote_ssrc,
@@ -1182,28 +1185,21 @@ impl RtpEndpoint {
             self.remote_ssrc = Some(header.ssrc);
         }
 
-        // Symmetric RTP: keep tracking address changes within the learning
-        // window (a NAT rebind during call setup), then lock once it elapses.
+        // Symmetric RTP: the first validated packet after endpoint creation or
+        // an explicit reset establishes the exact address and port. Do not
+        // autonomously migrate a call after that point, even for SRTP.
         if !self.addr_locked {
-            if self.created_at.elapsed() > Duration::from_secs(self.addr_learn_window_secs) {
-                // Learning window expired — lock the address
-                self.addr_locked = true;
-                debug!(endpoint_id = %self.id, addr = ?self.remote_rtp_addr, "address locked after learning window");
-            } else if self.remote_rtp_addr != Some(source) {
+            if self.remote_rtp_addr != Some(source) {
                 tracing::info!(
                     endpoint_id = %self.id,
                     sdp_addr = ?self.remote_rtp_addr,
                     actual_addr = %source,
-                    "symmetric RTP: updating remote address (SDP mismatch, likely NAT)"
+                    "symmetric RTP: latched remote address from first validated packet (SDP mismatch, likely NAT)"
                 );
-                self.latch_remote_addr(source);
             }
-        }
-
-        // Plain RTP has no cryptographic evidence for autonomous source migration.
-        // Relatching requires an explicit negotiation/direction reset.
-        if !self.has_srtp() {
+            self.latch_remote_addr(source);
             self.addr_locked = true;
+            debug!(endpoint_id = %self.id, addr = %source, "symmetric RTP address locked");
         }
 
         // Update stats
@@ -1229,13 +1225,25 @@ impl RtpEndpoint {
 
     /// Process an inbound RTCP packet (SRTCP decrypt if enabled).
     /// Returns (ByePacket if BYE received, decrypted RTCP bytes for recording).
+    #[cfg(test)]
     pub fn handle_rtcp(
         &mut self,
         data: &[u8],
         source: SocketAddr,
     ) -> (Option<rtcp::ByePacket>, Option<Vec<u8>>) {
+        self.handle_rtcp_at(data, source, Instant::now())
+    }
+
+    /// Process an inbound RTCP packet at the instant its receive task accepted
+    /// it. Dedicated RTCP uses its own latch barrier; rtcp-mux shares RTP's.
+    pub(crate) fn handle_rtcp_at(
+        &mut self,
+        data: &[u8],
+        source: SocketAddr,
+        received_at: Instant,
+    ) -> (Option<rtcp::ByePacket>, Option<Vec<u8>>) {
         self.check_rekey_switchover();
-        if !self.source_allowed(source, true) {
+        if !self.source_allowed(source, received_at, true) {
             self.raw_recv.record_source_rejection();
             return (None, None);
         }
@@ -1554,13 +1562,15 @@ impl RtpEndpoint {
         Ok(Some(rtcp_data))
     }
 
-    /// Reset the symmetric RTP address learning window.
-    /// Called after direction changes (e.g. hold/unhold) where the phone
+    /// Reset the symmetric RTP tuple latch.
+    /// Called after negotiated address or direction changes where the phone
     /// may resume from a new NAT binding.
     pub fn reset_addr_lock(&mut self) {
+        let reset_at = Instant::now();
         self.addr_locked = false;
         self.rtcp_addr_locked = false;
-        self.created_at = Instant::now();
+        self.rtp_latch_reset_at = reset_at;
+        self.rtcp_latch_reset_at = reset_at;
     }
 
     /// Generate a new SRTP TX key, replacing TX immediately. Returns the new
@@ -1621,12 +1631,6 @@ impl RtpEndpoint {
                 self.id.as_u128() as u64,
             )
         };
-
-        // Re-open the symmetric RTP address learning window.
-        // After rekey, the remote peer may change its NAT binding, so we need
-        // to re-learn the source address from inbound packets.
-        self.addr_locked = false;
-        self.created_at = Instant::now();
 
         debug!(endpoint_id = %self.id, "SRTP TX rekeyed — awaiting answer for RX update");
         Ok(sdp)

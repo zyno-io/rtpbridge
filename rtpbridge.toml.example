@@ -44,8 +44,11 @@ media_ip = "203.0.113.10"
 # binds a pair of ports (even for RTP, odd for RTCP) from this pool.
 rtp_port_range = [30000, 39999]
 
-# Alternate RTP/RTCP source IPs allowed during NAT learning. Empty means SDP IP only.
-# rtp_source_networks = ["203.0.113.0/24", "2001:db8:1234::/48"]
+# Source networks allowed to establish the initial symmetric RTP/RTCP tuple.
+# "*" is the default: any source may establish the tuple, which is then locked
+# to its exact IP and port. Set [] for SDP-IP-only admission, or use narrow
+# CIDRs for trusted SBCs or media gateways.
+rtp_source_networks = ["*"]
 
 # ---------------------------------------------------------------------------
 # Session Lifecycle

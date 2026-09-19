@@ -637,47 +637,13 @@ fn make_rtp_packet(ssrc: u32) -> Vec<u8> {
     crate::media::rtp::RtpHeader::build(0, 1, 160, ssrc, false, &[0u8; 160])
 }
 
-/// Fix #1 (unit): as the offerer we may ring longer than the learning window
-/// before the answer arrives. `accept_answer` must re-anchor the window to
-/// answer time, not endpoint creation — otherwise it is already closed when
-/// media starts and we lock to the (private, NAT'd) SDP address forever.
 #[tokio::test]
-async fn test_accept_answer_reanchors_stale_learning_window() {
-    let pool = crate::net::socket_pool::SocketPool::new("127.0.0.1".parse().unwrap(), 51710, 51810)
-        .unwrap();
-    let pair = pool.allocate_pair().await.unwrap();
-    let mut ep = RtpEndpoint::new(EndpointId::new_v4(), EndpointDirection::SendRecv, pair);
-
-    // Simulate a long ring: created well before the answer, past the window.
-    ep.created_at = Instant::now() - Duration::from_secs(ep.addr_learn_window_secs + 10);
-    assert!(ep.created_at.elapsed() > Duration::from_secs(ep.addr_learn_window_secs));
-
-    ep.accept_answer(&make_sdp_with_mux(30000, true)).unwrap();
-
-    assert!(
-        !ep.addr_locked,
-        "accept_answer must leave the address unlocked"
-    );
-    assert!(
-        ep.created_at.elapsed() < Duration::from_secs(ep.addr_learn_window_secs),
-        "accept_answer must re-anchor the learning window to answer time"
-    );
-}
-
-/// Fix #1 (end-to-end): offerer rings past the window, the answer advertises
-/// a private address, then media arrives from the public post-NAT source
-/// within the re-anchored window. We must latch the public source.
-#[tokio::test]
-async fn test_offerer_latches_public_source_after_long_ring() {
+async fn test_wildcard_source_latches_public_nat_tuple() {
     let pool = crate::net::socket_pool::SocketPool::new("127.0.0.1".parse().unwrap(), 51810, 51910)
         .unwrap();
     let pair = pool.allocate_pair().await.unwrap();
     let mut ep = RtpEndpoint::new(EndpointId::new_v4(), EndpointDirection::SendRecv, pair);
-    ep.source_networks = vec!["203.0.113.0/24".parse().unwrap()].into();
     ep.codecs = vec![sdp::CODEC_PCMU, sdp::CODEC_TELEPHONE_EVENT];
-
-    // Long ring before the answer.
-    ep.created_at = Instant::now() - Duration::from_secs(ep.addr_learn_window_secs + 10);
 
     // Answer advertises a private (NAT'd) address: 10.0.0.1:30000.
     ep.accept_answer(&make_sdp_with_mux(30000, true)).unwrap();
@@ -697,50 +663,44 @@ async fn test_offerer_latches_public_source_after_long_ring() {
         Some(public_src),
         "rtcp-mux: RTCP address follows the latched RTP source"
     );
+    assert!(
+        ep.addr_locked,
+        "the first validated packet locks its exact tuple"
+    );
+
+    let different_tuple: SocketAddr = "198.51.100.9:50001".parse().unwrap();
+    assert!(
+        ep.handle_rtp(&make_rtp_packet(0x1234_5678), different_tuple)
+            .is_none(),
+        "the wildcard applies only before latching, not after"
+    );
 }
 
-/// Fix #2: even if media only starts *after* the (re-anchored) window has
-/// elapsed — e.g. answered, then a long pause before cut-through — the first
-/// authenticated packet must still latch its source. Without it the
-/// window-expiry branch locks the stale SDP address. Uses a non-mux answer to
-/// also exercise the RTCP port+1 path.
 #[tokio::test]
-async fn test_first_packet_latches_even_after_window_elapsed() {
+async fn test_empty_source_networks_reject_sdp_mismatch_before_latching() {
     let pool = crate::net::socket_pool::SocketPool::new("127.0.0.1".parse().unwrap(), 51910, 52010)
         .unwrap();
     let pair = pool.allocate_pair().await.unwrap();
     let mut ep = RtpEndpoint::new(EndpointId::new_v4(), EndpointDirection::SendRecv, pair);
-    ep.source_networks = vec!["203.0.113.0/24".parse().unwrap()].into();
+    ep.source_networks = Arc::from([]);
     ep.codecs = vec![sdp::CODEC_PCMU, sdp::CODEC_TELEPHONE_EVENT];
 
     ep.accept_answer(&make_sdp_with_mux(30000, false)).unwrap();
-
-    // Window already elapsed by the time the first packet arrives.
-    ep.created_at = Instant::now() - Duration::from_secs(ep.addr_learn_window_secs + 10);
-    assert!(!ep.addr_locked);
-
     let public_src: SocketAddr = "203.0.113.9:40000".parse().unwrap();
-    let _ = ep.handle_rtp(&make_rtp_packet(0x1234_5678), public_src);
-
     assert_eq!(
         ep.remote_rtp_addr,
-        Some(public_src),
-        "first packet must latch even though the learning window had elapsed"
+        Some("10.0.0.1:30000".parse().unwrap()),
+        "the SDP tuple remains in effect before an accepted packet"
     );
-    assert_eq!(
-        ep.remote_rtcp_addr.unwrap(),
-        "10.0.0.1:30001".parse::<SocketAddr>().unwrap(),
-        "non-mux: keep SDP RTCP destination until its own source is learned"
+    assert!(
+        ep.handle_rtp(&make_rtp_packet(0x1234_5678), public_src)
+            .is_none(),
+        "an explicit empty list retains strict SDP-IP admission"
     );
 }
 
-/// Fix #1 (rekey/re-answer interaction — Codex finding #2): on an established
-/// leg `remote_ssrc` is already set, so fix #2's first-packet latch can't
-/// help. A re-answer (e.g. SRTP rekey) overwrites `remote_rtp_addr` from SDP
-/// (back to the private address). `accept_answer` reopening the window is what
-/// lets the next packet re-latch the live public source.
 #[tokio::test]
-async fn test_reanswer_reopens_window_to_relatch_established_leg() {
+async fn test_reanswer_reopens_tuple_latch_for_established_leg() {
     let pool = crate::net::socket_pool::SocketPool::new("127.0.0.1".parse().unwrap(), 52010, 52110)
         .unwrap();
     let pair = pool.allocate_pair().await.unwrap();
@@ -755,20 +715,51 @@ async fn test_reanswer_reopens_window_to_relatch_established_leg() {
     assert_eq!(ep.remote_rtp_addr, Some(public_src));
     assert!(ep.remote_ssrc.is_some(), "leg is established");
 
-    // Time passes on the call (well past the window).
-    ep.created_at = Instant::now() - Duration::from_secs(ep.addr_learn_window_secs + 10);
-
     // Re-answer overwrites the address back to the private SDP value.
     ep.accept_answer(&make_sdp_with_mux(30000, true)).unwrap();
     assert_eq!(ep.remote_rtp_addr.unwrap().ip().to_string(), "10.0.0.1");
+    assert_eq!(
+        ep.remote_ssrc, None,
+        "a re-answer must require fresh media before outbound RTP resumes"
+    );
 
     // Continued media from the same public source must re-latch.
     let _ = ep.handle_rtp(&make_rtp_packet(0x1234_5678), public_src);
     assert_eq!(
         ep.remote_rtp_addr,
         Some(public_src),
-        "re-answer must reopen the window so the established leg re-latches its source"
+        "re-answer must reopen the latch so the established leg re-latches its source"
     );
+}
+
+#[tokio::test]
+async fn test_reset_rejects_queued_packet_from_before_the_reset() {
+    let pool = crate::net::socket_pool::SocketPool::new("127.0.0.1".parse().unwrap(), 52110, 52210)
+        .unwrap();
+    let pair = pool.allocate_pair().await.unwrap();
+    let mut ep = RtpEndpoint::new(EndpointId::new_v4(), EndpointDirection::SendRecv, pair);
+    ep.codecs = vec![sdp::CODEC_PCMU, sdp::CODEC_TELEPHONE_EVENT];
+    ep.accept_answer(&make_sdp_with_mux(30000, true)).unwrap();
+
+    ep.reset_addr_lock();
+    let queued_before_reset = ep
+        .rtp_latch_reset_at
+        .checked_sub(Duration::from_nanos(1))
+        .unwrap();
+    let source: SocketAddr = "203.0.113.7:50000".parse().unwrap();
+    assert!(
+        ep.handle_rtp_at(&make_rtp_packet(0x1234_5678), source, queued_before_reset)
+            .is_none(),
+        "a packet received before the reset cannot establish its next tuple"
+    );
+    assert!(!ep.addr_locked);
+
+    assert!(
+        ep.handle_rtp(&make_rtp_packet(0x1234_5678), source)
+            .is_some(),
+        "a packet received after the reset can establish the tuple"
+    );
+    assert_eq!(ep.remote_rtp_addr, Some(source));
 }
 
 #[tokio::test]
@@ -1806,6 +1797,7 @@ async fn security_regression_invalid_secure_sdp_is_transactional() {
 #[tokio::test]
 async fn security_regression_foreign_rtp_and_rtcp_cannot_mutate_a_call() {
     let mut ep = mk_ts_endpoint(54000, 54100).await;
+    ep.source_networks = Arc::from([]);
     ep.update_remote_sdp(&make_sdp_with_mux(30000, true))
         .unwrap();
     let expected = ep.remote_rtp_addr.unwrap();

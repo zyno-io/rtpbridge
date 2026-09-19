@@ -67,7 +67,7 @@ Plain RTP/SRTP endpoints support mid-session key rotation via `endpoint.rtp.srtp
 
 4. **Switchover deadline**: After 5 seconds, any remaining old context is force-replaced by the new context, regardless of whether early promotion occurred.
 
-5. **Address learning**: The symmetric RTP address learning window is reopened on rekey to handle NAT rebinding that may accompany key rotation.
+5. **Tuple latching**: The established symmetric RTP tuple remains pinned while the rekey offer is outstanding. An accepted rekey answer reopens latching, so the next authenticated packet can establish a new tuple if the NAT binding changed.
 
 SRTCP contexts follow the same dual-context pattern independently of SRTP.
 

@@ -57,6 +57,49 @@ where
     parse_media_ips(&s).map_err(serde::de::Error::custom)
 }
 
+/// Networks that accept an initial RTP/RTCP source before symmetric RTP has
+/// learned and locked its exact tuple.  `*` in configuration expands to both
+/// address families so dual-stack media bindings retain the same default.
+pub(crate) fn default_rtp_source_networks() -> Vec<ipnet::IpNet> {
+    vec![
+        "0.0.0.0/0"
+            .parse()
+            .expect("hardcoded IPv4 wildcard network must parse"),
+        "::/0"
+            .parse()
+            .expect("hardcoded IPv6 wildcard network must parse"),
+    ]
+}
+
+/// Deserialize RTP source networks. `*` is a convenient configuration form
+/// for accepting the initial media packet from any address; it is represented
+/// internally as IPv4 and IPv6 wildcard CIDRs.
+fn deserialize_rtp_source_networks<'de, D>(deserializer: D) -> Result<Vec<ipnet::IpNet>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let values = Vec::<String>::deserialize(deserializer)?;
+    if values.iter().any(|value| value == "*") {
+        if values.len() != 1 {
+            return Err(serde::de::Error::custom(
+                "rtp_source_networks '*' must be used on its own",
+            ));
+        }
+        return Ok(default_rtp_source_networks());
+    }
+
+    values
+        .into_iter()
+        .map(|value| {
+            value.parse::<ipnet::IpNet>().map_err(|error| {
+                serde::de::Error::custom(format!(
+                    "invalid rtp_source_networks entry '{value}': {error}"
+                ))
+            })
+        })
+        .collect()
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "rtpbridge",
@@ -122,7 +165,12 @@ pub struct Config {
     /// UDP port range for plain RTP endpoints (start, end inclusive)
     pub rtp_port_range: (u16, u16),
 
-    /// Approved alternate media source networks for peers behind NAT.
+    /// Additional initial RTP/RTCP source networks allowed before symmetric
+    /// RTP latches an exact peer tuple. `*` is the default.
+    #[serde(
+        default = "default_rtp_source_networks",
+        deserialize_with = "deserialize_rtp_source_networks"
+    )]
     pub rtp_source_networks: Vec<ipnet::IpNet>,
 
     /// Session disconnect timeout in seconds
@@ -242,7 +290,7 @@ impl Default for Config {
             media_ip: default_media_ip(),
             // rtp_port_range applies per family — each media IP gets its own pool.
             rtp_port_range: (30000, 39999),
-            rtp_source_networks: Vec::new(),
+            rtp_source_networks: default_rtp_source_networks(),
             disconnect_timeout_secs: 30,
             shutdown_max_wait_secs: 300,
             media_dir: None,
@@ -675,6 +723,18 @@ mod tests {
         );
         assert_eq!(config.media_ip, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]);
         assert_eq!(config.rtp_port_range, (30000, 39999));
+        assert!(
+            config
+                .rtp_source_networks
+                .iter()
+                .any(|network| network.contains(&"198.51.100.1".parse::<IpAddr>().unwrap()))
+        );
+        assert!(
+            config
+                .rtp_source_networks
+                .iter()
+                .any(|network| network.contains(&"2001:db8::1".parse::<IpAddr>().unwrap()))
+        );
         assert_eq!(config.disconnect_timeout_secs, 30);
         assert_eq!(config.shutdown_max_wait_secs, 300);
         assert!(config.media_dir.is_none());
@@ -702,9 +762,29 @@ mod tests {
         assert_eq!(config.rtp_port_range, (20000, 29999));
         assert_eq!(config.disconnect_timeout_secs, 60);
         assert_eq!(config.max_sessions, 500);
+        assert_eq!(config.rtp_source_networks, default_rtp_source_networks());
         // Unset fields should use defaults
         assert_eq!(config.max_endpoints_per_session, 20);
         assert_eq!(config.cache_cleanup_interval_secs, 300);
+    }
+
+    #[test]
+    fn test_toml_parses_rtp_source_network_wildcard() {
+        let config: Config = toml::from_str(r#"rtp_source_networks = ["*"]"#).unwrap();
+        assert_eq!(config.rtp_source_networks, default_rtp_source_networks());
+    }
+
+    #[test]
+    fn test_toml_rtp_source_networks_allows_explicit_strict_sdp_mode() {
+        let config: Config = toml::from_str("rtp_source_networks = []").unwrap();
+        assert!(config.rtp_source_networks.is_empty());
+    }
+
+    #[test]
+    fn test_toml_rejects_mixed_rtp_source_network_wildcard() {
+        let error = toml::from_str::<Config>(r#"rtp_source_networks = ["*", "203.0.113.0/24"]"#)
+            .unwrap_err();
+        assert!(error.to_string().contains("must be used on its own"));
     }
 
     #[test]

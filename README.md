@@ -19,7 +19,7 @@ rtpbridge sits between VoIP endpoints, routing audio between them with support f
 - **Graceful shutdown** with configurable drain wait (k8s compatible)
 - **Split interface binding** for separate control and media networks
 - **Native TLS/WSS control listener** on the existing control port, with optional HMAC authorization for privileged control operations
-- **Symmetric RTP** with time-windowed address learning for NAT traversal
+- **Symmetric RTP** with first-packet tuple latching for NAT traversal
 
 ## Quick Start
 

@@ -81,7 +81,7 @@ Additional fixes replace WS front-draining vectors with paced byte-ring input, g
 ## Compatibility and operation
 
 - Control defaults to loopback. Non-loopback listeners require TLS and HMAC unless the corresponding explicit exception is configured. One HMAC key grants administrative access across sessions.
-- Configure `rtp_source_networks` for approved alternate media addresses and `file_download_origins`/`file_download_networks` before enabling remote playback. Plain RTP tuple validation cannot authenticate spoofed IP traffic.
+- `rtp_source_networks` defaults to `["*"]` so direct NATed media can latch its first valid tuple; use `[]` or approved relay CIDRs to restrict initial sources. Plain RTP tuple validation cannot authenticate spoofed IP traffic. Configure `file_download_origins`/`file_download_networks` before enabling remote playback.
 - Session and endpoint limits are finite and nonzero; the transcode cache must cover the endpoint cap. Fixed worker, queue and byte bounds are documented in [performance](./guide/performance.md).
 - Each process needs its own locked cache directory. Cache files from the old naming scheme require a stopped-server migration if their disk space must be reclaimed.
 - The runtime container now uses Distroless Debian 13 and UID/GID `65532:65532`. Adjust writable volume ownership and secret readability before upgrading. See [deployment](./guide/deployment.md).

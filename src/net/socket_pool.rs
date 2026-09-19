@@ -163,7 +163,7 @@ impl MediaBindings {
         }
         Ok(Self {
             bindings,
-            source_networks: Arc::from([]),
+            source_networks: crate::config::default_rtp_source_networks().into(),
         })
     }
 

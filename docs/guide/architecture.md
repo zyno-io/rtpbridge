@@ -49,9 +49,9 @@ Each socket-backed endpoint binds its own UDP socket(s) rather than sharing a mu
 
 ### Symmetric RTP
 
-Plain RTP endpoints use symmetric RTP with time-windowed address learning for NAT traversal. When an endpoint is created, the remote address from the SDP is recorded as the initial send target. During a 5-second learning window after creation, the source address of the first inbound packet overrides the SDP address. This handles NAT scenarios where the remote's actual transport address differs from what was advertised in the SDP.
+Plain RTP and SDES-SRTP endpoints use symmetric RTP with first-packet tuple latching for NAT traversal. The SDP address is the initial send target, but the first valid inbound packet from an allowed initial source overrides it and pins the exact IP and port. The default source policy permits any initial IP, so direct clients behind arbitrary NATs can establish media; deployments can restrict initial sources to the SDP IP or trusted relay CIDRs through `rtp_source_networks`. A tuple stays pinned until an accepted SDP renegotiation or an explicit direction reset, so later packets cannot autonomously migrate the call.
 
-Once the learning window expires, the address is locked and no further updates occur. If `rtcp-mux` is negotiated, the RTCP address tracks the RTP address; otherwise RTCP is sent to RTP port + 1.
+Separate RTCP latches its own source and port, allowing NAT mappings that do not preserve RTP-plus-one. If `rtcp-mux` is negotiated, RTP and RTCP instead share the one pinned tuple.
 
 ### One Task Per Session
 

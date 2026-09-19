@@ -3428,13 +3428,14 @@ fn handle_inbound_packet(
                 let is_rtcp =
                     pkt.is_rtcp || (rep.rtcp_mux && RtpEndpoint::is_rtcp_mux_packet(&pkt.data));
                 if is_rtcp {
-                    let (bye, decrypted_rtcp) = rep.handle_rtcp(&pkt.data, pkt.source);
+                    let (bye, decrypted_rtcp) =
+                        rep.handle_rtcp_at(&pkt.data, pkt.source, pkt.recv_at);
                     let rtcp_for_recording = decrypted_rtcp.map(|d| (pkt.endpoint_id, d));
                     let bye_info = bye.map(|b| (pkt.endpoint_id, b));
                     return (None, rtcp_for_recording, bye_info);
                 } else {
                     let has_srtp = rep.has_srtp();
-                    let result = rep.handle_rtp(&pkt.data, pkt.source);
+                    let result = rep.handle_rtp_at(&pkt.data, pkt.source, pkt.recv_at);
                     if has_srtp && result.is_none() {
                         metrics.srtp_errors.inc();
                     }

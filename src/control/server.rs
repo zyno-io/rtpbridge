@@ -251,7 +251,7 @@ async fn handle_incoming(
             "403 Forbidden",
             r#"{"error":"browser control requires an authenticated backend"}"#,
         );
-        let _ = tokio::time::timeout(Duration::from_secs(5), stream.write_all(&response)).await;
+        write_http_response_and_shutdown(&mut stream, peer_addr, &response).await;
         return;
     }
     if !request.is_websocket_upgrade {
@@ -263,11 +263,8 @@ async fn handle_incoming(
                 &request.target,
             )
         {
-            let _ = tokio::time::timeout(
-                Duration::from_secs(5),
-                stream.write_all(&http_unauthorized_response()),
-            )
-            .await;
+            let response = http_unauthorized_response();
+            write_http_response_and_shutdown(&mut stream, peer_addr, &response).await;
             return;
         }
         let operation = async {
@@ -297,7 +294,13 @@ async fn handle_incoming(
                 written.map_err(anyhow::Error::from)
             }
         };
-        let _ = tokio::time::timeout(Duration::from_secs(120), operation).await;
+        let operation_result = tokio::time::timeout(Duration::from_secs(120), operation).await;
+        match operation_result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => debug!(peer = %peer_addr, error = %e, "HTTP response failed"),
+            Err(_) => debug!(peer = %peer_addr, "HTTP response timed out"),
+        }
+        shutdown_http_transport(&mut stream, peer_addr).await;
         return;
     }
 
@@ -311,11 +314,8 @@ async fn handle_incoming(
             &request.target,
         )
     {
-        let _ = tokio::time::timeout(
-            Duration::from_secs(5),
-            stream.write_all(&http_unauthorized_response()),
-        )
-        .await;
+        let response = http_unauthorized_response();
+        write_http_response_and_shutdown(&mut stream, peer_addr, &response).await;
         return;
     }
 
@@ -354,6 +354,33 @@ async fn handle_incoming(
         Err(_) => {
             debug!(peer = %peer_addr, "WebSocket handshake timed out");
         }
+    }
+}
+
+async fn write_http_response_and_shutdown(
+    stream: &mut BoxedServerIo,
+    peer_addr: SocketAddr,
+    response: &[u8],
+) {
+    let write_result =
+        tokio::time::timeout(Duration::from_secs(5), stream.write_all(response)).await;
+    match write_result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => debug!(peer = %peer_addr, error = %e, "HTTP response failed"),
+        Err(_) => debug!(peer = %peer_addr, "HTTP response timed out"),
+    }
+    shutdown_http_transport(stream, peer_addr).await;
+}
+
+/// `Connection: close` still requires a graceful transport shutdown. In TLS mode this flushes
+/// pending ciphertext and sends close_notify; dropping the stream can make a client report an
+/// aborted response after receiving an otherwise complete body.
+async fn shutdown_http_transport(stream: &mut BoxedServerIo, peer_addr: SocketAddr) {
+    let shutdown_result = tokio::time::timeout(Duration::from_secs(5), stream.shutdown()).await;
+    match shutdown_result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => debug!(peer = %peer_addr, error = %e, "HTTP transport shutdown failed"),
+        Err(_) => debug!(peer = %peer_addr, "HTTP transport shutdown timed out"),
     }
 }
 

@@ -14,8 +14,12 @@ use futures_util::{SinkExt, StreamExt};
 use helpers::test_server::TestServer;
 use hmac::{Hmac, KeyInit, Mac};
 use rustls::{ClientConfig, RootCertStore};
+use rustls_pki_types::ServerName;
 use serde_json::{Value, json};
 use sha2::Sha256;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio_rustls::TlsConnector;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message, http::StatusCode};
 use tokio_tungstenite::{Connector, connect_async_tls_with_config};
@@ -60,7 +64,7 @@ async fn unauthenticated_loopback_control_rejects_browser_and_rebinding_requests
     let _ = control.close(None).await;
 }
 
-fn tls_connector(certificate_pem: &str) -> Connector {
+fn tls_client_config(certificate_pem: &str) -> Arc<ClientConfig> {
     let mut roots = RootCertStore::empty();
     let mut reader = BufReader::new(Cursor::new(certificate_pem.as_bytes()));
     let certificates = rustls_pki_types::CertificateDer::pem_reader_iter(&mut reader)
@@ -74,7 +78,33 @@ fn tls_connector(certificate_pem: &str) -> Connector {
     let config = ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    Connector::Rustls(Arc::new(config))
+    Arc::new(config)
+}
+
+fn tls_connector(certificate_pem: &str) -> Connector {
+    Connector::Rustls(tls_client_config(certificate_pem))
+}
+
+async fn raw_https_request(server: &TestServer, request: &str) -> Vec<u8> {
+    let certificate_pem = server
+        .tls_cert_pem
+        .as_deref()
+        .expect("TLS test server should provide its certificate");
+    let connector = TlsConnector::from(tls_client_config(certificate_pem));
+    let tcp_result = TcpStream::connect(&server.addr).await;
+    let tcp = tcp_result.expect("test server should accept TCP");
+    let server_name = ServerName::try_from("localhost")
+        .expect("localhost should be a valid TLS server name")
+        .to_owned();
+    let tls_result = connector.connect(server_name, tcp).await;
+    let mut tls = tls_result.expect("test server should accept TLS");
+    let write_result = tls.write_all(request.as_bytes()).await;
+    write_result.expect("HTTPS request should send");
+
+    let mut response = Vec::new();
+    let read_result = tls.read_to_end(&mut response).await;
+    read_result.expect("HTTPS response should end with TLS close_notify");
+    response
 }
 
 fn unix_seconds() -> i64 {
@@ -224,4 +254,57 @@ async fn wss_https_and_hmac_authorize_control_while_audio_keeps_its_own_token() 
         .close(None)
         .await
         .expect("control WebSocket should close cleanly");
+}
+
+#[tokio::test]
+async fn https_responses_end_with_clean_tls_eof() {
+    let server = TestServer::builder()
+        .tls()
+        .auth_hmac_secret(CONTROL_SECRET)
+        .start()
+        .await;
+    let expected = vec![0x5a; 2 * 64 * 1024 + 17];
+    std::fs::write(
+        std::path::Path::new(&server.recording_dir).join("clean-close.pcap"),
+        &expected,
+    )
+    .expect("test recording should be written");
+
+    let target = "/recordings/clean-close.pcap";
+    let request = format!(
+        "GET {target} HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\nConnection: close\r\n\r\n",
+        authorization(unix_seconds(), "GET", target)
+    );
+    let response = raw_https_request(&server, &request).await;
+    let header_end = response
+        .windows(4)
+        .position(|bytes| bytes == b"\r\n\r\n")
+        .map(|index| index + 4)
+        .expect("recording response should contain headers");
+    let headers = String::from_utf8_lossy(&response[..header_end]);
+    assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(headers.contains(&format!("Content-Length: {}\r\n", expected.len())));
+    assert_eq!(&response[header_end..], expected);
+
+    let unauthorized_http = raw_https_request(
+        &server,
+        "GET /sessions HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(unauthorized_http.starts_with(b"HTTP/1.1 401 Unauthorized\r\n"));
+
+    let unauthorized_upgrade = raw_https_request(
+        &server,
+        "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: AQIDBAUGBwgJCgsMDQ4PEC==\r\n\r\n",
+    )
+    .await;
+    assert!(unauthorized_upgrade.starts_with(b"HTTP/1.1 401 Unauthorized\r\n"));
+
+    let guarded_server = TestServer::builder().tls().start().await;
+    let forbidden_upgrade = raw_https_request(
+        &guarded_server,
+        "GET / HTTP/1.1\r\nHost: localhost\r\nOrigin: https://attacker.invalid\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: AQIDBAUGBwgJCgsMDQ4PEC==\r\n\r\n",
+    )
+    .await;
+    assert!(forbidden_upgrade.starts_with(b"HTTP/1.1 403 Forbidden\r\n"));
 }

@@ -51,9 +51,13 @@ impl DownloadPolicy {
             Some(url::Host::Ipv6(ip)) => IpAddr::V6(ip).to_canonical().is_loopback(),
             _ => false,
         };
-        if !(self.origins.contains(&url.origin().ascii_serialization())
-            || self.loopback_only && literal_loopback)
-        {
+        let requested_origin = url.origin().ascii_serialization();
+        if !(self.origins.contains(&requested_origin) || self.loopback_only && literal_loopback) {
+            tracing::warn!(
+                %requested_origin,
+                allowed_origins = ?self.origins,
+                "playback URL origin is not allowed"
+            );
             anyhow::bail!("playback URL origin is not allowed");
         }
         Ok(url)

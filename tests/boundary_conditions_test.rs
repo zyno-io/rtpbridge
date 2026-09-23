@@ -142,6 +142,41 @@ async fn test_sdp_with_nul_bytes() {
     client.request_ok("session.destroy", json!({})).await;
 }
 
+#[tokio::test]
+async fn test_dual_profile_audio_offer_selects_srtp() {
+    let server = TestServer::start().await;
+    let mut client = TestControlClient::connect(&server.addr).await;
+    client.request_ok("session.create", json!({})).await;
+
+    let offer = "v=0\r\n\
+        o=FreeSWITCH 1 1 IN IP4 127.0.0.1\r\n\
+        s=FreeSWITCH\r\n\
+        c=IN IP4 127.0.0.1\r\n\
+        t=0 0\r\n\
+        m=audio 30000 RTP/SAVP 0 9 8 101 13\r\n\
+        a=rtpmap:9 G722/8000\r\n\
+        a=rtpmap:101 telephone-event/8000\r\n\
+        a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\n\
+        m=audio 30000 RTP/AVP 0 9 8 101 13\r\n";
+    let result = client
+        .request_ok(
+            "endpoint.rtp.create_from_offer",
+            json!({"sdp": offer, "direction": "sendrecv"}),
+        )
+        .await;
+    let answer = result["sdp_answer"].as_str().unwrap();
+    let media_lines: Vec<&str> = answer
+        .lines()
+        .filter(|line| line.starts_with("m="))
+        .collect();
+    assert_eq!(media_lines.len(), 2);
+    assert!(media_lines[0].contains(" RTP/SAVP 9 101"));
+    assert_eq!(media_lines[1], "m=audio 0 RTP/AVP 0 9 8 101 13");
+    assert!(answer.contains("a=crypto:1 AES_CM_128_HMAC_SHA1_80"));
+
+    client.request_ok("session.destroy", json!({})).await;
+}
+
 /// Test: Deeply nested JSON doesn't cause stack overflow
 #[tokio::test]
 async fn test_deeply_nested_json() {

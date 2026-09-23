@@ -145,8 +145,12 @@ pub struct ParsedSdp {
     pub crypto: Option<SdpCrypto>,
     /// Crypto was advertised, including unsupported/malformed attributes.
     pub crypto_present: bool,
-    /// Multiple active audio sections cannot be represented by this endpoint.
+    /// Number of audio sections with nonzero ports in the remote SDP.
     pub audio_sections: usize,
+    /// Media sections in offer order, including rejected and non-audio sections.
+    pub media_sections: Vec<SdpMediaSection>,
+    /// The audio section represented by this endpoint.
+    pub selected_audio_section: Option<usize>,
     pub is_webrtc: bool,
     pub direction: Option<String>,
     pub rtcp_mux: bool,
@@ -158,10 +162,32 @@ pub struct ParsedSdp {
 }
 
 impl ParsedSdp {
-    /// Validate before allocating an endpoint or mutating a live negotiation.
+    /// Validate an answer to an offer originated by this single-media endpoint.
     pub fn validate_plain_transport(&self) -> anyhow::Result<()> {
         if self.audio_sections != 1 {
             anyhow::bail!("SDP must contain exactly one active audio section");
+        }
+        self.validate_selected_plain_media()
+    }
+
+    /// Validate a remote offer before allocating or updating an endpoint. One
+    /// audio section is selected; the others are rejected in the SDP answer.
+    pub fn validate_plain_offer(&self) -> anyhow::Result<()> {
+        if self.audio_sections == 0 {
+            anyhow::bail!("SDP must contain an active audio section");
+        }
+        self.validate_selected_plain_media()
+    }
+
+    fn validate_selected_plain_media(&self) -> anyhow::Result<()> {
+        if self.selected_audio_section.is_none()
+            || self.media_sections.iter().any(|section| {
+                section.media.is_empty()
+                    || section.protocol.is_empty()
+                    || section.formats.is_empty()
+            })
+        {
+            anyhow::bail!("invalid SDP media section");
         }
         let secure = match self.media_protocol.as_deref() {
             Some("RTP/AVP" | "RTP/AVPF") => false,
@@ -193,6 +219,31 @@ impl ParsedSdp {
         }
         Ok(())
     }
+}
+
+/// Fields needed to preserve each offered media section in an SDP answer.
+#[derive(Debug, Clone)]
+pub struct SdpMediaSection {
+    pub media: String,
+    pub protocol: String,
+    pub formats: Vec<String>,
+    active: bool,
+    crypto_present: bool,
+    crypto_supported: bool,
+}
+
+fn audio_section_preference(section: &SdpMediaSection) -> Option<u8> {
+    if section.media != "audio" || !section.active {
+        return None;
+    }
+    Some(match section.protocol.as_str() {
+        "RTP/SAVP" | "RTP/SAVPF" if section.crypto_supported => 4,
+        "RTP/AVP" | "RTP/AVPF" if section.crypto_supported => 3,
+        "RTP/SAVP" | "RTP/SAVPF" => 2,
+        "RTP/AVP" | "RTP/AVPF" if section.crypto_present => 2,
+        "RTP/AVP" | "RTP/AVPF" => 1,
+        _ => 0,
+    })
 }
 
 /// SRTP SDES crypto attribute
@@ -245,6 +296,31 @@ fn parse_sdes_inline_key(value: &str) -> Option<(String, Option<u64>)> {
     Some((key_b64.to_string(), lifetime))
 }
 
+fn parse_sdes_crypto(value: &str) -> Option<SdpCrypto> {
+    let parts: Vec<_> = value.split_whitespace().collect();
+    if parts.len() != 3 || parts[1] != "AES_CM_128_HMAC_SHA1_80" {
+        return None;
+    }
+    let tag = parts[0].parse::<u32>().ok().filter(|tag| *tag > 0)?;
+    let (key_b64, key_lifetime_packets) = parse_sdes_inline_key(parts[2])?;
+    Some(SdpCrypto {
+        tag,
+        suite: parts[1].into(),
+        key_b64,
+        key_lifetime_packets,
+    })
+}
+
+fn supported_sdes_key(crypto: &SdpCrypto) -> bool {
+    crate::media::srtp::SrtpContext::from_sdes_key_with_lifetime(
+        &crypto.key_b64,
+        crypto
+            .key_lifetime_packets
+            .unwrap_or(crate::media::srtp::MAX_SRTP_PACKETS_PER_MASTER_KEY),
+    )
+    .is_ok()
+}
+
 /// Parse relevant fields from an SDP string
 pub fn parse_sdp(sdp: &str) -> ParsedSdp {
     let mut result = ParsedSdp {
@@ -257,12 +333,59 @@ pub fn parse_sdp(sdp: &str) -> ParsedSdp {
         crypto: None,
         crypto_present: false,
         audio_sections: 0,
+        media_sections: Vec::new(),
+        selected_audio_section: None,
         is_webrtc: false,
         direction: None,
         rtcp_mux: false,
         media_protocol: None,
         is_osrtp: false,
     };
+
+    // Choose the section before parsing its attributes. A secure RTP profile
+    // (or opportunistic SRTP with crypto) wins over plain RTP regardless of
+    // offer order. Ties keep the offerer's first section.
+    let mut current_section: Option<usize> = None;
+    for line in sdp.lines().map(str::trim) {
+        if let Some(rest) = line.strip_prefix("m=") {
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            let active = parts
+                .get(1)
+                .and_then(|port| port.parse::<u16>().ok())
+                .is_some_and(|port| port > 0);
+            result.media_sections.push(SdpMediaSection {
+                media: parts.first().copied().unwrap_or_default().to_string(),
+                protocol: parts.get(2).copied().unwrap_or_default().to_string(),
+                formats: parts
+                    .iter()
+                    .skip(3)
+                    .map(|part| (*part).to_string())
+                    .collect(),
+                active,
+                crypto_present: false,
+                crypto_supported: false,
+            });
+            current_section = Some(result.media_sections.len() - 1);
+        } else if let Some(value) = line.strip_prefix("a=crypto:")
+            && let Some(index) = current_section
+        {
+            let section = &mut result.media_sections[index];
+            section.crypto_present = true;
+            if let Some(crypto) = parse_sdes_crypto(value) {
+                section.crypto_supported = supported_sdes_key(&crypto);
+            }
+        }
+    }
+    let mut best_preference = None;
+    for (index, section) in result.media_sections.iter().enumerate() {
+        if let Some(preference) = audio_section_preference(section) {
+            result.audio_sections += 1;
+            if best_preference.is_none_or(|best| preference > best) {
+                result.selected_audio_section = Some(index);
+                best_preference = Some(preference);
+            }
+        }
+    }
 
     let mut session_c_addr: Option<std::net::IpAddr> = None;
     let mut audio_c_addr: Option<std::net::IpAddr> = None;
@@ -279,8 +402,13 @@ pub fn parse_sdp(sdp: &str) -> ParsedSdp {
     // Some(false) = inside a non-audio m= section (e.g. m=video)
     // Attributes from non-audio sections are ignored to prevent cross-section PT collisions.
     let mut media_section: Option<bool> = None;
+    let mut current_section: Option<usize> = None;
     for line in sdp.lines() {
         let line = line.trim();
+
+        if line.starts_with("m=") {
+            current_section = Some(current_section.map_or(0, |index| index + 1));
+        }
 
         if let Some(rest) = line
             .strip_prefix("c=IN IP4 ")
@@ -309,10 +437,9 @@ pub fn parse_sdp(sdp: &str) -> ParsedSdp {
                 continue;
             }
 
-            result.audio_sections += 1;
-            if result.audio_sections > 1 {
-                // This endpoint can represent only one active audio section.
-                // Preserve the first for diagnostics; validation rejects the SDP.
+            if current_section != result.selected_audio_section {
+                // Only the preferred audio section contributes RTP state.
+                // The other sections are rejected in the answer.
                 media_section = Some(false);
                 continue;
             }
@@ -371,19 +498,8 @@ pub fn parse_sdp(sdp: &str) -> ParsedSdp {
             }
         } else if let Some(rest) = line.strip_prefix("a=crypto:") {
             result.crypto_present = true;
-            let parts: Vec<_> = rest.split_whitespace().collect();
-            if parts.len() == 3
-                && let Ok(tag) = parts[0].parse::<u32>()
-                && tag > 0
-                && parts[1] == "AES_CM_128_HMAC_SHA1_80"
-                && let Some((key_b64, key_lifetime_packets)) = parse_sdes_inline_key(parts[2])
-            {
-                result.crypto = Some(SdpCrypto {
-                    tag,
-                    suite: parts[1].into(),
-                    key_b64,
-                    key_lifetime_packets,
-                });
+            if let Some(crypto) = parse_sdes_crypto(rest) {
+                result.crypto = Some(crypto);
             }
         } else if line.starts_with("a=fingerprint:") || line.starts_with("a=ice-ufrag:") {
             result.is_webrtc = true;
@@ -494,7 +610,9 @@ pub fn generate_sdp_offer(
     crypto: Option<&SdpCrypto>,
     session_id: u64,
 ) -> String {
-    generate_sdp(local_addr, rtp_port, codecs, crypto, session_id, false)
+    generate_sdp(
+        local_addr, rtp_port, codecs, crypto, session_id, false, None,
+    )
 }
 
 /// Generate an opportunistic-SRTP offer (RFC 8643): advertise RTP/AVP while
@@ -507,10 +625,19 @@ pub fn generate_osrtp_sdp_offer(
     crypto: &SdpCrypto,
     session_id: u64,
 ) -> String {
-    generate_sdp(local_addr, rtp_port, codecs, Some(crypto), session_id, true)
+    generate_sdp(
+        local_addr,
+        rtp_port,
+        codecs,
+        Some(crypto),
+        session_id,
+        true,
+        None,
+    )
 }
 
 /// Generate an SDP answer for a plain RTP endpoint
+#[cfg(test)]
 pub fn generate_sdp_answer(
     local_addr: SocketAddr,
     rtp_port: u16,
@@ -518,7 +645,36 @@ pub fn generate_sdp_answer(
     crypto: Option<&SdpCrypto>,
     session_id: u64,
 ) -> String {
-    generate_sdp(local_addr, rtp_port, codecs, crypto, session_id, false)
+    generate_sdp(
+        local_addr, rtp_port, codecs, crypto, session_id, false, None,
+    )
+}
+
+/// Answer every offered media section in its original position. The selected
+/// audio section uses this endpoint's port; all other sections use port zero.
+pub fn generate_sdp_answer_for_offer(
+    local_addr: SocketAddr,
+    rtp_port: u16,
+    codecs: &[&SdpCodec],
+    crypto: Option<&SdpCrypto>,
+    session_id: u64,
+    offer: &ParsedSdp,
+) -> anyhow::Result<String> {
+    let selected = offer
+        .selected_audio_section
+        .ok_or_else(|| anyhow::anyhow!("SDP has no selected audio section"))?;
+    if !matches!(offer.media_sections.get(selected), Some(section) if section.media == "audio") {
+        anyhow::bail!("SDP selected media section is not audio");
+    }
+    Ok(generate_sdp(
+        local_addr,
+        rtp_port,
+        codecs,
+        crypto,
+        session_id,
+        false,
+        Some((&offer.media_sections, selected)),
+    ))
 }
 
 fn generate_sdp(
@@ -528,13 +684,14 @@ fn generate_sdp(
     crypto: Option<&SdpCrypto>,
     session_id: u64,
     use_rtp_avp_profile: bool,
+    answer_sections: Option<(&[SdpMediaSection], usize)>,
 ) -> String {
     let ip = local_addr.ip();
     let ip_ver = if ip.is_ipv4() { "IP4" } else { "IP6" };
-    let proto = if crypto.is_some() && !use_rtp_avp_profile {
-        "RTP/SAVP"
-    } else {
-        "RTP/AVP"
+    let proto = match answer_sections {
+        Some((sections, selected)) => sections[selected].protocol.as_str(),
+        None if crypto.is_some() && !use_rtp_avp_profile => "RTP/SAVP",
+        None => "RTP/AVP",
     };
 
     // Collect all PTs including telephone-event
@@ -556,7 +713,7 @@ fn generate_sdp(
     sdp.push_str("s=rtpbridge\r\n");
     sdp.push_str(&format!("c=IN {ip_ver} {ip}\r\n"));
     sdp.push_str("t=0 0\r\n");
-    sdp.push_str(&format!("m=audio {rtp_port} {proto} {pt_list}\r\n"));
+    let mut media_sdp = format!("m=audio {rtp_port} {proto} {pt_list}\r\n");
 
     // rtpmap for each codec
     for codec in &all_codecs {
@@ -568,18 +725,18 @@ fn generate_sdp(
         // leading the offer with Opus no longer drags telephone-event to 48000.
         let rate = codec.clock_rate;
         if let Some(ch) = codec.channels {
-            sdp.push_str(&format!(
+            media_sdp.push_str(&format!(
                 "a=rtpmap:{} {}/{}/{}\r\n",
                 codec.pt, codec.name, rate, ch
             ));
         } else {
-            sdp.push_str(&format!(
+            media_sdp.push_str(&format!(
                 "a=rtpmap:{} {}/{}\r\n",
                 codec.pt, codec.name, rate
             ));
         }
         if let Some(fmtp) = codec.fmtp {
-            sdp.push_str(&format!("a=fmtp:{} {}\r\n", codec.pt, fmtp));
+            media_sdp.push_str(&format!("a=fmtp:{} {}\r\n", codec.pt, fmtp));
         }
     }
 
@@ -589,15 +746,32 @@ fn generate_sdp(
             .key_lifetime_packets
             .map(|packets| format!("|{packets}"))
             .unwrap_or_default();
-        sdp.push_str(&format!(
+        media_sdp.push_str(&format!(
             "a=crypto:{} {} inline:{}{}\r\n",
             c.tag, c.suite, c.key_b64, lifetime
         ));
     }
 
-    sdp.push_str("a=sendrecv\r\n");
-    sdp.push_str("a=rtcp-mux\r\n");
-    sdp.push_str("a=ptime:20\r\n");
+    media_sdp.push_str("a=sendrecv\r\n");
+    media_sdp.push_str("a=rtcp-mux\r\n");
+    media_sdp.push_str("a=ptime:20\r\n");
+
+    if let Some((sections, selected)) = answer_sections {
+        for (index, section) in sections.iter().enumerate() {
+            if index == selected {
+                sdp.push_str(&media_sdp);
+            } else {
+                sdp.push_str(&format!(
+                    "m={} 0 {} {}\r\n",
+                    section.media,
+                    section.protocol,
+                    section.formats.join(" ")
+                ));
+            }
+        }
+    } else {
+        sdp.push_str(&media_sdp);
+    }
 
     sdp
 }

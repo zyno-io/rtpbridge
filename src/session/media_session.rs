@@ -1010,7 +1010,7 @@ impl SessionState {
             self.endpoints.insert(id, Endpoint::WebRtc(Box::new(ep)));
             (answer, Some(101u8))
         } else {
-            parsed.validate_plain_transport()?;
+            parsed.validate_plain_offer()?;
             // Match the remote SDP's address family; reject if we didn't bind it.
             let binding = self.select_rtp_binding(parsed.remote_addr)?;
             let bind_ip = binding.ip;

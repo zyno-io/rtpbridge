@@ -1480,6 +1480,47 @@ async fn test_create_from_offer_dual_stack_answers_matching_family() {
     );
 }
 
+#[tokio::test]
+async fn test_create_from_offer_accepts_secure_and_plain_audio_alternatives() {
+    let mut state = test_session_state();
+    let (tx, _rx) = mpsc::channel(16);
+    let offer = "v=0\r\n\
+        o=FreeSWITCH 1 1 IN IP4 127.0.0.1\r\n\
+        s=FreeSWITCH\r\n\
+        c=IN IP4 127.0.0.1\r\n\
+        t=0 0\r\n\
+        m=audio 30000 RTP/SAVP 0 9 8 101 13\r\n\
+        a=rtpmap:9 G722/8000\r\n\
+        a=rtpmap:101 telephone-event/8000\r\n\
+        a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\n\
+        m=audio 30000 RTP/AVP 0 9 8 101 13\r\n";
+
+    let (id, answer) = state
+        .handle_create_from_offer(
+            &tx,
+            offer,
+            EndpointDirection::SendRecv,
+            Some(EndpointType::Rtp),
+        )
+        .await
+        .unwrap();
+    let Endpoint::Rtp(endpoint) = state.endpoints.get(&id).unwrap() else {
+        panic!("expected RTP endpoint");
+    };
+    assert!(endpoint.has_srtp());
+    assert_eq!(
+        endpoint.send_codec.as_ref().map(|codec| codec.name),
+        Some("G722")
+    );
+    let media_lines: Vec<&str> = answer
+        .lines()
+        .filter(|line| line.starts_with("m="))
+        .collect();
+    assert_eq!(media_lines.len(), 2);
+    assert!(media_lines[0].contains(" RTP/SAVP 9 101"));
+    assert_eq!(media_lines[1], "m=audio 0 RTP/AVP 0 9 8 101 13");
+}
+
 async fn double_check_rtp_session(count: usize) -> (SessionState, Vec<EndpointId>) {
     let mut state = test_session_state();
     let (tx, _rx) = mpsc::channel(16);

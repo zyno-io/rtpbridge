@@ -176,6 +176,55 @@ async fn test_from_offer_without_rtcp_mux_uses_port_plus_one() {
 }
 
 #[tokio::test]
+async fn test_from_offer_and_reinvite_prefer_secure_audio_after_plain_audio() {
+    let pool = crate::net::socket_pool::SocketPool::new("127.0.0.1".parse().unwrap(), 61200, 61300)
+        .unwrap();
+    let pair = pool.allocate_pair().await.unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    let offer = "v=0\r\n\
+        o=- 123 1 IN IP4 127.0.0.1\r\n\
+        s=-\r\n\
+        c=IN IP4 127.0.0.1\r\n\
+        t=0 0\r\n\
+        m=audio 30002 RTP/AVP 0 101\r\n\
+        a=rtpmap:101 telephone-event/8000\r\n\
+        m=audio 30000 RTP/SAVP 9 101\r\n\
+        a=rtpmap:9 G722/8000\r\n\
+        a=rtpmap:101 telephone-event/8000\r\n\
+        a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\n";
+
+    let (mut ep, answer) = RtpEndpoint::from_offer(
+        EndpointId::new_v4(),
+        EndpointDirection::SendRecv,
+        offer,
+        pair,
+        "127.0.0.1".parse().unwrap(),
+        tx,
+    )
+    .unwrap();
+    assert!(ep.has_srtp());
+    assert_eq!(ep.remote_rtp_addr.unwrap().port(), 30000);
+    assert_eq!(ep.send_codec.as_ref().map(|codec| codec.name), Some("G722"));
+    let media_lines: Vec<&str> = answer
+        .lines()
+        .filter(|line| line.starts_with("m="))
+        .collect();
+    assert_eq!(media_lines[0], "m=audio 0 RTP/AVP 0 101");
+    assert!(media_lines[1].contains(" RTP/SAVP 9 101"));
+
+    let reinvite = offer.replace("30002", "31002").replace("30000", "31000");
+    let answer = ep.update_remote_sdp(&reinvite).unwrap();
+    assert!(ep.has_srtp());
+    assert_eq!(ep.remote_rtp_addr.unwrap().port(), 31000);
+    let media_lines: Vec<&str> = answer
+        .lines()
+        .filter(|line| line.starts_with("m="))
+        .collect();
+    assert_eq!(media_lines[0], "m=audio 0 RTP/AVP 0 101");
+    assert!(media_lines[1].contains(" RTP/SAVP 9 101"));
+}
+
+#[tokio::test]
 async fn test_from_offer_answer_advertises_selected_codec_first() {
     // Offer lists PCMU first, then G722, then Opus. We select Opus as the
     // highest-quality codec AND must advertise it first in the answer, so the

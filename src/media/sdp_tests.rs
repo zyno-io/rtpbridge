@@ -598,7 +598,7 @@ fn test_parse_sdp_duplicate_codec_definitions() {
 
 #[test]
 fn test_parse_sdp_two_audio_m_lines() {
-    // Two active m=audio lines cannot be represented by one RTP endpoint.
+    // An answer to an endpoint-originated offer cannot accept two audio lines.
     let sdp = "v=0\r\n\
         o=- 600 1 IN IP4 10.0.0.1\r\n\
         s=-\r\n\
@@ -619,6 +619,125 @@ fn test_parse_sdp_two_audio_m_lines() {
     assert!(!has_g722, "should not merge G722 from second m=audio line");
     assert_eq!(parsed.audio_sections, 2);
     assert!(parsed.validate_plain_transport().is_err());
+}
+
+#[test]
+fn test_plain_first_offer_selects_secure_audio_and_preserves_answer_order() {
+    let offer = "v=0\r\n\
+        o=- 601 1 IN IP4 10.0.0.1\r\n\
+        s=-\r\n\
+        c=IN IP4 10.0.0.1\r\n\
+        t=0 0\r\n\
+        m=audio 30002 RTP/AVP 0\r\n\
+        a=rtpmap:0 PCMU/8000\r\n\
+        m=audio 30000 RTP/SAVP 9 101\r\n\
+        a=rtpmap:9 G722/8000\r\n\
+        a=rtpmap:101 telephone-event/8000\r\n\
+        a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\n";
+
+    let parsed = parse_sdp(offer);
+    parsed.validate_plain_offer().unwrap();
+    assert_eq!(parsed.audio_sections, 2);
+    assert_eq!(parsed.selected_audio_section, Some(1));
+    assert_eq!(parsed.remote_addr.unwrap().port(), 30000);
+    assert_eq!(parsed.media_protocol.as_deref(), Some("RTP/SAVP"));
+    assert!(parsed.crypto.is_some());
+    assert_eq!(parsed.codecs[0].name, "G722");
+
+    let local: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+    let answer = generate_sdp_answer_for_offer(
+        local,
+        40000,
+        &[&CODEC_G722, &CODEC_TELEPHONE_EVENT],
+        parsed.crypto.as_ref(),
+        601,
+        &parsed,
+    )
+    .unwrap();
+    let media_lines: Vec<&str> = answer
+        .lines()
+        .filter(|line| line.starts_with("m="))
+        .collect();
+    assert_eq!(
+        media_lines,
+        ["m=audio 0 RTP/AVP 0", "m=audio 40000 RTP/SAVP 9 101"]
+    );
+    assert!(answer.contains("a=crypto:1 AES_CM_128_HMAC_SHA1_80"));
+}
+
+#[test]
+fn test_secure_first_offer_rejects_plain_alternative() {
+    let offer = "v=0\r\n\
+        o=- 602 1 IN IP4 10.0.0.1\r\n\
+        s=-\r\n\
+        c=IN IP4 10.0.0.1\r\n\
+        t=0 0\r\n\
+        m=audio 30000 RTP/SAVP 0 9 8 101 13\r\n\
+        a=rtpmap:9 G722/8000\r\n\
+        a=rtpmap:101 telephone-event/8000\r\n\
+        a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\n\
+        m=audio 30000 RTP/AVP 0 9 8 101 13\r\n\
+        a=rtpmap:9 G722/8000\r\n";
+
+    let parsed = parse_sdp(offer);
+    parsed.validate_plain_offer().unwrap();
+    assert_eq!(parsed.selected_audio_section, Some(0));
+    let local: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+    let answer = generate_sdp_answer_for_offer(
+        local,
+        40000,
+        &[&CODEC_G722, &CODEC_TELEPHONE_EVENT],
+        parsed.crypto.as_ref(),
+        602,
+        &parsed,
+    )
+    .unwrap();
+    let media_lines: Vec<&str> = answer
+        .lines()
+        .filter(|line| line.starts_with("m="))
+        .collect();
+    assert_eq!(
+        media_lines,
+        [
+            "m=audio 40000 RTP/SAVP 9 101",
+            "m=audio 0 RTP/AVP 0 9 8 101 13"
+        ]
+    );
+}
+
+#[test]
+fn test_invalid_secure_alternative_does_not_downgrade_to_plain_rtp() {
+    let offer = "v=0\r\n\
+        o=- 603 1 IN IP4 10.0.0.1\r\n\
+        s=-\r\n\
+        c=IN IP4 10.0.0.1\r\n\
+        t=0 0\r\n\
+        m=audio 30002 RTP/AVP 0\r\n\
+        m=audio 30000 RTP/SAVP 9\r\n\
+        a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:broken\r\n";
+
+    let parsed = parse_sdp(offer);
+    assert_eq!(parsed.selected_audio_section, Some(1));
+    assert!(parsed.validate_plain_offer().is_err());
+}
+
+#[test]
+fn test_valid_secure_alternative_wins_over_invalid_secure_alternative() {
+    let offer = "v=0\r\n\
+        o=- 604 1 IN IP4 10.0.0.1\r\n\
+        s=-\r\n\
+        c=IN IP4 10.0.0.1\r\n\
+        t=0 0\r\n\
+        m=audio 30000 RTP/SAVP 0\r\n\
+        a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:broken\r\n\
+        m=audio 30002 RTP/SAVP 9\r\n\
+        a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\n";
+
+    let parsed = parse_sdp(offer);
+    parsed.validate_plain_offer().unwrap();
+    assert_eq!(parsed.selected_audio_section, Some(1));
+    assert_eq!(parsed.remote_addr.unwrap().port(), 30002);
+    assert_eq!(parsed.codecs[0].name, "G722");
 }
 
 #[test]

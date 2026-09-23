@@ -430,7 +430,7 @@ impl RtpEndpoint {
         packet_tx: mpsc::Sender<InboundPacket>,
     ) -> anyhow::Result<(Self, String)> {
         let parsed = sdp::parse_sdp(offer_sdp);
-        parsed.validate_plain_transport()?;
+        parsed.validate_plain_offer()?;
 
         let mut endpoint = Self::new(id, direction, socket_pair);
 
@@ -539,13 +539,14 @@ impl RtpEndpoint {
             }
             answer_codecs.push(c);
         }
-        let answer = sdp::generate_sdp_answer(
+        let answer = sdp::generate_sdp_answer_for_offer(
             SocketAddr::new(bind_ip, endpoint.local_rtp_addr.port()),
             endpoint.local_rtp_addr.port(),
             &answer_codecs,
             answer_crypto.as_ref(),
             id.as_u128() as u64,
-        );
+            &parsed,
+        )?;
 
         endpoint.state = EndpointState::Connected;
         endpoint.start_recv_tasks(packet_tx);
@@ -881,7 +882,7 @@ impl RtpEndpoint {
     /// originally-negotiated one, causing one-way audio after hold/unhold.
     pub fn update_remote_sdp(&mut self, sdp: &str) -> anyhow::Result<String> {
         let parsed = sdp::parse_sdp(sdp);
-        parsed.validate_plain_transport()?;
+        parsed.validate_plain_offer()?;
 
         if self.has_srtp() && parsed.crypto.is_none() {
             anyhow::bail!("SDP renegotiation cannot remove established SRTP security");
@@ -1007,13 +1008,14 @@ impl RtpEndpoint {
             }
         });
 
-        let answer = sdp::generate_sdp_answer(
+        let answer = sdp::generate_sdp_answer_for_offer(
             SocketAddr::new(bind_ip, self.local_rtp_addr.port()),
             self.local_rtp_addr.port(),
             &answer_codecs,
             answer_crypto.as_ref(),
             self.id.as_u128() as u64,
-        );
+            &parsed,
+        )?;
 
         Ok(answer)
     }

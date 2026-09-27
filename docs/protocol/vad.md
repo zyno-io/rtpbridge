@@ -48,6 +48,13 @@ Emitted when speech is detected after a period of silence.
 
 Emitted periodically while silence persists (every `silence_interval_ms`). The first emission occurs after `silence_interval_ms` of continuous silence.
 
+Speech-to-silence transitions retain a 320 ms hangover. Silence duration and event cadence use the
+greater of decoded audio time and monotonic elapsed time since the last detected speech/transition.
+Quiet packets do not reset that elapsed-time clock. This preserves audio-time behavior for buffered
+input while allowing Opus DTX (for example, 20 ms packets arriving every 160 ms) and complete packet
+cessation to reach the configured interval promptly. A timeout transition never emits an immediate
+zero-duration silence event; the full interval must elapse after the hangover.
+
 ```json
 {"event":"vad.silence","data":{"endpoint_id":"...","silence_duration_ms":3000}}
 ```

@@ -62,6 +62,12 @@ async fn test_recording_uses_real_remote_address() {
     let (mut peer_a, _peer_b, ep_a_id) = two_rtp_endpoints(&mut client).await;
     let peer_a_port = peer_a.local_addr.port();
 
+    // A listening phase keeps outgoing RTP alive, but its endpoint-scoped PCAP
+    // must exclude the synthetic silence source and preserve the caller channel.
+    client
+        .request_ok("endpoint.create_tone", json!({"tone": "silence"}))
+        .await;
+
     // Record endpoint A's inbound only.
     let pcap_path = std::path::Path::new(&server.recording_dir).join("real-addr.pcap");
     let rec = client

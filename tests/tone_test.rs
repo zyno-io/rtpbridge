@@ -2,12 +2,115 @@ mod helpers;
 
 use std::time::Duration;
 
+use rtpbridge::media::codec::{AudioCodec, make_decoder};
+
 use serde_json::json;
 
 use helpers::control_client::TestControlClient;
 use helpers::test_rtp_peer::{TestRtpPeer, parse_rtp_addr_from_sdp};
 use helpers::test_server::TestServer;
 use helpers::timing;
+
+#[tokio::test]
+async fn test_silence_keeps_negotiated_opus_rtp_flowing_until_removed() {
+    let server = TestServer::start().await;
+    let mut client = TestControlClient::connect(&server.addr).await;
+    client.request_ok("session.create", json!({})).await;
+    let mut peer = TestRtpPeer::new().await;
+    let offer = format!(
+        "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\nm=audio {port} RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\na=sendrecv\r\n",
+        ip = peer.local_addr.ip(),
+        port = peer.local_addr.port()
+    );
+    let endpoint = client
+        .request_ok("endpoint.create_from_offer", json!({"sdp": offer}))
+        .await;
+    let address = parse_rtp_addr_from_sdp(endpoint["sdp_answer"].as_str().unwrap()).unwrap();
+    peer.set_remote(address);
+    peer.activation_pt = 111;
+    peer.activate().await;
+    peer.start_recv();
+    let silence = client
+        .request_ok("endpoint.create_tone", json!({"tone": "silence"}))
+        .await;
+    assert_eq!(silence["tone"], "silence");
+    tokio::time::sleep(timing::scaled_ms(700)).await;
+    let packets = peer.all_received_raw().await;
+    assert!(
+        packets.len() >= 20,
+        "silence must produce paced RTP, got {} packets",
+        packets.len()
+    );
+    let mut decoder = make_decoder(AudioCodec::Opus).unwrap();
+    for packet in &packets {
+        assert_eq!(packet[1] & 127, 111, "silence must use negotiated Opus PT");
+        let mut pcm = Vec::new();
+        decoder.decode(&packet[12..], &mut pcm).unwrap();
+        assert_eq!(pcm.len(), 960, "silence must retain the 20 ms audio clock");
+        // Opus decoding may dither digital silence; keep it below -60 dBFS.
+        let rms = (pcm
+            .iter()
+            .map(|sample| (*sample as f64).powi(2))
+            .sum::<f64>()
+            / pcm.len() as f64)
+            .sqrt();
+        assert!(rms < 32.0, "silence must remain inaudible, RMS={rms}");
+    }
+    for pair in packets.windows(2) {
+        let previous = u32::from_be_bytes(pair[0][4..8].try_into().unwrap());
+        let current = u32::from_be_bytes(pair[1][4..8].try_into().unwrap());
+        assert_eq!(
+            current.wrapping_sub(previous),
+            960,
+            "RTP timestamps must advance normally"
+        );
+    }
+
+    // Prompts must remain audible while the silence source shares their mixer.
+    let beep = client
+        .request_ok("endpoint.create_tone", json!({"tone": "beep"}))
+        .await;
+    tokio::time::sleep(timing::scaled_ms(300)).await;
+    let mixed_packets = peer.all_received_raw().await;
+    let mut audible_frames = 0;
+    for packet in mixed_packets.iter().skip(packets.len()) {
+        assert_eq!(packet[1] & 127, 111);
+        let mut pcm = Vec::new();
+        decoder.decode(&packet[12..], &mut pcm).unwrap();
+        if pcm.iter().any(|sample| (*sample as i32).abs() > 1000) {
+            audible_frames += 1;
+        }
+    }
+    assert!(audible_frames >= 5, "silence must not suppress the beep");
+    client
+        .request_ok(
+            "endpoint.remove",
+            json!({"endpoint_id": beep["endpoint_id"]}),
+        )
+        .await;
+    tokio::time::sleep(timing::scaled_ms(100)).await;
+    let after_beep = peer.received_count();
+    tokio::time::sleep(timing::scaled_ms(200)).await;
+    assert!(
+        peer.received_count() >= after_beep + 5,
+        "silence must continue after the prompt is removed"
+    );
+    client
+        .request_ok(
+            "endpoint.remove",
+            json!({"endpoint_id": silence["endpoint_id"]}),
+        )
+        .await;
+    tokio::time::sleep(timing::scaled_ms(100)).await;
+    let stopped_count = peer.received_count();
+    tokio::time::sleep(timing::scaled_ms(200)).await;
+    assert_eq!(
+        peer.received_count(),
+        stopped_count,
+        "removing silence must stop its RTP"
+    );
+    client.request_ok("session.destroy", json!({})).await;
+}
 
 /// Helper: create a PCMU endpoint and activate symmetric RTP.
 async fn setup_rtp_endpoint(client: &mut TestControlClient, peer: &mut TestRtpPeer) -> String {

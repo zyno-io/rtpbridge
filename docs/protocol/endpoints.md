@@ -304,7 +304,7 @@ Create a send-only generated tone endpoint. Tone endpoints produce PCMU audio at
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
-| `tone` | string | required | `"ringback"`, `"ringing"`, `"busy"`, `"beep"`, or `"sine"` |
+| `tone` | string | required | `"ringback"`, `"ringing"`, `"busy"`, `"beep"`, `"sine"`, or `"silence"` |
 | `frequency` | number | tone default | Custom frequency for `"sine"`; must be 20-20000 Hz when provided |
 | `duration_ms` | u64 or null | `null` | Stop automatically after this duration; `null` means play until removed |
 
@@ -314,6 +314,13 @@ Create a send-only generated tone endpoint. Tone endpoints produce PCMU audio at
 ```
 
 When a duration-limited tone finishes, rtpbridge emits `endpoint.tone.finished`.
+
+`silence` produces zero-filled audio on the ordinary 20 ms tone clock, encoded into each receiving
+endpoint's negotiated codec by normal routing. It keeps RTP flowing during recording or other
+listening phases without audible output. The control application owns its lifetime: omit
+`duration_ms` to keep it active until `endpoint.remove` or session destruction. It does not alter
+incoming VAD or enable automatic idle audio on other endpoints. A full-session recording includes
+the generator as another source; use an endpoint-specific recording to capture only the listening party.
 
 ### endpoint.create_websocket
 

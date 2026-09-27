@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use earshot::{DefaultPredictor, Detector};
 
@@ -12,9 +12,9 @@ const HANGOVER_FRAMES: u32 = 20;
 /// resamples to 16kHz, feeds 256-sample frames to earshot.
 /// Completely independent of recording.
 ///
-/// Silence duration is tracked in audio samples (at 16kHz) rather than wall
-/// clock time, so it is independent of processing jitter and packet arrival
-/// timing.
+/// Silence timing uses both decoded samples and monotonic elapsed quiet time.
+/// Sparse DTX packets must not stretch the configured interval, while buffered
+/// audio can still advance the sample clock without waiting for wall time.
 pub struct VadMonitor {
     detector: Detector<DefaultPredictor>,
     resampler: Option<Resampler>,
@@ -33,8 +33,10 @@ pub struct VadMonitor {
     samples_since_last_event: u64,
     /// Consecutive non-speech frames while still in speaking state (hangover counter)
     hangover_frames: u32,
-    /// Wall-clock time of last `process()` call (for timeout-based fallback)
-    last_process_time: Option<Instant>,
+    /// Quiet packets never reset the detected-speech clock.
+    last_speech_time: Option<Instant>,
+    silence_started_at: Option<Instant>,
+    last_silence_event_at: Option<Instant>,
 }
 
 /// Events emitted by the VAD monitor
@@ -69,14 +71,19 @@ impl VadMonitor {
             silence_samples: 0,
             samples_since_last_event: 0,
             hangover_frames: 0,
-            last_process_time: None,
+            last_speech_time: None,
+            silence_started_at: None,
+            last_silence_event_at: None,
         }
     }
 
     /// Feed decoded PCM samples (at source sample rate).
     /// Returns any VAD events that should be emitted.
     pub fn process(&mut self, pcm: &[i16]) -> Vec<VadEvent> {
-        self.last_process_time = Some(Instant::now());
+        self.process_at(pcm, Instant::now())
+    }
+
+    fn process_at(&mut self, pcm: &[i16], now: Instant) -> Vec<VadEvent> {
         // Resample to 16kHz if needed
         if let Some(resampler) = &mut self.resampler {
             resampler.process(pcm, &mut self.resample_buf);
@@ -92,85 +99,85 @@ impl VadMonitor {
             let mut frame = [0i16; 256];
             frame.copy_from_slice(&self.pcm_buffer[..256]);
             self.pcm_buffer.drain(..256);
-            let score = self.detector.predict_i16(&frame);
-
-            let is_speech = score >= self.speech_threshold;
-
-            if is_speech {
-                self.hangover_frames = 0;
-                if !self.is_speaking {
-                    // Transition: silence → speech
-                    self.is_speaking = true;
-                    self.in_silence = false;
-                    self.silence_samples = 0;
-                    self.samples_since_last_event = 0;
-                    events.push(VadEvent::SpeechStarted);
-                }
-            } else if self.is_speaking {
-                // Non-speech frame during speaking: bump hangover counter.
-                // Require 20 consecutive non-speech frames (~320ms at 16kHz)
-                // before committing to the speech→silence transition.
-                self.hangover_frames += 1;
-                if self.hangover_frames >= HANGOVER_FRAMES {
-                    self.is_speaking = false;
-                    self.in_silence = true;
-                    self.silence_samples = 0;
-                    self.samples_since_last_event = 0;
-                    self.hangover_frames = 0;
-                }
-            }
-
-            // Accumulate silence samples and emit periodic events
-            if !self.is_speaking && self.in_silence {
-                self.silence_samples += 256;
-                self.samples_since_last_event += 256;
-
-                let since_last_ms = self.samples_since_last_event * 1000 / 16000;
-                if since_last_ms >= self.silence_interval_ms as u64 {
-                    self.samples_since_last_event = 0;
-                    let silence_ms = self.silence_samples * 1000 / 16000;
-                    events.push(VadEvent::Silence {
-                        duration_ms: silence_ms,
-                    });
-                }
-            }
+            self.process_frame(&frame, now, &mut events);
         }
 
+        events.extend(self.check_timeout_at(now));
         events
     }
 
-    /// Check for timeout-based speech→silence transition when packets stop arriving.
-    /// Should be called periodically (e.g. every second) from the session loop.
-    /// If the monitor is in the speaking state and no packets have arrived for
-    /// longer than the hangover duration, force the transition to silence.
+    /// Advance quiet time even when DTX delivers little audio or packets stop.
     pub fn check_timeout(&mut self) -> Vec<VadEvent> {
-        let hangover_duration = std::time::Duration::from_millis(HANGOVER_FRAMES as u64 * 16);
-        if self.is_speaking {
-            if let Some(last) = self.last_process_time
-                && last.elapsed() >= hangover_duration
-            {
-                self.is_speaking = false;
-                self.in_silence = true;
+        self.check_timeout_at(Instant::now())
+    }
+
+    fn check_timeout_at(&mut self, now: Instant) -> Vec<VadEvent> {
+        let hangover = Duration::from_millis(HANGOVER_FRAMES as u64 * 16);
+        if self.is_speaking
+            && let Some(last_speech) = self.last_speech_time
+            && now.saturating_duration_since(last_speech) >= hangover
+        {
+            self.enter_silence(last_speech + hangover);
+        }
+        self.silence_event(now).into_iter().collect()
+    }
+
+    fn enter_silence(&mut self, now: Instant) {
+        self.is_speaking = false;
+        self.in_silence = true;
+        self.silence_samples = 0;
+        self.samples_since_last_event = 0;
+        self.hangover_frames = 0;
+        self.silence_started_at = Some(now);
+        self.last_silence_event_at = Some(now);
+    }
+
+    fn silence_event(&mut self, now: Instant) -> Option<VadEvent> {
+        if !self.in_silence || self.is_speaking {
+            return None;
+        }
+        let elapsed = |start: Option<Instant>| {
+            start.map_or(0, |start| {
+                now.saturating_duration_since(start).as_millis() as u64
+            })
+        };
+        let since_last_ms =
+            (self.samples_since_last_event * 1000 / 16000).max(elapsed(self.last_silence_event_at));
+        if since_last_ms < self.silence_interval_ms as u64 {
+            return None;
+        }
+        let duration_ms =
+            (self.silence_samples * 1000 / 16000).max(elapsed(self.silence_started_at));
+        self.samples_since_last_event = 0;
+        self.last_silence_event_at = Some(now);
+        Some(VadEvent::Silence { duration_ms })
+    }
+
+    fn process_frame(&mut self, frame: &[i16; 256], now: Instant, events: &mut Vec<VadEvent>) {
+        let is_speech = self.detector.predict_i16(frame) >= self.speech_threshold;
+        if is_speech {
+            self.last_speech_time = Some(now);
+            self.hangover_frames = 0;
+            if !self.is_speaking {
+                self.is_speaking = true;
+                self.in_silence = false;
                 self.silence_samples = 0;
                 self.samples_since_last_event = 0;
-                self.hangover_frames = 0;
-                return vec![VadEvent::Silence { duration_ms: 0 }];
+                self.silence_started_at = None;
+                self.last_silence_event_at = None;
+                events.push(VadEvent::SpeechStarted);
             }
-        } else if self.in_silence
-            && let Some(last) = self.last_process_time
-        {
-            let elapsed_ms = last.elapsed().as_millis() as u64;
-            let total_silence_ms = self.silence_samples * 1000 / 16000 + elapsed_ms;
-            let since_last_ms = self.samples_since_last_event * 1000 / 16000 + elapsed_ms;
-            if since_last_ms >= self.silence_interval_ms as u64 {
-                self.samples_since_last_event = 0;
-                self.last_process_time = Some(Instant::now());
-                return vec![VadEvent::Silence {
-                    duration_ms: total_silence_ms,
-                }];
+        } else if self.is_speaking {
+            self.hangover_frames += 1;
+            if self.hangover_frames >= HANGOVER_FRAMES {
+                self.enter_silence(now);
             }
         }
-        Vec::new()
+        if self.in_silence && !self.is_speaking {
+            self.silence_samples += 256;
+            self.samples_since_last_event += 256;
+            events.extend(self.silence_event(now));
+        }
     }
 
     /// Flush any remaining samples (<256) at stream end.
@@ -182,39 +189,11 @@ impl VadMonitor {
         }
         // Zero-pad to 256 samples
         self.pcm_buffer.resize(256, 0);
-        let frame: Vec<i16> = self.pcm_buffer.drain(..).collect();
-        let score = self.detector.predict_i16(&frame);
-        let is_speech = score >= self.speech_threshold;
+        let mut frame = [0; 256];
+        frame.copy_from_slice(&self.pcm_buffer);
+        self.pcm_buffer.clear();
         let mut events = Vec::new();
-
-        if is_speech {
-            self.hangover_frames = 0;
-            if !self.is_speaking {
-                self.is_speaking = true;
-                self.in_silence = false;
-                self.silence_samples = 0;
-                self.samples_since_last_event = 0;
-                events.push(VadEvent::SpeechStarted);
-            }
-        } else if self.is_speaking {
-            self.hangover_frames += 1;
-            if self.hangover_frames >= 20 {
-                self.is_speaking = false;
-                self.in_silence = true;
-                self.silence_samples = 0;
-                self.samples_since_last_event = 0;
-                self.hangover_frames = 0;
-            }
-        }
-
-        if !self.is_speaking && self.in_silence {
-            self.silence_samples += 256;
-            let silence_ms = self.silence_samples * 1000 / 16000;
-            events.push(VadEvent::Silence {
-                duration_ms: silence_ms,
-            });
-        }
-
+        self.process_frame(&frame, Instant::now(), &mut events);
         events
     }
 
@@ -229,7 +208,9 @@ impl VadMonitor {
         self.silence_samples = 0;
         self.samples_since_last_event = 0;
         self.hangover_frames = 0;
-        self.last_process_time = None;
+        self.last_speech_time = None;
+        self.silence_started_at = None;
+        self.last_silence_event_at = None;
     }
 }
 
@@ -245,6 +226,93 @@ mod tests {
                 (f64::sin(2.0 * std::f64::consts::PI * freq_hz * t) * amplitude) as i16
             })
             .collect()
+    }
+
+    #[test]
+    fn sparse_quiet_packets_do_not_reset_silence_clock() {
+        let start = Instant::now();
+        let mut vad = VadMonitor::new(16000, 0.5, 2500);
+        vad.process_at(&sine_wave(440.0, 16000, 8000, 25000.0), start);
+        vad.process_at(&[0; 16000], start);
+        assert!(vad.in_silence);
+
+        // 20 ms of decoded audio every 160 ms, as in the staging Opus DTX capture.
+        for step in 1..16 {
+            let now = start + Duration::from_millis(step * 160);
+            assert!(vad.process_at(&[0; 320], now).is_empty());
+        }
+        let events = vad.process_at(&[0; 320], start + Duration::from_millis(2560));
+        assert!(matches!(
+            events.as_slice(),
+            [VadEvent::Silence { duration_ms: 2560 }]
+        ));
+        assert!(vad.silence_samples * 1000 / 16000 < 2500);
+        assert!(
+            vad.check_timeout_at(start + Duration::from_millis(2560))
+                .is_empty()
+        );
+
+        let events = vad.check_timeout_at(start + Duration::from_millis(5060));
+        assert!(matches!(
+            events.as_slice(),
+            [VadEvent::Silence { duration_ms: 5060 }]
+        ));
+    }
+
+    #[test]
+    fn packet_cessation_waits_for_hangover_and_full_interval() {
+        let start = Instant::now();
+        let mut vad = VadMonitor::new(16000, 0.5, 2500);
+        vad.is_speaking = true;
+        vad.last_speech_time = Some(start);
+        assert!(
+            vad.check_timeout_at(start + Duration::from_millis(320))
+                .is_empty()
+        );
+        assert!(
+            vad.check_timeout_at(start + Duration::from_millis(2819))
+                .is_empty()
+        );
+        let events = vad.check_timeout_at(start + Duration::from_millis(2820));
+        assert!(matches!(
+            events.as_slice(),
+            [VadEvent::Silence { duration_ms: 2500 }]
+        ));
+        let events = vad.check_timeout_at(start + Duration::from_millis(5320));
+        assert!(matches!(
+            events.as_slice(),
+            [VadEvent::Silence { duration_ms: 5000 }]
+        ));
+    }
+
+    #[test]
+    fn resumed_speech_and_reset_clear_elapsed_silence() {
+        let start = Instant::now();
+        let mut vad = VadMonitor::new(16000, 0.5, 2500);
+        let speech = sine_wave(440.0, 16000, 8000, 25000.0);
+        vad.is_speaking = true;
+        vad.last_speech_time = Some(start);
+        vad.check_timeout_at(start + Duration::from_millis(320));
+        let resumed_at = start + Duration::from_millis(2000);
+        let resumed = vad.process_at(&speech, resumed_at);
+        assert!(
+            resumed
+                .iter()
+                .any(|event| matches!(event, VadEvent::SpeechStarted))
+        );
+        assert!(
+            vad.check_timeout_at(start + Duration::from_millis(2820))
+                .is_empty()
+        );
+        let events = vad.check_timeout_at(resumed_at + Duration::from_millis(2820));
+        assert!(
+            matches!(events.as_slice(), [VadEvent::Silence { duration_ms }] if (2500..=2820).contains(duration_ms))
+        );
+        vad.reset();
+        assert!(
+            vad.check_timeout_at(resumed_at + Duration::from_secs(30))
+                .is_empty()
+        );
     }
 
     #[test]

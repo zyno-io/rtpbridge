@@ -16,6 +16,8 @@ pub enum ToneType {
     Beep,
     /// Custom single-frequency continuous tone
     Sine,
+    /// Continuous zero-filled audio to keep outgoing RTP alive while listening.
+    Silence,
 }
 
 /// Cadence definition: on_ms / off_ms pattern. None = continuous.
@@ -32,6 +34,7 @@ impl ToneType {
             ToneType::Busy => (480.0, Some(620.0)),
             ToneType::Beep => (1000.0, None),
             ToneType::Sine => (custom_freq.unwrap_or(440.0), None),
+            ToneType::Silence => (0.0, None),
         }
     }
 
@@ -45,7 +48,7 @@ impl ToneType {
                 on_ms: 500,
                 off_ms: 500,
             }),
-            ToneType::Ringing | ToneType::Beep | ToneType::Sine => None, // continuous
+            ToneType::Ringing | ToneType::Beep | ToneType::Sine | ToneType::Silence => None,
         }
     }
 }
@@ -135,7 +138,7 @@ impl ToneEndpoint {
 
         self.elapsed_ms += 20; // 20ms per poll
 
-        if !in_on_phase {
+        if !in_on_phase || self.tone_type == ToneType::Silence {
             // During off phase, produce silence
             return Some(vec![0i16; target_samples]);
         }
@@ -165,6 +168,23 @@ impl ToneEndpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn silence_produces_audio_until_removed_or_duration_expires() {
+        let mut ep = ToneEndpoint::new(EndpointId::new_v4(), ToneType::Silence, None, None);
+        for _ in 0..1500 {
+            let pcm = ep
+                .next_pcm(160)
+                .expect("silence must keep generating frames");
+            assert_eq!(pcm, vec![0; 160]);
+        }
+        assert_eq!(ep.state, EndpointState::Playing);
+        let mut bounded =
+            ToneEndpoint::new(EndpointId::new_v4(), ToneType::Silence, None, Some(20));
+        assert_eq!(bounded.next_pcm(160), Some(vec![0; 160]));
+        assert!(bounded.next_pcm(160).is_none());
+        assert_eq!(bounded.state, EndpointState::Finished);
+    }
 
     #[test]
     fn test_sine_tone_generates_pcm() {

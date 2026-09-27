@@ -75,6 +75,12 @@ Telephone-event (RFC 4733) packets bypass the transcode pipeline entirely. They'
 
 Voice Activity Detection and recording are completely separate features. VAD monitors an endpoint's incoming audio and emits events. Recording captures raw packets to PCAP. They can be used independently or together.
 
+VAD combines decoded audio time with monotonic silence timing so sparse Opus DTX packets cannot
+stretch the cutoff. The exact event timing is owned by the [VAD protocol](../protocol/vad.md).
+Applications that need outgoing RTP while listening can explicitly own a
+[`silence` tone endpoint](../protocol/endpoints.md#endpoint-create-tone); recording and VAD alone do
+not create outgoing audio.
+
 ## Threading Model
 
 ```

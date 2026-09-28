@@ -2,14 +2,119 @@ mod helpers;
 
 use std::time::Duration;
 
-use rtpbridge::media::codec::{AudioCodec, make_decoder};
+use rtpbridge::media::codec::{AudioCodec, make_decoder, make_encoder};
 
 use serde_json::json;
+use tempfile::TempDir;
 
 use helpers::control_client::TestControlClient;
-use helpers::test_rtp_peer::{TestRtpPeer, parse_rtp_addr_from_sdp};
+use helpers::test_rtp_peer::{TestRtpPeer, build_rtp_packet, parse_rtp_addr_from_sdp};
 use helpers::test_server::TestServer;
 use helpers::timing;
+use helpers::wav::generate_test_wav_at_rate;
+
+/// Incoming packets must not postpone mixed prompt output between its 20 ms ticks.
+#[tokio::test]
+async fn test_file_prompt_with_silence_survives_intertick_rtp_wakes() {
+    let tmp = TempDir::new().unwrap();
+    let wav_path = tmp.path().join("goodbye.wav");
+    // Match the native 16 kHz, 80-frame goodbye prompt in the reported capture.
+    generate_test_wav_at_rate(&wav_path, 1.6, 440.0, 16000);
+    let server = TestServer::builder()
+        .media_dir(tmp.path().to_str().unwrap())
+        .start()
+        .await;
+    let mut client = TestControlClient::connect(&server.addr).await;
+    client.request_ok("session.create", json!({})).await;
+    let mut peer = TestRtpPeer::new().await;
+    let offer = format!(
+        "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\nm=audio {port} RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\na=sendrecv\r\n",
+        ip = peer.local_addr.ip(),
+        port = peer.local_addr.port()
+    );
+    let endpoint = client
+        .request_ok("endpoint.create_from_offer", json!({"sdp": offer}))
+        .await;
+    let address = parse_rtp_addr_from_sdp(endpoint["sdp_answer"].as_str().unwrap()).unwrap();
+    peer.set_remote(address);
+    peer.activation_pt = 111;
+    peer.activate().await;
+    peer.start_recv();
+    client
+        .request_ok("endpoint.create_tone", json!({"tone": "silence"}))
+        .await;
+
+    // Valid 5 ms Opus packets wake the session repeatedly before every mixer deadline.
+    // The only receiving endpoint has no routed destinations, so its inbound audio
+    // bypasses playout buffers, as it does after voicemail VAD has stopped.
+    let socket = std::sync::Arc::clone(&peer.socket);
+    let sender = tokio::spawn(async move {
+        let mut encoder = make_encoder(AudioCodec::Opus).unwrap();
+        let mut payload = Vec::new();
+        encoder.encode(&[0; 240], &mut payload).unwrap();
+        let ssrc = rand::random();
+        let deadline = tokio::time::Instant::now() + timing::scaled_ms(2000);
+        let mut interval = tokio::time::interval(Duration::from_millis(5));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut sequence = 0u16;
+        let mut timestamp = 0u32;
+        while tokio::time::Instant::now() < deadline {
+            interval.tick().await;
+            let packet = build_rtp_packet(111, sequence, timestamp, ssrc, false, &payload);
+            let sent = socket.send_to(&packet, address).await;
+            sent.unwrap();
+            sequence = sequence.wrapping_add(1);
+            timestamp = timestamp.wrapping_add(240);
+        }
+    });
+    client
+        .request_ok(
+            "endpoint.create_with_file",
+            json!({"source": wav_path.to_str().unwrap(), "shared": false, "loop_count": 0}),
+        )
+        .await;
+    let finished = client
+        .recv_event_type("endpoint.file.finished", timing::scaled_ms(4000))
+        .await;
+    let sent = sender.await;
+    sent.unwrap();
+    tokio::time::sleep(timing::scaled_ms(50)).await;
+    let packets = peer.all_received_raw().await;
+    client.request_ok("session.destroy", json!({})).await;
+    assert!(finished.is_some(), "prompt must finish playing");
+
+    let mut decoder = make_decoder(AudioCodec::Opus).unwrap();
+    let mut audible = Vec::new();
+    for packet in &packets {
+        assert_eq!(packet[1] & 127, 111, "output must use negotiated Opus");
+        let mut pcm = Vec::new();
+        decoder.decode(&packet[12..], &mut pcm).unwrap();
+        assert_eq!(pcm.len(), 960, "output must retain its 20 ms duration");
+        let rms = (pcm
+            .iter()
+            .map(|sample| (*sample as f64).powi(2))
+            .sum::<f64>()
+            / pcm.len() as f64)
+            .sqrt();
+        audible.push(rms > 1000.0);
+    }
+    let audible_frames = audible.iter().filter(|&&frame| frame).count();
+    assert!(
+        audible_frames >= 75,
+        "the 80-frame prompt must arrive intact, allowing a few boundary frames; got {audible_frames} audible frames"
+    );
+    let first = audible.iter().position(|&frame| frame).unwrap();
+    let last = audible.iter().rposition(|&frame| frame).unwrap();
+    assert!(
+        audible[first..=last].iter().all(|&frame| frame),
+        "mixed prompt must not have silent holes"
+    );
+    for pair in packets.windows(2) {
+        let previous = u32::from_be_bytes(pair[0][4..8].try_into().unwrap());
+        let current = u32::from_be_bytes(pair[1][4..8].try_into().unwrap());
+        assert_eq!(current.wrapping_sub(previous), 960);
+    }
+}
 
 #[tokio::test]
 async fn test_silence_keeps_negotiated_opus_rtp_flowing_until_removed() {

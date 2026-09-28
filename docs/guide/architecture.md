@@ -67,6 +67,15 @@ wire-level counters, and forward datagrams to the owning session task over a
 bounded channel. The session task owns all endpoint state and is the only place
 that drives str0m, RTP parsing/decryption, playout, mixing, and routing.
 
+### Shared Audio Clock
+
+The session keeps one 20 ms playout clock running while a destination mixer exists or an
+engaged playout buffer has pending audio. File and tone sources bypass those buffers, but their
+mixed output still uses this clock. Packet and control-command wakes between ticks must preserve
+the next deadline, including when a mixer has consumed its current frames and is waiting for
+the next ones. The clock parks only after all mixers are removed and the playout buffers are
+idle. An idle mixer emits no audio.
+
 ### DTMF Never Transcoded
 
 Telephone-event (RFC 4733) packets bypass the transcode pipeline entirely. They're identified by payload type, forwarded as-is with PT remapping if endpoints negotiated different dynamic PTs.

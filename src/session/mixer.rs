@@ -28,10 +28,9 @@ struct SourceState {
 /// decodes all sources to PCM, sums them with saturation, encodes the result,
 /// and emits packets with proper monotonic timestamps.
 ///
-/// Frame boundaries are detected by packet arrival: when a source that already
-/// contributed feeds again, a new 20ms period has started. The accumulated
-/// frame is mixed, queued, and contributions reset. This keeps the mixer
-/// naturally synchronized with source timing without wall-clock pacing.
+/// Production callers enqueue decoded PCM with `feed_pcm` and flush one frame
+/// per source on the session's shared 20 ms clock. The retained encoded `feed`
+/// path detects frame boundaries when a source contributes a second time.
 pub struct DestinationMixer {
     dest_codec: AudioCodec,
     dest_pt: u8,
@@ -185,6 +184,8 @@ impl DestinationMixer {
         Ok(())
     }
 
+    // Retained for library callers; the session clock follows the mixer's lifetime.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn has_pending(&self) -> bool {
         self.sources
             .values()

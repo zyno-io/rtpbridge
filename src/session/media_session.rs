@@ -3499,18 +3499,20 @@ fn ingest_audio(
 
 /// Advance the shared playout grid. When a 20 ms tick is due, drain one frame from every
 /// engaged buffer into `packets_to_route` and step the grid (with a catch-up clamp so a
-/// stalled loop re-syncs instead of bursting). Parks the grid (`None`) when nothing is
-/// pending. Returns whether a tick fired this pass (gates the mixer `flush_tick`).
+/// stalled loop re-syncs instead of bursting). Mixers keep the grid active even between
+/// contributions: file/tone sources bypass playout buffers. Parks only when there are
+/// no mixers and no pending buffers. Returns whether a tick fired (gates `flush_tick`).
 fn drive_grid(
     mix_grid: &mut Option<Instant>,
     playout_buffers: &mut HashMap<EndpointId, PlayoutBuffer>,
+    has_mixers: bool,
     packets_to_route: &mut Vec<RoutedRtpPacket>,
     now: Instant,
 ) -> bool {
     let fired = match *mix_grid {
         Some(g) => now >= g,
         None => {
-            if playout_buffers.values().any(|b| b.has_pending()) {
+            if has_mixers || playout_buffers.values().any(|b| b.has_pending()) {
                 *mix_grid = Some(now);
                 true
             } else {
@@ -3538,8 +3540,9 @@ fn drive_grid(
         }
         *mix_grid = Some(next);
     }
-    // Park the grid when no buffer has pending audio (Synth idle / Tracked empty).
-    if !playout_buffers.values().any(|b| b.has_pending()) {
+    // Preserve the next tick while mixers exist, including when their current frames
+    // have just been consumed. Inter-tick packet/control wakes must not re-anchor it.
+    if !has_mixers && !playout_buffers.values().any(|b| b.has_pending()) {
         *mix_grid = None;
     }
     fired
@@ -3869,7 +3872,13 @@ async fn poll_and_route(
 
     // Shared 20 ms grid: drain each engaged buffer's due frame into the route set. All buffers
     // are evaluated against the same instant so a mixer's sources stay frame-aligned.
-    let grid_fired = drive_grid(mix_grid, playout_buffers, &mut packets_to_route, now);
+    let grid_fired = drive_grid(
+        mix_grid,
+        playout_buffers,
+        !mixers.is_empty(),
+        &mut packets_to_route,
+        now,
+    );
 
     let needs_routing_rebuild = emit_webrtc_events(
         event_tx,
@@ -4139,10 +4148,8 @@ async fn poll_and_route(
         }
     }
 
-    // On a grid tick, flush each mixer's accumulated frame so the mixer is wall-clock-clocked
-    // when fed by paced playout buffers. Additive with feed()'s implicit second-contribution
-    // flush (which still handles file/tone catch-up and arrival-fed RTP bursts); the inner
-    // flush is guarded so an all-idle tick emits nothing.
+    // Flush one queued frame per source on the shared grid, including file/tone sources
+    // that bypass playout buffers. An all-idle mixer emits nothing.
     if grid_fired {
         for mixer in mixers.values_mut() {
             if let Err(e) = mixer.flush_tick() {
@@ -4151,11 +4158,7 @@ async fn poll_and_route(
         }
     }
 
-    if mix_grid.is_none() && mixers.values().any(|mixer| mixer.has_pending()) {
-        *mix_grid = Some(now + super::playout::FRAME);
-    }
-
-    // Deliver mixed frames queued by feed() (flushed on frame boundaries) + grid flush_tick
+    // Deliver mixed frames queued by the shared clock.
     for (&dest_id, mixer) in mixers.iter_mut() {
         for routed in mixer.drain() {
             if let Some(dest_ep) = endpoints.get_mut(&dest_id) {

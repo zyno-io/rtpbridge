@@ -132,7 +132,7 @@ fn synth_grid_repaces_bursty_ws_inbound_from_pcap() {
             idx += 1;
         }
         let mut routed = Vec::new();
-        drive_grid(&mut mix_grid, &mut buffers, &mut routed, now);
+        drive_grid(&mut mix_grid, &mut buffers, false, &mut routed, now);
         for _ in &routed {
             out.push(now);
         }
@@ -173,6 +173,94 @@ fn synth_grid_repaces_bursty_ws_inbound_from_pcap() {
         zero_pairs < small / 50,
         "egress is emitting catch-up bursts ({zero_pairs} sub-ms gaps) instead of pacing"
     );
+}
+
+/// Generated prompt + silence must retain every frame on a fixed grid, even when
+/// packet/control wakes arrive while both the mixer and playout buffers are empty.
+#[test]
+fn mixer_grid_preserves_prompt_frames_across_intertick_wakes() {
+    use crate::session::mixer::DestinationMixer;
+
+    let base = Instant::now();
+    let destination = EndpointId::new_v4();
+    let prompt = EndpointId::new_v4();
+    let silence = EndpointId::new_v4();
+    let mut mixers = HashMap::from([(
+        destination,
+        DestinationMixer::new(AudioCodec::L16 { sample_rate: 16000 }, 127).unwrap(),
+    )]);
+    let mut buffers = HashMap::new();
+    let mut grid = None;
+    let mut output = Vec::new();
+
+    // Follow production ordering: clock, route generated frames, flush, then send.
+    // Wakes every 5 ms leave three empty passes between consecutive prompt frames.
+    for step in 0..=320 {
+        let now = base + Duration::from_millis(step * 5);
+        let mut routed = Vec::new();
+        let fired = drive_grid(
+            &mut grid,
+            &mut buffers,
+            !mixers.is_empty(),
+            &mut routed,
+            now,
+        );
+        assert!(
+            routed.is_empty(),
+            "generated sources bypass playout buffers"
+        );
+        let mixer = mixers.get_mut(&destination).unwrap();
+        if step % 4 == 0 && step < 320 {
+            let frame = (step / 4) as i16;
+            mixer.feed_pcm(silence, Arc::new(vec![0; 320])).unwrap();
+            mixer
+                .feed_pcm(prompt, Arc::new(vec![1000 + frame; 320]))
+                .unwrap();
+        }
+        if fired {
+            mixer.flush_tick().unwrap();
+        }
+        for packet in mixer.drain() {
+            output.push((now, packet));
+        }
+    }
+
+    assert_eq!(output.len(), 80, "every prompt frame must reach the caller");
+    for (index, (now, packet)) in output.iter().enumerate() {
+        assert_eq!(*now, base + Duration::from_millis(index as u64 * 20));
+        let expected: Vec<_> = (0..320)
+            .flat_map(|_| (1000 + index as i16).to_le_bytes())
+            .collect();
+        assert_eq!(packet.payload, expected, "prompt frame {index} changed");
+    }
+    for pair in output.windows(2) {
+        assert_eq!(pair[1].1.timestamp.wrapping_sub(pair[0].1.timestamp), 320);
+    }
+
+    // Empty mixers keep the deadline, but do not fabricate output. Removing the
+    // final mixer must park the clock rather than leave an idle session ticking.
+    let mut routed = Vec::new();
+    let next_tick = grid;
+    let fired = drive_grid(
+        &mut grid,
+        &mut buffers,
+        !mixers.is_empty(),
+        &mut routed,
+        base + Duration::from_millis(1605),
+    );
+    assert!(!fired);
+    assert_eq!(grid, next_tick);
+    assert!(!mixers[&destination].has_pending());
+    mixers.clear();
+    drive_grid(
+        &mut grid,
+        &mut buffers,
+        !mixers.is_empty(),
+        &mut routed,
+        base + Duration::from_millis(1610),
+    );
+    assert!(grid.is_none());
+    assert!(routed.is_empty());
 }
 
 #[derive(Clone)]

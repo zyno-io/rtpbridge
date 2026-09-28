@@ -5,7 +5,16 @@ use std::path::Path;
 
 /// Generate a minimal 8 kHz mono 16-bit PCM WAV file with a sine tone.
 pub fn generate_test_wav(path: impl AsRef<Path>, duration_secs: f64, frequency_hz: f64) {
-    let sample_rate: u32 = 8000;
+    generate_test_wav_at_rate(path, duration_secs, frequency_hz, 8000);
+}
+
+/// Generate a mono 16-bit PCM WAV at the requested native sample rate.
+pub fn generate_test_wav_at_rate(
+    path: impl AsRef<Path>,
+    duration_secs: f64,
+    frequency_hz: f64,
+    sample_rate: u32,
+) {
     let num_samples = (sample_rate as f64 * duration_secs) as usize;
     let bits_per_sample: u16 = 16;
     let num_channels: u16 = 1;

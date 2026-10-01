@@ -68,6 +68,7 @@ struct RtpPacket {
     /// Incremented on each descriptor for an existing channel. Concatenated recordings replay
     /// descriptors, so sequence/timestamp origins must never be ordered across this boundary.
     epoch: u32,
+    ssrc: u32,
     seq: u16,
     ts: u32,
     /// PCAP capture (wall-clock) time — the timeline anchor, and the only timing
@@ -262,7 +263,7 @@ fn run() -> anyhow::Result<()> {
                 let (Some(codec), Some(want_pt)) = (ch.codec, ch.pt) else {
                     continue;
                 };
-                let Some((pt, seq, ts, body)) = parse_rtp(payload) else {
+                let Some((pt, seq, ts, ssrc, body)) = parse_rtp(payload) else {
                     continue;
                 };
                 // Skip anything that isn't the declared audio PT (telephone-event, CN).
@@ -282,6 +283,7 @@ fn run() -> anyhow::Result<()> {
                 encoded.write_all(body)?;
                 ch.packets.push(RtpPacket {
                     epoch: ch.epoch,
+                    ssrc,
                     seq,
                     ts,
                     capture: pkt.timestamp,
@@ -435,8 +437,10 @@ fn decode_channel_to(
     let maximum = (out_rate as u64 * MAX_DURATION_SECS).min(max_samples);
     // Reorder by RTP sequence so stateful decoders (Opus/G.722) get in-order input.
     // The recording is arrival-ordered, so we unwrap the 16-bit sequence into a
-    // monotonic key in arrival order (handling wraps and post-renegotiation resets)
-    // and stable-sort by it. Degenerate (all-zero) sequence numbers — e.g.
+    // key within each recording epoch in arrival order, then stable-sort by it.
+    // Descriptors, SSRC changes and jumps outside the reorder window start a new
+    // epoch with fresh decoder/resampler state and a capture-time anchor.
+    // Degenerate (all-zero) sequence numbers — e.g.
     // bridge/websocket sources whose timeline is synthesized downstream — keep
     // arrival order.
     let first_capture = ch.first_capture.unwrap_or(origin);
@@ -452,22 +456,9 @@ fn decode_channel_to(
 
     let mut epoch_start = 0;
     while epoch_start < ch.packets.len() {
-        let epoch = ch.packets[epoch_start].epoch;
-        let epoch_end = ch.packets[epoch_start..]
-            .iter()
-            .position(|packet| packet.epoch != epoch)
-            .map(|offset| epoch_start + offset)
-            .unwrap_or(ch.packets.len());
+        let keys = epoch_sequence_keys(&ch.packets[epoch_start..]);
+        let epoch_end = epoch_start + keys.len();
         let epoch_packets = &ch.packets[epoch_start..epoch_end];
-        let keys = unwrap_sequence(epoch_packets);
-        let mut highest = keys.first().copied().unwrap_or(0);
-        for &key in &keys {
-            anyhow::ensure!(
-                key >= highest - 512 && key <= highest + 16384,
-                "sequence discontinuity exceeds supported reorder window; split recording epochs"
-            );
-            highest = highest.max(key);
-        }
         let mut idx: Vec<usize> = (0..epoch_packets.len()).collect();
         idx.sort_by_key(|&i| keys[i]);
         let first_epoch_capture = epoch_packets
@@ -549,23 +540,36 @@ fn decode_channel_to(
     Ok(written)
 }
 
-/// Unwrap 16-bit RTP sequence numbers (in arrival order) into a monotonic i64 key
+/// Unwrap the first recording epoch's 16-bit RTP sequences (in arrival order)
 /// by accumulating the **signed** 16-bit delta between consecutive packets. This
 /// correctly handles forward wrap, small reordering, AND reordering across the wrap
 /// boundary (a delayed pre-wrap packet arriving after a post-wrap one), as long as
 /// adjacent packets are within ±2^15 of each other (true for RTP with bounded
-/// jitter). Sorting by the result reconstructs sequence order; equal keys (e.g.
-/// all-zero degenerate sequences) keep arrival order under a stable sort.
-fn unwrap_sequence(packets: &[RtpPacket]) -> Vec<i64> {
-    let mut keys = Vec::with_capacity(packets.len());
+/// jitter). Stop before a descriptor boundary, SSRC change or sequence outside
+/// the supported reorder window. The caller decodes that packet in a new epoch;
+/// unrelated sequence/timestamp origins must never be sorted together.
+/// Equal keys (e.g. all-zero sequences) retain arrival order under a stable sort.
+fn epoch_sequence_keys(packets: &[RtpPacket]) -> Vec<i64> {
+    let Some(first) = packets.first() else {
+        return Vec::new();
+    };
+    let mut keys = Vec::new();
     let mut prev: Option<u16> = None;
     let mut ext: i64 = 0;
+    let mut highest = first.seq as i64;
     for p in packets {
+        if p.epoch != first.epoch || p.ssrc != first.ssrc {
+            break;
+        }
         match prev {
             None => ext = p.seq as i64,
             Some(pv) => ext += p.seq.wrapping_sub(pv) as i16 as i64,
         }
+        if ext < highest - 512 || ext > highest + 16384 {
+            break;
+        }
         keys.push(ext);
+        highest = highest.max(ext);
         prev = Some(p.seq);
     }
     keys
@@ -635,9 +639,9 @@ fn parse_frame(data: &[u8]) -> Option<(SocketAddr, SocketAddr, &[u8])> {
     }
 }
 
-/// Parse an RTP header, returning `(pt, seq, ts, body)`. Handles CSRC and one
+/// Parse an RTP header, returning `(pt, seq, ts, ssrc, body)`. Handles CSRC and one
 /// extension header.
-fn parse_rtp(p: &[u8]) -> Option<(u8, u16, u32, &[u8])> {
+fn parse_rtp(p: &[u8]) -> Option<(u8, u16, u32, u32, &[u8])> {
     if p.len() < 12 || (p[0] >> 6) != 2 {
         return None;
     }
@@ -645,6 +649,7 @@ fn parse_rtp(p: &[u8]) -> Option<(u8, u16, u32, &[u8])> {
     let pt = p[1] & 0x7F;
     let seq = u16::from_be_bytes([p[2], p[3]]);
     let ts = u32::from_be_bytes([p[4], p[5], p[6], p[7]]);
+    let ssrc = u32::from_be_bytes([p[8], p[9], p[10], p[11]]);
     let mut offset = 12 + cc * 4;
     if p[0] & 0x10 != 0 {
         // Extension header: 4-byte prefix + length words.
@@ -657,7 +662,7 @@ fn parse_rtp(p: &[u8]) -> Option<(u8, u16, u32, &[u8])> {
     if p.len() < offset {
         return None;
     }
-    Some((pt, seq, ts, &p[offset..]))
+    Some((pt, seq, ts, ssrc, &p[offset..]))
 }
 
 /// Sum several mono PCM buffers with saturation.
@@ -709,6 +714,7 @@ mod tests {
     fn pkt(seq: u16) -> RtpPacket {
         RtpPacket {
             epoch: 0,
+            ssrc: 1,
             seq,
             ts: 0,
             capture: Duration::ZERO,
@@ -768,7 +774,7 @@ mod tests {
             .iter()
             .map(|&s| pkt(s))
             .collect();
-        let keys = unwrap_sequence(&pkts);
+        let keys = epoch_sequence_keys(&pkts);
         // Keys must be strictly increasing across the 16-bit wrap boundary.
         for w in keys.windows(2) {
             assert!(w[1] > w[0], "monotonic across wrap: {keys:?}");
@@ -781,7 +787,7 @@ mod tests {
         // 65535 is delayed and arrives AFTER the post-wrap 0; sorting by the
         // unwrapped key must still reconstruct 65534, 65535, 0, 1.
         let pkts: Vec<RtpPacket> = [65534u16, 0, 65535, 1].iter().map(|&s| pkt(s)).collect();
-        let keys = unwrap_sequence(&pkts);
+        let keys = epoch_sequence_keys(&pkts);
         let mut idx: Vec<usize> = (0..pkts.len()).collect();
         idx.sort_by_key(|&i| keys[i]);
         let ordered: Vec<u16> = idx.iter().map(|&i| pkts[i].seq).collect();
@@ -792,8 +798,59 @@ mod tests {
     fn unwrap_sequence_keeps_small_reorder_in_epoch() {
         // A small backward step (in-window jitter) must NOT be treated as a wrap.
         let pkts: Vec<RtpPacket> = [100u16, 102, 101, 103].iter().map(|&s| pkt(s)).collect();
-        let keys = unwrap_sequence(&pkts);
+        let keys = epoch_sequence_keys(&pkts);
         assert_eq!(keys, vec![100, 102, 101, 103]);
+    }
+
+    #[test]
+    fn epoch_sequence_keys_checks_the_high_watermark() {
+        // The final packet is only 510 behind its predecessor, but 520 behind
+        // the epoch's highest sequence: it must begin a new epoch.
+        let packets: Vec<_> = [10_000, 9_990, 9_480].into_iter().map(pkt).collect();
+        assert_eq!(epoch_sequence_keys(&packets), vec![10_000, 9_990]);
+        assert_eq!(epoch_sequence_keys(&packets[2..]), vec![9_480]);
+    }
+
+    #[test]
+    fn epoch_sequence_keys_keeps_reorder_window_boundaries() {
+        let packets: Vec<_> = [10_000, 9_488, 26_384].into_iter().map(pkt).collect();
+        assert_eq!(epoch_sequence_keys(&packets), vec![10_000, 9_488, 26_384]);
+    }
+
+    #[test]
+    fn epoch_sequence_keys_keeps_degenerate_sequences() {
+        let packets: Vec<_> = [0, 0, 0].into_iter().map(pkt).collect();
+        assert_eq!(epoch_sequence_keys(&packets), vec![0, 0, 0]);
+    }
+
+    #[test]
+    fn discontinuity_does_not_invent_silence_between_contiguous_packets() {
+        let mut first = pkt(100);
+        first.payload = vec![0x20; 160];
+        let mut next = pkt(20_000);
+        next.payload = vec![0xa0; 160];
+        next.capture = Duration::from_millis(20);
+        next.ts = 1_000_000;
+        let mut channel = Channel {
+            codec: Some(AudioCodec::Pcmu),
+            pt: Some(0),
+            first_capture: Some(Duration::ZERO),
+            packets: vec![first, next],
+            epoch: 0,
+        };
+        let mut encoded = tempfile::tempfile().unwrap();
+        let mut output = Vec::new();
+        let count = decode_channel_to(
+            &mut channel,
+            8000,
+            Duration::ZERO,
+            &mut encoded,
+            &mut output,
+            8000 * MAX_DURATION_SECS,
+        )
+        .unwrap();
+        assert_eq!(count, 320);
+        assert!(output.chunks_exact(2).all(|s| s != [0, 0]));
     }
 
     #[test]
@@ -809,6 +866,7 @@ mod tests {
             packets: vec![
                 RtpPacket {
                     epoch: 0,
+                    ssrc: 1,
                     seq: 65_000,
                     ts: 3_000_000_000,
                     capture: Duration::ZERO,
@@ -819,6 +877,7 @@ mod tests {
                 },
                 RtpPacket {
                     epoch: 1,
+                    ssrc: 1,
                     seq: 7,
                     ts: 17,
                     capture: Duration::from_secs(3),
@@ -859,14 +918,15 @@ mod tests {
         // V=2, CC=1, X=1, PT=0; 1 CSRC (4 bytes); ext header (4-byte prefix + 1 word).
         let mut p = vec![0x91u8, 0x00, 0x00, 0x05]; // byte0: V=2,X=1,CC=1
         p.extend_from_slice(&[0, 0, 0, 0]); // timestamp
-        p.extend_from_slice(&[0, 0, 0, 0]); // ssrc
+        p.extend_from_slice(&[0x12, 0x34, 0x56, 0x78]); // ssrc
         p.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]); // 1 CSRC
         p.extend_from_slice(&[0xBE, 0xDE, 0x00, 0x01]); // ext: profile + length=1 word
         p.extend_from_slice(&[1, 2, 3, 4]); // 1 ext word
         p.extend_from_slice(&[0xAA, 0xBB]); // body
-        let (pt, seq, _ts, body) = parse_rtp(&p).expect("parses");
+        let (pt, seq, _ts, ssrc, body) = parse_rtp(&p).expect("parses");
         assert_eq!(pt, 0);
         assert_eq!(seq, 5);
+        assert_eq!(ssrc, 0x12345678);
         assert_eq!(body, &[0xAA, 0xBB]);
     }
 

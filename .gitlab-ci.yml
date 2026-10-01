@@ -76,7 +76,7 @@ test:unit:
   script:
     - useradd -m ci
     - chown -R ci:ci . ${CARGO_HOME:-/usr/local/cargo} ${RUSTUP_HOME:-/usr/local/rustup}
-    - runuser -u ci -- cargo test --lib -- --test-threads=1
+    - runuser -u ci -- cargo test --lib --bin pcap2audio -- --test-threads=1
 
 test:integration:
   extends:
@@ -217,7 +217,7 @@ build:pcap2audio:
   dependencies: []
   rules:
     - if: $CI_COMMIT_TAG
-    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH
   variables:
     OPUS_VERSION: "1.5.2"
     OPENSSL_DIR: /opt/rtpbridge-openssl
@@ -266,14 +266,16 @@ build:pcap2audio-image:
     - build:pcap2audio
   rules:
     - if: $CI_COMMIT_TAG
-    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH
   variables:
     IMAGE: ${CI_REGISTRY_IMAGE}/pcap2audio
   script: |
     if [ -n "$CI_COMMIT_TAG" ]; then
       TAGS="${CI_COMMIT_TAG} latest"
-    else
+    elif [ "$CI_COMMIT_BRANCH" = "main" ]; then
       TAGS="main ${CI_COMMIT_SHA}"
+    else
+      TAGS="${CI_COMMIT_SHA}"
     fi
     TAG_ARGS=""
     for t in $TAGS; do TAG_ARGS="$TAG_ARGS -t ${IMAGE}:${t}"; done

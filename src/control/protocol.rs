@@ -786,6 +786,12 @@ pub struct EndpointStateChangedData {
     pub new_state: EndpointState,
 }
 
+/// `endpoint.webrtc.connected` — ICE, DTLS, and SRTP are established.
+#[derive(Debug, Serialize)]
+pub struct WebrtcConnectedData {
+    pub endpoint_id: EndpointId,
+}
+
 /// `endpoint.ice_state_changed` — emitted when a WebRTC endpoint's str0m ICE
 /// connection state transitions. Finer-grained than `endpoint.state_changed`;
 /// `ice_state: "disconnected"` is ICE consent loss (RFC 7675), the canonical

@@ -52,6 +52,31 @@ fn test_session_state() -> SessionState {
     }
 }
 
+#[test]
+fn webrtc_connected_event_uses_critical_channel_when_regular_queue_is_full() {
+    let (event_tx, _event_rx) = mpsc::channel(1);
+    event_tx
+        .try_send(Event::new("stats", serde_json::json!({})))
+        .unwrap();
+    let (critical_tx, mut critical_rx) = mpsc::channel(1);
+    let endpoint_id = EndpointId::new_v4();
+    let dropped = AtomicU64::new(0);
+    emit_event_with_priority(
+        &Some(event_tx),
+        &Some(critical_tx),
+        "endpoint.webrtc.connected",
+        WebrtcConnectedData { endpoint_id },
+        &dropped,
+        &crate::metrics::Metrics::new(),
+    );
+    let event = critical_rx
+        .try_recv()
+        .expect("audio readiness must use the priority channel");
+    assert_eq!(event.event, "endpoint.webrtc.connected");
+    assert_eq!(event.data["endpoint_id"], endpoint_id.to_string());
+    assert_eq!(dropped.load(Ordering::Relaxed), 0);
+}
+
 /// Repro harness for the WS→PSTN stutter (call2.pcapng): drive the REAL `drive_grid` with
 /// the captured inbound-WS arrival timeline, modeling the media loop's select/sleep wake
 /// behavior — wake at `min(grid_instant, next_packet)`, batch-drain everything that has

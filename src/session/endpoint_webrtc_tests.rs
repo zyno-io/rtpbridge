@@ -15,6 +15,108 @@ async fn mk_webrtc_ts_endpoint() -> WebRtcEndpoint {
     .expect("new_with_socket should succeed")
 }
 
+/// ICE alone must not report audio readiness; a silent peer becomes ready only after DTLS.
+#[tokio::test]
+async fn test_webrtc_connected_waits_for_dtls_without_audio_packets() {
+    let mut server = mk_webrtc_ts_endpoint().await;
+    server.add_host_candidates().unwrap();
+    let server_addr = server.sockets[0].0;
+    let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client_addr = client_socket.local_addr().unwrap();
+    let start = Instant::now();
+    let mut client = RtcConfig::new().set_rtp_mode(true).build(start);
+    client.add_local_candidate(Candidate::host(client_addr, "udp").unwrap());
+    let mut api = server.rtc.sdp_api();
+    api.add_media(MediaKind::Audio, Direction::SendRecv, None, None, None);
+    let (offer, pending) = api.apply().unwrap();
+    server.pending_offer = Some(pending);
+    let answer = client.sdp_api().accept_offer(offer).unwrap();
+    server.accept_answer(&answer.to_sdp_string()).unwrap();
+
+    let mut dtls_enabled = false;
+    let mut held_to_server: Vec<Vec<u8>> = Vec::new();
+    let mut held_to_client: Vec<Vec<u8>> = Vec::new();
+    let mut ready_count = 0;
+    let mut buffer = [0u8; 2048];
+    for tick in 0..500 {
+        let now = start + Duration::from_millis(tick * 10);
+        if dtls_enabled {
+            for data in held_to_server.drain(..) {
+                server
+                    .handle_receive(client_addr, server_addr, &data, now)
+                    .unwrap();
+            }
+            for data in held_to_client.drain(..) {
+                let receive = Receive::new(Protocol::Udp, server_addr, client_addr, &data).unwrap();
+                client.handle_input(Input::Receive(now, receive)).unwrap();
+            }
+        }
+        server.handle_timeout(now).unwrap();
+        let (events, _) = server.poll_output().unwrap();
+        for event in events {
+            match event {
+                WebRtcEvent::Connected => {
+                    assert!(
+                        dtls_enabled,
+                        "ICE-only connection cannot signal audio readiness"
+                    );
+                    ready_count += 1;
+                }
+                WebRtcEvent::IceStateChanged {
+                    state: IceConnectionState::Connected | IceConnectionState::Completed,
+                } if !dtls_enabled => {
+                    assert_eq!(ready_count, 0);
+                    assert!(!server.rtc.is_connected(), "DTLS is still withheld");
+                    dtls_enabled = true;
+                }
+                _ => {}
+            }
+        }
+        while let Ok((len, source)) = client_socket.try_recv_from(&mut buffer) {
+            let data = &buffer[..len];
+            if !dtls_enabled && (20..=63).contains(&data[0]) {
+                held_to_client.push(data.to_vec());
+            } else {
+                let receive = Receive::new(Protocol::Udp, source, client_addr, data).unwrap();
+                client.handle_input(Input::Receive(now, receive)).unwrap();
+            }
+        }
+        loop {
+            match client.poll_output().unwrap() {
+                Output::Transmit(transmit) => {
+                    let data = transmit.contents.to_vec();
+                    if !dtls_enabled && (20..=63).contains(&data[0]) {
+                        held_to_server.push(data);
+                    } else {
+                        server
+                            .handle_receive(client_addr, server_addr, &data, now)
+                            .unwrap();
+                    }
+                }
+                Output::Timeout(_) => {
+                    client.handle_input(Input::Timeout(now)).unwrap();
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if ready_count > 0 {
+            assert!(server.rtc.is_connected());
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(dtls_enabled, "ICE should establish before DTLS is released");
+    assert_eq!(
+        ready_count, 1,
+        "a silent peer should establish its audio transport"
+    );
+    assert_eq!(
+        server.stats.inbound_packets, 0,
+        "no audio packets are needed for readiness"
+    );
+}
+
 #[tokio::test]
 async fn test_outbound_timeline_source_change_preserves_continuity() {
     let mut ep = mk_webrtc_ts_endpoint().await;

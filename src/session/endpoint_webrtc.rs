@@ -971,6 +971,7 @@ impl WebRtcEndpoint {
                         self.state = EndpointState::Connected;
                         self.connecting_since = None;
                         self.connecting_warned = false;
+                        events.push(WebRtcEvent::Connected);
                         events.push(WebRtcEvent::StateChanged {
                             old,
                             new: self.state,
@@ -1273,6 +1274,8 @@ impl Drop for WebRtcEndpoint {
 /// Events produced by a WebRTC endpoint
 #[derive(Debug)]
 pub enum WebRtcEvent {
+    /// ICE, DTLS, and SRTP are established (str0m's Connected event).
+    Connected,
     StateChanged {
         old: EndpointState,
         new: EndpointState,

@@ -480,6 +480,7 @@ fn event_fields(event: &str) -> &'static [&'static str] {
         "dtmf" => &["endpoint_id", "digit", "duration_ms", "sensitive"],
         "endpoint.state_changed" => &["endpoint_id", "old_state", "new_state"],
         "endpoint.ice_state_changed" => &["endpoint_id", "ice_state"],
+        "endpoint.webrtc.connected" => &["endpoint_id"],
         "endpoint.file.started" => &["endpoint_id"],
         "endpoint.file.finished" => &["endpoint_id", "reason", "error"],
         "endpoint.tone.finished" => &["endpoint_id"],

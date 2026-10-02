@@ -367,6 +367,7 @@ const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Event names that should be routed to the critical channel first.
 const CRITICAL_EVENTS: &[&str] = &[
+    "endpoint.webrtc.connected",
     "endpoint.state_changed",
     "endpoint.ice_state_changed",
     "recording.stopped",
@@ -3653,6 +3654,18 @@ fn drain_webrtc_output_into_inbound(
         Ok((events, timeout)) => {
             for event in events {
                 match event {
+                    WebRtcEvent::Connected => {
+                        emit_event_with_priority(
+                            event_tx,
+                            critical_event_tx,
+                            "endpoint.webrtc.connected",
+                            WebrtcConnectedData {
+                                endpoint_id: wep.id,
+                            },
+                            dropped_events,
+                            metrics,
+                        );
+                    }
                     WebRtcEvent::RtpPacket(pkt) => {
                         // str0m 0.21 RTP mode stores a single pending RTP packet.
                         // Drain after each handle_receive() so a later datagram

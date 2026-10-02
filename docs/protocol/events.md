@@ -26,6 +26,19 @@ WebRTC-only. The endpoint's str0m ICE connection state transitioned. States: `ne
 {"event":"endpoint.ice_state_changed","data":{"endpoint_id":"...","ice_state":"disconnected"}}
 ```
 
+## endpoint.webrtc.connected
+
+WebRTC-only. Emitted from str0m's `Connected` event after ICE, DTLS, and SRTP are established, on the
+critical-priority channel. Consumers may use this to commit a call answer once its audio transport is
+ready. SDP answer acceptance, ICE `connected`/`completed`, and generic endpoint `connected` state can
+precede this event and do not provide that guarantee. No received audio packet is required, so muted
+or silent callers can still establish their session. This is initial transport readiness; ordinary ICE
+restarts preserve the established DTLS association and need not emit another event.
+
+```json
+{"event":"endpoint.webrtc.connected","data":{"endpoint_id":"..."}}
+```
+
 ## endpoint.file.started
 
 File playback routed its first RTP packet. This is distinct from endpoint creation because URL-backed

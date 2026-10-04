@@ -48,6 +48,12 @@ pub struct Metrics {
     pub dtmf_events: Counter,
     /// Transcode errors (decode or encode failures).
     pub transcode_errors: Counter,
+    /// Sessions that have required peer codec conversion, once per lifetime.
+    pub transcoding_sessions_total: Counter,
+    /// Sessions with a live RTP/WebRTC peer codec mismatch.
+    pub transcoding_sessions_active: Gauge,
+    /// Live file-to-destination routes requiring codec/rate conversion.
+    pub file_transcodings_active: Gauge,
     /// Playout buffer: packets dropped because they arrived after their play slot.
     pub playout_late_drops: Counter,
     /// Playout buffer: frames dropped to bound latency when a producer ran ahead.
@@ -145,6 +151,9 @@ impl Metrics {
         let srtp_errors = Counter::default();
         let dtmf_events = Counter::default();
         let transcode_errors = Counter::default();
+        let transcoding_sessions_total = Counter::default();
+        let transcoding_sessions_active = Gauge::default();
+        let file_transcodings_active = Gauge::default();
         let playout_late_drops = Counter::default();
         let playout_overflow_drops = Counter::default();
         let playout_underflow_fills = Counter::default();
@@ -219,6 +228,21 @@ impl Metrics {
             "rtpbridge_transcode_errors",
             "Transcode errors (decode or encode failures)",
             transcode_errors.clone(),
+        );
+        registry.register(
+            "rtpbridge_transcoding_sessions",
+            "Sessions that required RTP/WebRTC peer codec conversion, once per session lifetime",
+            transcoding_sessions_total.clone(),
+        );
+        registry.register(
+            "rtpbridge_transcoding_sessions_active",
+            "Sessions with live RTP/WebRTC routes requiring peer codec conversion",
+            transcoding_sessions_active.clone(),
+        );
+        registry.register(
+            "rtpbridge_file_transcodings_active",
+            "Live file-to-destination routes requiring codec or sample-rate conversion",
+            file_transcodings_active.clone(),
         );
         registry.register(
             "rtpbridge_playout_late_drops",
@@ -317,6 +341,9 @@ impl Metrics {
             srtp_errors,
             dtmf_events,
             transcode_errors,
+            transcoding_sessions_total,
+            transcoding_sessions_active,
+            file_transcodings_active,
             playout_late_drops,
             playout_overflow_drops,
             playout_underflow_fills,
@@ -405,6 +432,9 @@ mod tests {
         assert!(output.contains("rtpbridge_srtp_errors_total"));
         assert!(output.contains("rtpbridge_dtmf_events_total"));
         assert!(output.contains("rtpbridge_transcode_errors_total"));
+        assert!(output.contains("rtpbridge_transcoding_sessions_total 0"));
+        assert!(output.contains("rtpbridge_transcoding_sessions_active 0"));
+        assert!(output.contains("rtpbridge_file_transcodings_active 0"));
         assert!(output.contains("rtpbridge_events_dropped_total"));
         assert!(output.contains("rtpbridge_webrtc_recv_task_started_total"));
         assert!(output.contains("rtpbridge_webrtc_recv_task_exited_total"));

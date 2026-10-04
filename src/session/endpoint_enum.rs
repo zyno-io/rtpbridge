@@ -522,7 +522,9 @@ pub fn endpoint_audio_codec(ep: &Endpoint) -> Option<AudioCodec> {
             .send_codec
             .as_ref()
             .and_then(|c| AudioCodec::from_name(c.name)),
-        Endpoint::WebRtc(_) => Some(AudioCodec::Opus),
+        Endpoint::WebRtc(ep) => ep
+            .negotiated_codec()
+            .and_then(|codec| AudioCodec::from_name(codec.name)),
         // File emits native-rate L16 (PT 127) so the per-edge transcode/mixer
         // encodes at each destination's full quality rather than 8 kHz µ-law.
         Endpoint::File(ep) => Some(AudioCodec::L16 {
@@ -635,7 +637,10 @@ pub fn endpoint_rtp_clock_rate(ep: &Endpoint) -> u32 {
             .as_ref()
             .map(|c| c.clock_rate)
             .unwrap_or(8000),
-        Endpoint::WebRtc(_) => 48000,
+        Endpoint::WebRtc(ep) => ep
+            .negotiated_codec()
+            .map(|codec| codec.clock_rate)
+            .unwrap_or(48000),
         Endpoint::File(ep) => ep.sample_rate(),
         Endpoint::Tone(_) => 8000,
         Endpoint::Bridge(_) => 48000,

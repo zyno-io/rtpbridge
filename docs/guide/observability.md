@@ -16,6 +16,7 @@ All metrics use the `rtpbridge_` prefix.
 | `rtpbridge_packets_recorded_total` | Total packets written to PCAP recordings |
 | `rtpbridge_srtp_errors_total` | SRTP authentication or replay check failures |
 | `rtpbridge_transcode_errors_total` | Codec transcode failures (decode or encode) |
+| `rtpbridge_transcoding_sessions_total` | Sessions that have required an RTP/WebRTC peer codec conversion, counted once per session lifetime |
 | `rtpbridge_dtmf_events_total` | DTMF digits detected |
 | `rtpbridge_playout_late_drops_total` | Playout packets dropped after their play slot |
 | `rtpbridge_playout_overflow_drops_total` | Playout frames dropped to bound latency |
@@ -39,8 +40,41 @@ All metrics use the `rtpbridge_` prefix.
 | `rtpbridge_sessions_active` | Currently active sessions |
 | `rtpbridge_endpoints_active` | Currently active endpoints |
 | `rtpbridge_recordings_active` | Currently active PCAP recordings |
+| `rtpbridge_transcoding_sessions_active` | Sessions currently requiring an RTP/WebRTC peer codec conversion |
+| `rtpbridge_file_transcodings_active` | Directed routes from playing files to destinations requiring codec or sample-rate conversion |
 
 ## Interpreting Metrics
+
+### Transcoding Demand
+
+`rtpbridge_transcode_errors_total` counts failures, so zero errors does not mean
+zero transcoding. Use `rtpbridge_transcoding_sessions_active` for current peer
+codec mismatches and `increase(rtpbridge_transcoding_sessions_total[5m])` to
+detect sessions that required conversion, including calls that ended between
+scrapes. The counter increments once per media-session lifetime, even if hold,
+resume, or renegotiation removes and restores a mismatch. A warning named
+`session requires peer codec transcoding` identifies the first mismatched route
+with session ID, endpoint IDs, and source/destination codecs.
+Combine the active gauge with the counter increase in an alert: a call can
+already be running at the first scrape, before a counter delta is available.
+Calls that finish before the first scrape are identifiable from the warning log;
+their initial counter value cannot establish when they happened.
+
+These peer metrics exclude expected conversion for file playback, tones,
+WebSocket PCM, and cross-session bridge endpoints. They also exclude same-codec
+conference mixing and DTMF. A zero peer gauge therefore means no routed peer
+codec mismatch, rather than no decoding or encoding anywhere in the process.
+An Opus softphone connected to a G.722 or PCMU SIP peer legitimately contributes
+to this signal; a mismatch alone does not indicate a media failure.
+
+`rtpbridge_file_transcodings_active` measures file-to-destination conversion
+paths: a single playing file feeding two encoded destinations contributes two.
+It includes conversion into mixers, respects routing directions, and excludes
+buffering, paused, finished, unrouted, or removed files. Shared playback shares
+the file decoder; each destination still requires its own conversion. These
+gauges measure live routing demand, including silent routes, rather than CPU
+workers or recently processed packets. The metric lifecycle and codec rules are
+owned by [Architecture](./architecture.md#transcoding-observability).
 
 ### Throughput
 
@@ -109,6 +143,16 @@ groups:
           severity: warning
         annotations:
           summary: "Transcode errors on {{ $labels.instance }}"
+
+      # Any peer codec mismatch, including a session that has already ended
+      - alert: RtpbridgePeerCodecTranscoding
+        expr: >
+          rtpbridge_transcoding_sessions_active > 0
+          or increase(rtpbridge_transcoding_sessions_total[5m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "A session required peer codec transcoding on {{ $labels.instance }}"
 
       # Client backpressure
       - alert: RtpbridgeEventsDropped

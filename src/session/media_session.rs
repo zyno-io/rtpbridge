@@ -23,6 +23,7 @@ use super::file_poll::FileRtpState;
 use super::playout::{PlayoutBuffer, PlayoutKind, Policy};
 use super::routing::RoutingTable;
 use super::session_dtmf::{EndpointDtmf, PendingDtmfInjection};
+use super::transcoding_metrics::TranscodingMetrics;
 use super::vad_tap;
 use crate::control::protocol::*;
 use crate::media::codec::AudioCodec;
@@ -327,6 +328,7 @@ struct SessionState {
     file_rtp_states: HashMap<EndpointId, FileRtpState>,
     tone_rtp_states: HashMap<EndpointId, super::tone_poll::ToneRtpState>,
     transcode_cache: HashMap<(EndpointId, EndpointId), CachedTranscode>,
+    transcoding_metrics: TranscodingMetrics,
     url_sources: HashMap<EndpointId, String>,
     reserved_transfers: HashSet<EndpointId>,
     fax_detectors: HashMap<EndpointId, FaxDetector>,
@@ -1371,8 +1373,8 @@ impl SessionState {
         }
         self.transcode_cache
             .retain(|(src, dst), _| *src != endpoint_id && *dst != endpoint_id);
-        // Rebuild routing now that endpoint is Connected and has a remote address
-        if state_change.is_some() {
+        // Answers can change codecs without changing an already-connected state.
+        if result.is_ok() {
             self.rebuild_routing();
         }
         match &result {
@@ -1410,6 +1412,7 @@ impl SessionState {
         };
 
         if result.is_ok() {
+            self.rebuild_routing();
             let sdp_remote = sdp::parse_sdp(sdp).remote_addr;
             let local_addr = self.endpoints.get(&endpoint_id).and_then(|ep| match ep {
                 Endpoint::WebRtc(w) => Some(w.local_addr),
@@ -2074,6 +2077,7 @@ impl SessionState {
                 endpoint_id = %endpoint_id,
                 "file endpoint paused"
             );
+            self.rebuild_routing();
             self.send_event(
                 "endpoint.state_changed",
                 EndpointStateChangedData {
@@ -2106,6 +2110,7 @@ impl SessionState {
                 endpoint_id = %endpoint_id,
                 "file endpoint resumed"
             );
+            self.rebuild_routing();
             self.send_event(
                 "endpoint.state_changed",
                 EndpointStateChangedData {
@@ -2506,6 +2511,8 @@ impl SessionState {
         self.endpoint_count
             .store(self.endpoints.len(), std::sync::atomic::Ordering::Relaxed);
         self.routing.rebuild(&ep_list);
+        self.transcoding_metrics
+            .update(self.session_id, &self.endpoints, &self.routing);
         // Discard obsolete edges before admitting new encoder state. Active
         // single-source destinations fit the validated pipeline budget.
         self.transcode_cache.retain(|(source, destination), _| {
@@ -2927,6 +2934,7 @@ pub async fn run_media_session(
         file_rtp_states: HashMap::new(),
         tone_rtp_states: HashMap::new(),
         transcode_cache: HashMap::new(),
+        transcoding_metrics: TranscodingMetrics::new(Arc::clone(&metrics)),
         url_sources: HashMap::new(),
         reserved_transfers: HashSet::new(),
         fax_detectors: HashMap::new(),

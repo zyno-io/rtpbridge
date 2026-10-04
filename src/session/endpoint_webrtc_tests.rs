@@ -191,6 +191,7 @@ async fn test_outbound_timeline_reset_clears_source_state() {
     assert!(ep.last_source_id.is_none());
     assert!(ep.last_source_ts.is_none());
     assert!(ep.learned_step.is_none());
+    assert!(ep.outbound_clock_rate.is_none());
 }
 
 #[tokio::test]
@@ -439,7 +440,7 @@ async fn test_negotiated_codec_reads_from_str0m() {
 }
 
 #[tokio::test]
-async fn test_remote_receiver_report_uses_negotiated_pcmu_clock() {
+async fn test_quality_and_outbound_timeline_use_negotiated_pcmu_clock() {
     let mut ep = mk_webrtc_ts_endpoint().await;
     ep.rtc = RtcConfig::new()
         .clear_codecs()
@@ -448,6 +449,12 @@ async fn test_remote_receiver_report_uses_negotiated_pcmu_clock() {
         .build(Instant::now());
     ep.add_host_candidates()
         .expect("host candidate should be accepted");
+
+    // Previously learned Opus timing must not survive an 8 kHz negotiation.
+    let source = EndpointId::new_v4();
+    ep.advance_outbound_timeline(source, 1_000, false);
+    ep.advance_outbound_timeline(source, 1_960, false);
+    assert_eq!(ep.learned_step, Some(960));
 
     let mut peer = RtcConfig::new()
         .clear_codecs()
@@ -467,6 +474,23 @@ async fn test_remote_receiver_report_uses_negotiated_pcmu_clock() {
         ep.negotiated_codec().map(|codec| codec.clock_rate),
         Some(8_000)
     );
+    let codec = ep.negotiated_codec().unwrap();
+    assert_eq!(ep.rtp_clock_rate_for_payload_type(codec.pt), 8_000);
+    let previous = ep.last_outbound_ts.unwrap();
+    let (timestamp, marker) = ep.advance_outbound_timeline(source, 6_000, false);
+    assert_eq!(timestamp, previous + 160);
+    assert!(
+        marker,
+        "changing the codec clock must re-anchor the timeline"
+    );
+    assert!(ep.learned_step.is_none());
+    let replacement = EndpointId::new_v4();
+    let (switched, marker) = ep.advance_outbound_timeline(replacement, 9_000_000, false);
+    assert_eq!(switched, timestamp + 160);
+    assert!(
+        marker,
+        "a source switch before learning a step uses the PCMU clock"
+    );
 
     ep.remote_receiver_report = Some(WebRtcRemoteReceiverReport {
         packets_lost: 0,
@@ -477,6 +501,14 @@ async fn test_remote_receiver_report_uses_negotiated_pcmu_clock() {
         count: 1,
     });
     let endpoint = crate::session::endpoint_enum::Endpoint::WebRtc(Box::new(ep));
+    assert_eq!(
+        crate::session::endpoint_enum::endpoint_audio_codec(&endpoint),
+        Some(crate::media::codec::AudioCodec::Pcmu)
+    );
+    assert_eq!(
+        crate::session::endpoint_enum::endpoint_rtp_clock_rate(&endpoint),
+        8_000
+    );
     let report = endpoint
         .remote_receiver_report()
         .expect("remote receiver report should be available");

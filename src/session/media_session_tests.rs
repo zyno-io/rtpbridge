@@ -4,6 +4,7 @@ use super::*;
 /// Uses in-memory defaults — no real sockets or file caches needed.
 fn test_session_state() -> SessionState {
     let (cmd_tx, _cmd_rx) = mpsc::channel(16);
+    let metrics = Arc::new(crate::metrics::Metrics::new());
     SessionState {
         session_id: SessionId::new_v4(),
         media_bindings: Arc::new(
@@ -18,7 +19,7 @@ fn test_session_state() -> SessionState {
         ),
         endpoint_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         max_endpoints: 100,
-        metrics: Arc::new(crate::metrics::Metrics::new()),
+        metrics: Arc::clone(&metrics),
         cmd_tx,
         event_tx: None,
         critical_event_tx: None,
@@ -35,6 +36,7 @@ fn test_session_state() -> SessionState {
         file_rtp_states: HashMap::new(),
         tone_rtp_states: HashMap::new(),
         transcode_cache: HashMap::new(),
+        transcoding_metrics: TranscodingMetrics::new(metrics),
         url_sources: HashMap::new(),
         reserved_transfers: HashSet::new(),
         fax_detectors: HashMap::new(),
@@ -1653,6 +1655,161 @@ async fn double_check_rtp_session(count: usize) -> (SessionState, Vec<EndpointId
     (state, ids)
 }
 
+async fn add_g722_metric_endpoint(state: &mut SessionState) -> EndpointId {
+    let (tx, _rx) = mpsc::channel(16);
+    let created = state
+        .handle_create_offer(
+            &tx,
+            EndpointDirection::SendRecv,
+            EndpointType::Rtp,
+            false,
+            false,
+            Some(vec!["G722".to_string(), "PCMU".to_string()]),
+        )
+        .await;
+    let (id, _) = created.unwrap();
+    // Keep PCMU as an agreed alternative so a subsequent answer can change
+    // the selected codec without a Connected-state transition.
+    let answer = rtp_family_offer(false)
+        .replace("RTP/AVP 0 101", "RTP/AVP 9 0 101")
+        .replace("a=rtpmap:0", "a=rtpmap:9 G722/8000\r\na=rtpmap:0");
+    state.handle_accept_answer(id, &answer, None, None).unwrap();
+    id
+}
+
+#[tokio::test]
+async fn transcoding_metrics_follow_peer_routes_once_per_session() {
+    // Same-codec conferences still decode/mix/encode, but are not codec mismatches.
+    let (mut state, _) = double_check_rtp_session(3).await;
+    let metrics = Arc::clone(&state.metrics);
+    assert!(!state.mixers.is_empty());
+    assert_eq!(metrics.transcoding_sessions_total.get(), 0);
+    assert_eq!(metrics.transcoding_sessions_active.get(), 0);
+
+    let mismatched_id = add_g722_metric_endpoint(&mut state).await;
+    assert_eq!(metrics.transcoding_sessions_total.get(), 1);
+    assert_eq!(metrics.transcoding_sessions_active.get(), 1);
+    state.rebuild_routing();
+    assert_eq!(metrics.transcoding_sessions_total.get(), 1);
+    assert_eq!(metrics.transcoding_sessions_active.get(), 1);
+
+    state
+        .handle_update_direction(mismatched_id, EndpointDirectionUpdate::Inactive)
+        .unwrap();
+    assert_eq!(metrics.transcoding_sessions_active.get(), 0);
+    state
+        .handle_update_direction(mismatched_id, EndpointDirectionUpdate::SendRecv)
+        .unwrap();
+    assert_eq!(metrics.transcoding_sessions_active.get(), 1);
+    assert_eq!(metrics.transcoding_sessions_total.get(), 1);
+
+    // An answer can change the codec without a Connected-state transition.
+    state
+        .handle_accept_answer(mismatched_id, &rtp_family_offer(false), None, None)
+        .unwrap();
+    assert_eq!(metrics.transcoding_sessions_active.get(), 0);
+    let replacement_id = add_g722_metric_endpoint(&mut state).await;
+    assert_eq!(metrics.transcoding_sessions_active.get(), 1);
+    assert_eq!(metrics.transcoding_sessions_total.get(), 1);
+
+    // Removing or transferring the mismatched endpoint releases the source
+    // session's contribution; the lifetime counter remains historical.
+    let removed = state.handle_remove_endpoint(replacement_id).await;
+    removed.unwrap();
+    assert_eq!(metrics.transcoding_sessions_active.get(), 0);
+    assert_eq!(metrics.transcoding_sessions_total.get(), 1);
+    assert_eq!(metrics.file_transcodings_active.get(), 0);
+}
+
+#[tokio::test]
+async fn file_transcoding_metrics_follow_playback_and_destination_lifetimes() {
+    let (mut state, ids) = double_check_rtp_session(2).await;
+    let metrics = Arc::clone(&state.metrics);
+    let file_id = EndpointId::new_v4();
+    let file = FileEndpoint::new_buffering(file_id, 0.0);
+    state
+        .endpoints
+        .insert(file_id, Endpoint::File(Box::new(file)));
+    state.rebuild_routing();
+    assert_eq!(metrics.file_transcodings_active.get(), 0);
+    if let Endpoint::File(file) = state.endpoints.get_mut(&file_id).unwrap() {
+        file.state = EndpointState::Playing;
+    }
+    state.rebuild_routing();
+    assert_eq!(metrics.file_transcodings_active.get(), 2);
+    assert_eq!(metrics.transcoding_sessions_total.get(), 0);
+    assert_eq!(metrics.transcoding_sessions_active.get(), 0);
+
+    // Other expected media conversions don't turn this into a peer mismatch.
+    state
+        .handle_create_tone(super::super::endpoint_tone::ToneType::Ringback, None, None)
+        .unwrap();
+    let created = state
+        .handle_create_websocket(EndpointDirection::SendOnly, 16000, 0)
+        .unwrap();
+    let (websocket_id, _) = created;
+    if let Endpoint::WebSocket(endpoint) = state.endpoints.get_mut(&websocket_id).unwrap() {
+        endpoint.state = EndpointState::Connected;
+    }
+    state.rebuild_routing();
+    assert_eq!(metrics.file_transcodings_active.get(), 2);
+    assert_eq!(metrics.transcoding_sessions_total.get(), 0);
+
+    state.handle_file_pause(file_id).unwrap();
+    state.handle_file_pause(file_id).unwrap();
+    assert_eq!(metrics.file_transcodings_active.get(), 0);
+    state.rebuild_routing();
+    state.handle_file_resume(file_id).unwrap();
+    state.handle_file_resume(file_id).unwrap();
+    assert_eq!(metrics.file_transcodings_active.get(), 2);
+
+    state
+        .handle_update_direction(ids[0], EndpointDirectionUpdate::Inactive)
+        .unwrap();
+    assert_eq!(metrics.file_transcodings_active.get(), 1);
+    let removed = state.handle_remove_endpoint(file_id).await;
+    removed.unwrap();
+    assert_eq!(metrics.file_transcodings_active.get(), 0);
+    assert_eq!(metrics.transcoding_sessions_total.get(), 0);
+}
+
+#[tokio::test]
+async fn transcoding_metrics_aggregate_sessions_and_release_on_task_abort() {
+    let (mut first, _) = double_check_rtp_session(1).await;
+    let metrics = Arc::clone(&first.metrics);
+    add_g722_metric_endpoint(&mut first).await;
+    let file_id = EndpointId::new_v4();
+    let mut file = FileEndpoint::new_buffering(file_id, 0.0);
+    file.state = EndpointState::Playing;
+    first
+        .endpoints
+        .insert(file_id, Endpoint::File(Box::new(file)));
+    first.rebuild_routing();
+    let mut second = TranscodingMetrics::new(Arc::clone(&metrics));
+    second.update(SessionId::new_v4(), &first.endpoints, &first.routing);
+    assert_eq!(metrics.transcoding_sessions_total.get(), 2);
+    assert_eq!(metrics.transcoding_sessions_active.get(), 2);
+    assert_eq!(metrics.file_transcodings_active.get(), 4);
+    drop(first);
+    assert_eq!(metrics.transcoding_sessions_active.get(), 1);
+    assert_eq!(metrics.file_transcodings_active.get(), 2);
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        let _ = ready_tx.send(());
+        std::future::pending::<()>().await;
+        drop(second);
+    });
+    let ready = ready_rx.await;
+    ready.unwrap();
+    task.abort();
+    let result = task.await;
+    assert!(result.unwrap_err().is_cancelled());
+    assert_eq!(metrics.transcoding_sessions_total.get(), 2);
+    assert_eq!(metrics.transcoding_sessions_active.get(), 0);
+    assert_eq!(metrics.file_transcodings_active.get(), 0);
+}
+
 #[tokio::test]
 async fn completed_generators_leave_mixers_and_restore_direct_routing() {
     for file in [false, true] {
@@ -1676,6 +1833,10 @@ async fn completed_generators_leave_mixers_and_restore_direct_routing() {
         state.endpoints.insert(source, generator);
         state.rebuild_routing();
         assert_eq!(state.mixers.len(), 2);
+        assert_eq!(
+            state.metrics.file_transcodings_active.get(),
+            if file { 2 } else { 0 }
+        );
         let (_, changed) = poll_and_route(
             &mut state.endpoints,
             &mut state.dtmf_state,
@@ -1704,6 +1865,7 @@ async fn completed_generators_leave_mixers_and_restore_direct_routing() {
         state.rebuild_routing();
         assert!(state.mixers.is_empty());
         assert!(state.routing.destinations(&source).is_none());
+        assert_eq!(state.metrics.file_transcodings_active.get(), 0);
         assert_eq!(
             state.routing.destinations(&ids[0]),
             Some(&HashSet::from([ids[1]]))

@@ -80,6 +80,37 @@ idle. An idle mixer emits no audio.
 
 Telephone-event (RFC 4733) packets bypass the transcode pipeline entirely. They're identified by payload type, forwarded as-is with PT remapping if endpoints negotiated different dynamic PTs.
 
+### Transcoding Observability
+
+Routing uses each WebRTC endpoint's negotiated audio codec and RTP clock rate,
+including PCMU; an unanswered endpoint has no known audio codec. Outbound
+timeline steps use that negotiated RTP clock. A clock change clears the learned
+packet duration and re-anchors the next packet with a marker, preserving the
+destination-owned timestamp timeline. Inbound WebRTC jitter uses the received
+payload type's negotiated RTP clock.
+
+Transcoding metrics follow the live routing table, which includes only connected
+or playing endpoints and respects their directions. They describe required work,
+rather than packet throughput or the contents of the encoder cache.
+
+A session with a codec mismatch on an RTP/WebRTC-to-RTP/WebRTC route contributes
+once to the cumulative transcoding-session counter and once to the active gauge.
+The first mismatch logs a warning with the session ID, endpoint IDs, and codec
+pair. Removing every mismatched peer route clears the active contribution;
+restoring one does not increment the cumulative counter again. Same-codec mixing,
+DTMF, files, tones, WebSocket PCM, and bridge endpoints do not contribute to this
+peer-codec mismatch signal.
+
+File transcoding has a separate active gauge counting directed routes from
+playing file endpoints to destinations with a different codec or PCM sample
+rate. One file feeding three encoded destinations contributes three, including
+when a destination mixes it with other sources. Shared file decoding does not
+collapse the destination encodes. Buffering, paused, finished, unrouted, and
+removed files contribute zero. Session-owned metric contributions are released
+on task exit, including cancellation or panic. See
+[Monitoring & Observability](./observability.md#transcoding-demand) for metric
+names and alert queries.
+
 ### VAD Independent of Recording
 
 Voice Activity Detection and recording are completely separate features. VAD monitors an endpoint's incoming audio and emits events. Recording captures raw packets to PCAP. They can be used independently or together.

@@ -24,8 +24,7 @@ use crate::control::protocol::{
 use crate::media::rtcp::RtcpStats;
 use crate::metrics::Metrics;
 
-/// RTP timestamp clock for Opus, the only audio codec we negotiate for WebRTC.
-/// Kept in sync with `endpoint_enum::endpoint_rtp_clock_rate` for WebRTC.
+/// Default before a WebRTC audio codec has been negotiated.
 const WEBRTC_OPUS_RTP_CLOCK_HZ: u32 = 48_000;
 
 /// Grace window for a per-endpoint UDP recv task to reach its receive loop after
@@ -149,6 +148,8 @@ pub struct WebRtcEndpoint {
     /// recent same-source deltas. Used as the bump on source changes or
     /// discontinuity clamps. Falls back to 20ms at the WebRTC audio RTP clock.
     learned_step: Option<u32>,
+    /// Clock domain of the learned step and source timestamp baseline.
+    outbound_clock_rate: Option<u32>,
     /// Pending offer (when we created an offer, waiting for answer)
     pub pending_offer: Option<SdpPendingOffer>,
     /// Remote DTLS fingerprint advertised in the first accepted SDP. This is
@@ -343,6 +344,7 @@ impl WebRtcEndpoint {
             last_source_id: None,
             last_source_ts: None,
             learned_step: None,
+            outbound_clock_rate: None,
             pending_offer: None,
             remote_dtls_fingerprint: None,
             offer_generation: 0,
@@ -392,6 +394,7 @@ impl WebRtcEndpoint {
         self.last_source_id = None;
         self.last_source_ts = None;
         self.learned_step = None;
+        self.outbound_clock_rate = None;
     }
 
     fn remember_or_validate_remote_dtls_fingerprint(
@@ -1056,12 +1059,14 @@ impl WebRtcEndpoint {
                     }
                     Event::RtpPacket(pkt) => {
                         self.stats.record_inbound(pkt.payload.len());
+                        let clock_rate =
+                            self.rtp_clock_rate_for_payload_type(*pkt.header.payload_type);
                         self.rtcp_stats.record_received(
                             *pkt.header.ssrc,
                             pkt.header.sequence_number,
                             pkt.header.timestamp,
                             pkt.payload.len(),
-                            WEBRTC_OPUS_RTP_CLOCK_HZ,
+                            clock_rate,
                         );
                         events.push(WebRtcEvent::RtpPacket(RoutedRtpPacket {
                             source_endpoint_id: self.id,
@@ -1143,7 +1148,16 @@ impl WebRtcEndpoint {
         source_ts: u32,
         source_marker: bool,
     ) -> (u32, bool) {
-        let nominal_step = WEBRTC_OPUS_RTP_CLOCK_HZ / 50;
+        let clock_rate = self
+            .negotiated_codec()
+            .map(|codec| codec.clock_rate)
+            .unwrap_or(WEBRTC_OPUS_RTP_CLOCK_HZ);
+        if self.outbound_clock_rate != Some(clock_rate) {
+            self.outbound_clock_rate = Some(clock_rate);
+            self.learned_step = None;
+            self.last_source_ts = None;
+        }
+        let nominal_step = clock_rate / 50;
         let bump = self.learned_step.unwrap_or(nominal_step);
 
         let (outbound_ts, marker_override) = match (
@@ -1173,6 +1187,16 @@ impl WebRtcEndpoint {
         self.last_source_id = Some(source_id);
         self.last_source_ts = Some(source_ts);
         (outbound_ts, source_marker || marker_override)
+    }
+
+    fn rtp_clock_rate_for_payload_type(&self, payload_type: u8) -> u32 {
+        self.rtc
+            .codec_config()
+            .params()
+            .iter()
+            .find(|codec| *codec.pt() == payload_type)
+            .map(|codec| codec.spec().clock_rate.get())
+            .unwrap_or(WEBRTC_OPUS_RTP_CLOCK_HZ)
     }
 
     /// The negotiated primary audio codec, read from str0m's media line after the

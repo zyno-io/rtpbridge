@@ -4,7 +4,7 @@ Capacity depends on the negotiated codecs, fanout, native codec libraries, packe
 
 ## Media work
 
-A destination with one source and the same codec forwards packets without decoding unless VAD or fax analysis is active. A destination with multiple sources mixes PCM even when all participants use the same codec. WebRTC currently negotiates Opus; selecting G.722 for its WebRTC side is not supported.
+A destination with one source and the same codec forwards packets without decoding unless VAD or fax analysis is active. A destination with multiple sources mixes PCM even when all participants use the same codec. WebRTC normally negotiates Opus; routing also honors negotiated PCMU and its 8 kHz clock. Selecting G.722 for its WebRTC side is not supported.
 
 | Codec | PCM rate | RTP clock | Payload for 20 ms |
 | --- | --- | --- | --- |

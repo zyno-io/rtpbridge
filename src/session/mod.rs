@@ -16,6 +16,7 @@ pub mod routing;
 pub mod session_dtmf;
 pub mod stats;
 pub mod tone_poll;
+mod transcoding_metrics;
 pub mod transfer;
 pub mod vad_tap;
 

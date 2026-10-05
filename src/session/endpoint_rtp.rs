@@ -162,6 +162,8 @@ pub struct RtpEndpoint {
     /// - Auto: follow SDP direction from re-INVITEs (endpoint.rtp.reinvite)
     /// - Manual: explicit override from endpoint.update_direction
     direction_auto: bool,
+    offer_codec_constrained: bool,
+    pub opus_receive_profile: sdp::OpusProfile,
     /// Most recently advertised remote SDP direction mapped into local direction.
     last_remote_direction: Option<EndpointDirection>,
 
@@ -229,6 +231,8 @@ impl RtpEndpoint {
             // direction at creation is treated as a manual override, so the
             // user's choice survives the initial offer/answer exchange.
             direction_auto: matches!(direction, EndpointDirection::SendRecv),
+            offer_codec_constrained: false,
+            opus_receive_profile: sdp::OpusProfile::advertised_default(),
             last_remote_direction: None,
             cancel_token: CancellationToken::new(),
             recv_tasks: Vec::new(),
@@ -241,9 +245,9 @@ impl RtpEndpoint {
             self.direction_auto = false;
         } else {
             self.direction_auto = true;
-            if let Some(dir) = self.last_remote_direction {
-                self.config.direction = dir;
-            }
+            self.config.direction = self
+                .last_remote_direction
+                .unwrap_or(EndpointDirection::SendRecv);
         }
     }
 
@@ -421,6 +425,7 @@ impl RtpEndpoint {
     /// `socket_pair` is consumed here. On SRTP init failure, the sockets are dropped
     /// (ports released back to OS). The SocketPool wraps its counter so these ports
     /// will be available for future allocations.
+    #[allow(dead_code)] // Source-free constructor remains part of the library API.
     pub fn from_offer(
         id: EndpointId,
         direction: EndpointDirection,
@@ -428,6 +433,26 @@ impl RtpEndpoint {
         socket_pair: SocketPair,
         bind_ip: std::net::IpAddr,
         packet_tx: mpsc::Sender<InboundPacket>,
+    ) -> anyhow::Result<(Self, String)> {
+        Self::from_offer_with_codec(
+            id,
+            direction,
+            offer_sdp,
+            socket_pair,
+            bind_ip,
+            packet_tx,
+            None,
+        )
+    }
+
+    pub fn from_offer_with_codec(
+        id: EndpointId,
+        direction: EndpointDirection,
+        offer_sdp: &str,
+        socket_pair: SocketPair,
+        bind_ip: std::net::IpAddr,
+        packet_tx: mpsc::Sender<InboundPacket>,
+        codec: Option<&str>,
     ) -> anyhow::Result<(Self, String)> {
         let parsed = sdp::parse_sdp(offer_sdp);
         parsed.validate_plain_offer()?;
@@ -462,13 +487,28 @@ impl RtpEndpoint {
 
         // Pick the highest-quality offered codec as our send codec (rather than
         // the offerer's first-listed preference), and learn the receive clock rate.
-        endpoint.send_codec = crate::media::sdp::select_answer_codec(&parsed.codecs).cloned();
+        endpoint.send_codec = if let Some(name) = codec {
+            Some(
+                parsed
+                    .codecs
+                    .iter()
+                    .find(|c| c.name.eq_ignore_ascii_case(name) && c.name != "telephone-event")
+                    .ok_or_else(|| anyhow::anyhow!("Requested audio codec is absent from offer"))?
+                    .clone(),
+            )
+        } else {
+            crate::media::sdp::select_answer_codec(&parsed.codecs).cloned()
+        };
         endpoint.recv_clock_rate = endpoint
             .send_codec
             .as_ref()
             .map(|c| c.clock_rate)
             .unwrap_or(8000);
 
+        let telephone = sdp::select_telephone_event_codec(&parsed.codecs, endpoint.recv_clock_rate);
+        endpoint.telephone_event_pt = telephone.map(|codec| codec.pt);
+        endpoint.telephone_event_clock_rate =
+            telephone.map(|codec| codec.clock_rate).unwrap_or(8000);
         // Commit to a single media codec and a single telephone-event mapping.
         // This endpoint decodes ALL inbound media as send_codec (see
         // endpoint_audio_codec) and tracks one RFC 4733 PT/clock. Advertising
@@ -539,10 +579,21 @@ impl RtpEndpoint {
             }
             answer_codecs.push(c);
         }
+        let local_codecs: Vec<_> = answer_codecs
+            .iter()
+            .map(|codec| {
+                let mut local = (*codec).clone();
+                if local.name == "opus" {
+                    local.fmtp = sdp::CODEC_OPUS.fmtp;
+                }
+                local
+            })
+            .collect();
+        let local_refs: Vec<_> = local_codecs.iter().collect();
         let answer = sdp::generate_sdp_answer_for_offer(
             SocketAddr::new(bind_ip, endpoint.local_rtp_addr.port()),
             endpoint.local_rtp_addr.port(),
-            &answer_codecs,
+            &local_refs,
             answer_crypto.as_ref(),
             id.as_u128() as u64,
             &parsed,
@@ -566,6 +617,17 @@ impl RtpEndpoint {
     ) -> anyhow::Result<(Self, String)> {
         let mut endpoint = Self::new(id, direction, socket_pair);
         endpoint.codecs = codecs.to_vec();
+        endpoint.opus_receive_profile = codecs
+            .iter()
+            .find(|c| c.name == "opus")
+            .map(sdp::OpusProfile::from_codec)
+            .unwrap_or_default();
+        endpoint.opus_receive_profile.max_packet_ms = 20;
+        endpoint.offer_codec_constrained = codecs
+            .iter()
+            .filter(|c| c.name != "telephone-event")
+            .count()
+            == 1;
         endpoint.send_codec = codecs.iter().find(|c| c.name != "telephone-event").cloned();
         let te_codec = codecs.iter().find(|c| c.name == "telephone-event");
         endpoint.telephone_event_pt = te_codec.map(|c| c.pt);
@@ -722,23 +784,47 @@ impl RtpEndpoint {
             anyhow::bail!("SDP answer has no connection address");
         }
 
+        if self.offer_codec_constrained
+            && parsed
+                .selected_audio_section
+                .and_then(|index| parsed.media_sections.get(index))
+                .is_some_and(|section| {
+                    section.formats.iter().any(|format| {
+                        format
+                            .parse::<u8>()
+                            .ok()
+                            .is_none_or(|pt| !self.codecs.iter().any(|c| c.pt == pt))
+                    })
+                })
+        {
+            anyhow::bail!("SDP answer includes an unoffered payload type");
+        }
         // Validate the answer's codec intersection before applying any of its
         // negotiated state to the endpoint.
         let negotiated_codecs = if parsed.codecs.is_empty() {
-            None
+            anyhow::bail!("SDP answer has no supported audio codec")
         } else {
-            let offered: std::collections::HashSet<String> = self
+            let offered: std::collections::HashSet<(u8, String, u32)> = self
                 .codecs
                 .iter()
-                .map(|c| c.name.to_ascii_uppercase())
+                .map(|c| (c.pt, c.name.to_ascii_uppercase(), c.clock_rate))
                 .collect();
             let valid: Vec<_> = parsed
                 .codecs
                 .iter()
-                .filter(|c| offered.contains(&c.name.to_ascii_uppercase()))
+                .filter(|c| {
+                    self.codecs.is_empty()
+                        || if self.offer_codec_constrained {
+                            offered.contains(&(c.pt, c.name.to_ascii_uppercase(), c.clock_rate))
+                        } else {
+                            self.codecs
+                                .iter()
+                                .any(|original| original.name.eq_ignore_ascii_case(c.name))
+                        }
+                })
                 .cloned()
                 .collect();
-            if valid.is_empty() && !offered.is_empty() {
+            if !valid.iter().any(|c| c.name != "telephone-event") {
                 anyhow::bail!("SDP answer contains no codecs from the original offer");
             }
             Some(valid)

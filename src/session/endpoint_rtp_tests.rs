@@ -1927,7 +1927,10 @@ async fn double_check_osrtp_cannot_downgrade_after_a_secure_answer() {
         EndpointDirection::SendRecv,
         allocated.unwrap(),
         "127.0.0.1".parse().unwrap(),
-        &[crate::media::sdp::CODEC_PCMU],
+        &[
+            crate::media::sdp::CODEC_PCMU,
+            crate::media::sdp::CODEC_TELEPHONE_EVENT,
+        ],
         RtpMediaSecurity::OptionalSrtp,
         tokio::sync::mpsc::channel(1).0,
     )

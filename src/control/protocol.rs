@@ -140,6 +140,7 @@ pub struct ServerInfoParams {}
 
 #[derive(Debug, Serialize)]
 pub struct ServerInfoResult {
+    pub capabilities: Vec<&'static str>,
     pub hostname: String,
     pub version: &'static str,
     /// All configured media-plane bind IPs (≤1 per family). This is an array to
@@ -155,10 +156,37 @@ pub enum SessionState {
     Orphaned,
 }
 
+/// Explicit conversational source, scoped to the attached session.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CodecSource {
+    Endpoint { endpoint_id: EndpointId },
+    Offer { sdp: String },
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CodecDescriptor {
+    pub name: String,
+    pub payload_type: u8,
+    pub clock_rate: u32,
+    pub channels: u8,
+    pub fmtp: Option<String>,
+    pub receive_fmtp: Option<String>,
+    pub maxptime: Option<u32>,
+    pub receive_maxptime: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EndpointCodecParams {
+    pub endpoint_id: EndpointId,
+}
+
 // ── Endpoint Creation ───────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 pub struct EndpointCreateFromOfferParams {
+    pub codec: Option<String>,
+    pub peer_endpoint_id: Option<EndpointId>,
     pub sdp: String,
     #[serde(default = "default_direction")]
     pub direction: EndpointDirection,
@@ -166,12 +194,14 @@ pub struct EndpointCreateFromOfferParams {
 
 #[derive(Debug, Serialize)]
 pub struct EndpointCreateFromOfferResult {
+    pub codec: Option<CodecDescriptor>,
     pub endpoint_id: EndpointId,
     pub sdp_answer: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct EndpointCreateOfferParams {
+    pub codec_source: Option<CodecSource>,
     #[serde(default = "default_direction")]
     pub direction: EndpointDirection,
     #[serde(rename = "type")]
@@ -186,12 +216,14 @@ pub struct EndpointCreateOfferParams {
 
 #[derive(Debug, Deserialize)]
 pub struct WebRtcCreateOfferParams {
+    pub codec_source: Option<CodecSource>,
     #[serde(default = "default_direction")]
     pub direction: EndpointDirection,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct RtpCreateOfferParams {
+    pub codec_source: Option<CodecSource>,
     #[serde(default = "default_direction")]
     pub direction: EndpointDirection,
     #[serde(default)]
@@ -204,6 +236,9 @@ pub struct RtpCreateOfferParams {
 
 #[derive(Debug, Serialize)]
 pub struct EndpointCreateOfferResult {
+    pub codec: Option<CodecDescriptor>,
+    pub codec_candidates: Vec<String>,
+    pub source_codec: Option<CodecDescriptor>,
     pub endpoint_id: EndpointId,
     pub sdp_offer: String,
 }

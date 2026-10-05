@@ -86,6 +86,8 @@ pub struct NegotiatedCodec {
 /// A WebRTC endpoint backed by str0m
 pub struct WebRtcEndpoint {
     pub id: EndpointId,
+    pub opus_receive_profile: crate::media::sdp::OpusProfile,
+    pub opus_send_profile: crate::media::sdp::OpusProfile,
     pub config: EndpointConfig,
     pub state: EndpointState,
     pub stats: EndpointStats,
@@ -291,11 +293,22 @@ fn forward_datagram(
 
 impl WebRtcEndpoint {
     /// Create a new WebRTC endpoint with its own UDP socket
+    #[cfg(test)]
     async fn new_with_socket(
         id: EndpointId,
         config: EndpointConfig,
         bind_addrs: &[SocketAddr],
         metrics: Arc<Metrics>,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_socket_and_codecs(id, config, bind_addrs, metrics, None).await
+    }
+
+    async fn new_with_socket_and_codecs(
+        id: EndpointId,
+        config: EndpointConfig,
+        bind_addrs: &[SocketAddr],
+        metrics: Arc<Metrics>,
+        codecs: Option<&[String]>,
     ) -> anyhow::Result<Self> {
         // WebRTC endpoints use OS-assigned ephemeral ports (not rtp_port_range).
         // ICE negotiates connectivity dynamically, so fixed port ranges don't apply.
@@ -303,6 +316,20 @@ impl WebRtcEndpoint {
         // ICE host candidate, and ICE nominates the working pair.
         if bind_addrs.is_empty() {
             anyhow::bail!("WebRTC endpoint requires at least one bind address");
+        }
+        let mut rtc_config = RtcConfig::new();
+        if let Some(names) = codecs {
+            rtc_config = rtc_config.clear_codecs();
+            for name in names {
+                rtc_config = match name.to_ascii_lowercase().as_str() {
+                    "opus" => rtc_config.enable_opus(true),
+                    "pcmu" => rtc_config.enable_pcmu(true),
+                    _ => anyhow::bail!("Unsupported WebRTC audio codec"),
+                };
+            }
+            if names.is_empty() {
+                anyhow::bail!("Empty WebRTC codec subset");
+            }
         }
         let mut sockets = Vec::with_capacity(bind_addrs.len());
         for &bind_addr in bind_addrs {
@@ -312,7 +339,7 @@ impl WebRtcEndpoint {
         }
         let local_addr = sockets[0].0;
 
-        let rtc = RtcConfig::new()
+        let rtc = rtc_config
             .set_ice_lite(true)
             .set_rtp_mode(true)
             // Emit periodic stats so we can surface RTT for the WebRTC leg.
@@ -323,6 +350,11 @@ impl WebRtcEndpoint {
 
         Ok(Self {
             id,
+            opus_receive_profile: crate::media::sdp::OpusProfile {
+                min_packet_ms: 10,
+                ..Default::default()
+            },
+            opus_send_profile: crate::media::sdp::OpusProfile::default(),
             config: config.clone(),
             state: EndpointState::New,
             stats: EndpointStats::new(),
@@ -702,7 +734,8 @@ impl WebRtcEndpoint {
         metrics: Arc<Metrics>,
     ) -> anyhow::Result<(Self, String)> {
         let config = EndpointConfig { direction };
-        let mut endpoint = Self::new_with_socket(id, config, bind_addrs, metrics).await?;
+        let mut endpoint =
+            Self::new_with_socket_and_codecs(id, config, bind_addrs, metrics, None).await?;
 
         // One ICE host candidate per bound socket (IPv4 and/or IPv6).
         endpoint.add_host_candidates()?;
@@ -712,6 +745,7 @@ impl WebRtcEndpoint {
             serde_json::from_str::<SdpOffer>(offer_sdp)
                 .map_err(|e| anyhow::anyhow!("Failed to parse SDP offer: {e}"))
         })?;
+        let remote_profile = validated_opus_profile(&offer.to_sdp_string())?;
         let remote_fingerprint = remote_dtls_fingerprint_from_sdp(&offer.to_sdp_string())?;
         endpoint.remember_or_validate_remote_dtls_fingerprint(&remote_fingerprint, "from_offer")?;
 
@@ -723,10 +757,12 @@ impl WebRtcEndpoint {
         endpoint.mark_negotiation_started();
         endpoint.start_recv_task(packet_tx);
 
+        endpoint.opus_send_profile = remote_profile;
         Ok((endpoint, answer_str))
     }
 
     /// Create an SDP offer for a new outgoing endpoint
+    #[allow(dead_code)] // Source-free constructor remains part of the library API.
     pub async fn create_offer(
         id: EndpointId,
         direction: EndpointDirection,
@@ -734,8 +770,20 @@ impl WebRtcEndpoint {
         packet_tx: mpsc::Sender<InboundPacket>,
         metrics: Arc<Metrics>,
     ) -> anyhow::Result<(Self, String)> {
+        Self::create_offer_with_codecs(id, direction, bind_addrs, packet_tx, metrics, None).await
+    }
+
+    pub async fn create_offer_with_codecs(
+        id: EndpointId,
+        direction: EndpointDirection,
+        bind_addrs: &[SocketAddr],
+        packet_tx: mpsc::Sender<InboundPacket>,
+        metrics: Arc<Metrics>,
+        codecs: Option<&[String]>,
+    ) -> anyhow::Result<(Self, String)> {
         let config = EndpointConfig { direction };
-        let mut endpoint = Self::new_with_socket(id, config, bind_addrs, metrics).await?;
+        let mut endpoint =
+            Self::new_with_socket_and_codecs(id, config, bind_addrs, metrics, codecs).await?;
 
         // One ICE host candidate per bound socket (IPv4 and/or IPv6).
         endpoint.add_host_candidates()?;
@@ -775,6 +823,7 @@ impl WebRtcEndpoint {
             serde_json::from_str::<SdpAnswer>(answer_sdp)
                 .map_err(|e| anyhow::anyhow!("Failed to parse SDP answer: {e}"))
         })?;
+        let remote_profile = validated_opus_profile(&answer.to_sdp_string())?;
         let remote_fingerprint = remote_dtls_fingerprint_from_sdp(&answer.to_sdp_string())?;
         self.remember_or_validate_remote_dtls_fingerprint(&remote_fingerprint, "accept_answer")?;
 
@@ -790,6 +839,7 @@ impl WebRtcEndpoint {
         // measured from now, not from the original offer.
         self.mark_negotiation_started();
 
+        self.opus_send_profile = remote_profile;
         Ok(())
     }
 
@@ -799,10 +849,12 @@ impl WebRtcEndpoint {
             serde_json::from_str::<SdpOffer>(offer_sdp)
                 .map_err(|e| anyhow::anyhow!("Failed to parse SDP offer: {e}"))
         })?;
+        let remote_profile = validated_opus_profile(&offer.to_sdp_string())?;
         let remote_fingerprint = remote_dtls_fingerprint_from_sdp(&offer.to_sdp_string())?;
         self.remember_or_validate_remote_dtls_fingerprint(&remote_fingerprint, "accept_offer")?;
 
         let answer = self.rtc.sdp_api().accept_offer(offer)?;
+        self.opus_send_profile = remote_profile;
         self.store_remote_dtls_fingerprint(remote_fingerprint);
 
         // If we had a local offer in flight, a remote offer supersedes it.
@@ -1327,3 +1379,14 @@ pub fn ice_state_str(state: IceConnectionState) -> &'static str {
 #[cfg(test)]
 #[path = "endpoint_webrtc_tests.rs"]
 mod tests;
+
+/// Validate receive packetization before mutating str0m's negotiation state.
+fn validated_opus_profile(sdp: &str) -> anyhow::Result<crate::media::sdp::OpusProfile> {
+    let profile = crate::media::sdp::parse_sdp(sdp)
+        .opus_profile
+        .unwrap_or_default();
+    if !profile.encodable() {
+        anyhow::bail!("Opus receive packetization must permit 20 ms frames");
+    }
+    Ok(profile)
+}

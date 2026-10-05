@@ -58,9 +58,24 @@ impl DestinationMixer {
         self.dest_codec == codec && self.dest_pt == payload_type
     }
 
-    /// Create a new mixer that outputs encoded audio for `dest_codec`.
+    pub fn matches_profile(&self, profile: crate::media::sdp::OpusProfile) -> bool {
+        self.dest_codec != AudioCodec::Opus || self.encoder.opus_profile() == profile
+    }
+    /// Create a new mixer with the default receive profile for `dest_codec`.
+    #[allow(dead_code)] // Default-profile constructor remains part of the library API.
     pub fn new(dest_codec: AudioCodec, dest_pt: u8) -> Result<Self> {
-        let encoder = codec::make_encoder(dest_codec)?;
+        Self::new_with_profile(
+            dest_codec,
+            dest_pt,
+            crate::media::sdp::OpusProfile::default(),
+        )
+    }
+    pub fn new_with_profile(
+        dest_codec: AudioCodec,
+        dest_pt: u8,
+        opus_profile: crate::media::sdp::OpusProfile,
+    ) -> Result<Self> {
+        let encoder = codec::make_encoder_with_profile(dest_codec, opus_profile)?;
         let frame_samples = dest_codec.ptime_samples();
         let clock_increment = dest_codec.rtp_clock_rate() / 50; // 20ms
 

@@ -1,4 +1,5 @@
 use crate::media::codec::AudioCodec;
+use std::borrow::Cow;
 use std::net::{IpAddr, SocketAddr};
 
 /// Codec info for SDP generation
@@ -8,7 +9,8 @@ pub struct SdpCodec {
     pub name: &'static str,
     pub clock_rate: u32,
     pub channels: Option<u8>,
-    pub fmtp: Option<&'static str>,
+    pub maxptime: Option<u32>,
+    pub fmtp: Option<Cow<'static, str>>,
 }
 
 /// Well-known codec definitions
@@ -17,6 +19,7 @@ pub const CODEC_PCMU: SdpCodec = SdpCodec {
     name: "PCMU",
     clock_rate: 8000,
     channels: None,
+    maxptime: None,
     fmtp: None,
 };
 
@@ -25,6 +28,7 @@ pub const CODEC_G722: SdpCodec = SdpCodec {
     name: "G722",
     clock_rate: 8000, // SDP says 8000 even though it's actually 16kHz
     channels: None,
+    maxptime: None,
     fmtp: None,
 };
 
@@ -33,7 +37,10 @@ pub const CODEC_OPUS: SdpCodec = SdpCodec {
     name: "opus",
     clock_rate: 48000,
     channels: Some(2), // RFC 7587 §7 mandates channels=2 in rtpmap even for mono; stereo=0 in fmtp is the actual mono/stereo signal
-    fmtp: Some("minptime=10;useinbandfec=1;stereo=0;sprop-stereo=0"),
+    maxptime: None,
+    fmtp: Some(Cow::Borrowed(
+        "minptime=10;useinbandfec=1;stereo=0;sprop-stereo=0",
+    )),
 };
 
 pub const CODEC_TELEPHONE_EVENT: SdpCodec = SdpCodec {
@@ -41,7 +48,8 @@ pub const CODEC_TELEPHONE_EVENT: SdpCodec = SdpCodec {
     name: "telephone-event",
     clock_rate: 8000,
     channels: None,
-    fmtp: Some("0-16"),
+    maxptime: None,
+    fmtp: Some(Cow::Borrowed("0-16")),
 };
 
 /// Audio-quality ranking used when answering an offer. Higher = better
@@ -136,6 +144,8 @@ pub struct ParsedSdp {
     pub remote_rtcp_addr: Option<SocketAddr>,
     pub invalid_rtcp: bool,
     pub codecs: Vec<SdpCodec>,
+    /// Receive constraints of an offered Opus mapping, including unsupported packetization.
+    pub opus_profile: Option<OpusProfile>,
     pub telephone_event_pt: Option<u8>,
     /// Negotiated telephone-event rtpmap clock (RFC 4733). `None` if no
     /// telephone-event was advertised; consumers default to 8000. Tracked
@@ -328,6 +338,7 @@ pub fn parse_sdp(sdp: &str) -> ParsedSdp {
         remote_rtcp_addr: None,
         invalid_rtcp: false,
         codecs: Vec::new(),
+        opus_profile: None,
         telephone_event_pt: None,
         telephone_event_clock_rate: None,
         crypto: None,
@@ -393,6 +404,8 @@ pub fn parse_sdp(sdp: &str) -> ParsedSdp {
     let mut rtcp_port = None;
     let mut rtcp_ip = None;
     let mut pts: Vec<u8> = Vec::new();
+    let mut maxptime = None;
+    let mut fmtp = std::collections::HashMap::<u8, String>::new();
     // Parsed rtpmap entries: PT → (name, clock_rate, channels)
     let mut rtpmap: std::collections::HashMap<u8, (String, u32, Option<u8>)> =
         std::collections::HashMap::new();
@@ -479,6 +492,15 @@ pub fn parse_sdp(sdp: &str) -> ParsedSdp {
             if line.starts_with("a=fingerprint:") || line.starts_with("a=ice-ufrag:") {
                 result.is_webrtc = true;
             }
+        } else if let Some(rest) = line.strip_prefix("a=maxptime:") {
+            maxptime = rest.parse::<u32>().ok();
+        } else if let Some(rest) = line.strip_prefix("a=fmtp:") {
+            if let Some((pt, value)) = rest.split_once(' ')
+                && let Ok(pt) = pt.parse::<u8>()
+                && fmtp.len() < 32
+            {
+                fmtp.insert(pt, value.trim().to_string());
+            }
         } else if let Some(rest) = line.strip_prefix("a=rtpmap:") {
             // e.g., "111 opus/48000/2"
             let parts: Vec<&str> = rest.splitn(2, ' ').collect();
@@ -548,10 +570,24 @@ pub fn parse_sdp(sdp: &str) -> ParsedSdp {
     // Map PTs to codecs using well-known PTs and rtpmap entries
     for pt in pts {
         match pt {
-            0 => result.codecs.push(CODEC_PCMU),
-            9 => result.codecs.push(CODEC_G722),
+            0 if rtpmap.get(&0).is_none_or(|(name, rate, channels)| {
+                name.eq_ignore_ascii_case("PCMU")
+                    && *rate == 8000
+                    && channels.is_none_or(|channels| channels == 1)
+            }) =>
+            {
+                result.codecs.push(CODEC_PCMU)
+            }
+            9 if rtpmap.get(&9).is_none_or(|(name, rate, channels)| {
+                name.eq_ignore_ascii_case("G722")
+                    && *rate == 8000
+                    && channels.is_none_or(|channels| channels == 1)
+            }) =>
+            {
+                result.codecs.push(CODEC_G722)
+            }
             pt if pt >= 96 => {
-                if let Some((name, clock_rate, _channels)) = rtpmap.get(&pt) {
+                if let Some((name, clock_rate, channels)) = rtpmap.get(&pt) {
                     if name.eq_ignore_ascii_case("telephone-event") {
                         let mut te = CODEC_TELEPHONE_EVENT;
                         te.pt = pt;
@@ -559,15 +595,30 @@ pub fn parse_sdp(sdp: &str) -> ParsedSdp {
                             te.clock_rate = *clock_rate;
                         }
                         result.codecs.push(te);
-                    } else if name.eq_ignore_ascii_case("opus") && *clock_rate == 48000 {
+                    } else if name.eq_ignore_ascii_case("opus")
+                        && *clock_rate == 48000
+                        && channels.is_none_or(|channels| channels == 2)
+                    {
                         let mut opus = CODEC_OPUS;
                         opus.pt = pt;
-                        result.codecs.push(opus);
-                    } else if name.eq_ignore_ascii_case("PCMU") && *clock_rate == 8000 {
+                        opus.maxptime = maxptime;
+                        opus.fmtp = fmtp.get(&pt).cloned().map(Cow::Owned);
+                        let profile = OpusProfile::from_codec(&opus);
+                        result.opus_profile = Some(profile);
+                        if profile.encodable() {
+                            result.codecs.push(opus);
+                        }
+                    } else if name.eq_ignore_ascii_case("PCMU")
+                        && *clock_rate == 8000
+                        && channels.is_none_or(|channels| channels == 1)
+                    {
                         let mut pcmu = CODEC_PCMU;
                         pcmu.pt = pt;
                         result.codecs.push(pcmu);
-                    } else if name.eq_ignore_ascii_case("G722") && *clock_rate == 8000 {
+                    } else if name.eq_ignore_ascii_case("G722")
+                        && *clock_rate == 8000
+                        && channels.is_none_or(|channels| channels == 1)
+                    {
                         let mut g722 = CODEC_G722;
                         g722.pt = pt;
                         result.codecs.push(g722);
@@ -735,7 +786,7 @@ fn generate_sdp(
                 codec.pt, codec.name, rate
             ));
         }
-        if let Some(fmtp) = codec.fmtp {
+        if let Some(fmtp) = &codec.fmtp {
             media_sdp.push_str(&format!("a=fmtp:{} {}\r\n", codec.pt, fmtp));
         }
     }
@@ -754,7 +805,7 @@ fn generate_sdp(
 
     media_sdp.push_str("a=sendrecv\r\n");
     media_sdp.push_str("a=rtcp-mux\r\n");
-    media_sdp.push_str("a=ptime:20\r\n");
+    media_sdp.push_str("a=ptime:20\r\na=maxptime:20\r\n");
 
     if let Some((sections, selected)) = answer_sections {
         for (index, section) in sections.iter().enumerate() {
@@ -779,3 +830,86 @@ fn generate_sdp(
 #[cfg(test)]
 #[path = "sdp_tests.rs"]
 mod tests;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpusProfile {
+    pub bitrate: u32,
+    pub playback_rate: u32,
+    pub stereo: bool,
+    pub min_packet_ms: u32,
+    pub max_packet_ms: u32,
+}
+
+impl Default for OpusProfile {
+    fn default() -> Self {
+        Self {
+            bitrate: 510_000,
+            playback_rate: 48_000,
+            stereo: false,
+            min_packet_ms: 3,
+            max_packet_ms: 120,
+        }
+    }
+}
+
+impl OpusProfile {
+    pub fn parse(fmtp: Option<&str>) -> Self {
+        let mut profile = Self::default();
+        for item in fmtp.unwrap_or("").split(';') {
+            let Some((key, value)) = item.trim().split_once('=') else {
+                continue;
+            };
+            match key.trim().to_ascii_lowercase().as_str() {
+                "maxaveragebitrate" => {
+                    if let Ok(value) = value.trim().parse::<u32>() {
+                        profile.bitrate = value.clamp(6000, 510_000);
+                    }
+                }
+                "maxplaybackrate" => {
+                    if let Ok(value) = value.trim().parse::<u32>() {
+                        profile.playback_rate = value.clamp(8000, 48_000);
+                    }
+                }
+                "minptime" => {
+                    if let Ok(value) = value.trim().parse::<u32>() {
+                        profile.min_packet_ms = value;
+                    }
+                }
+                "stereo" => profile.stereo = value.trim() == "1",
+                _ => {}
+            }
+        }
+        profile
+    }
+    pub fn advertised_default() -> Self {
+        Self {
+            min_packet_ms: 10,
+            max_packet_ms: 20,
+            ..Self::default()
+        }
+    }
+    pub fn from_codec(codec: &SdpCodec) -> Self {
+        let mut profile = Self::parse(codec.fmtp.as_deref());
+        profile.max_packet_ms = codec.maxptime.unwrap_or(120);
+        profile
+    }
+    pub fn encodable(self) -> bool {
+        self.min_packet_ms <= 20 && self.max_packet_ms >= 20
+    }
+    pub fn permits(self, sender: Self) -> bool {
+        self.min_packet_ms <= sender.min_packet_ms
+            && self.max_packet_ms >= sender.max_packet_ms
+            && self.bitrate >= sender.bitrate
+            && self.playback_rate >= sender.playback_rate
+            && (self.stereo || !sender.stereo)
+    }
+    pub fn fmtp(self) -> String {
+        format!(
+            "minptime={};useinbandfec=1;stereo={};sprop-stereo=0;maxaveragebitrate={};maxplaybackrate={}",
+            self.min_packet_ms,
+            u8::from(self.stereo),
+            self.bitrate,
+            self.playback_rate
+        )
+    }
+}

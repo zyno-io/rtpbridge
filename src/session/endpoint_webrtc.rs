@@ -762,6 +762,7 @@ impl WebRtcEndpoint {
     }
 
     /// Create an SDP offer for a new outgoing endpoint
+    #[allow(dead_code)] // Source-free constructor remains part of the library API.
     pub async fn create_offer(
         id: EndpointId,
         direction: EndpointDirection,

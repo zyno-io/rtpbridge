@@ -258,10 +258,12 @@ impl OpusEncoder {
     }
     pub fn with_profile(profile: super::sdp::OpusProfile) -> Result<Self> {
         let mut result = Self::new()?;
-        result
-            .encoder
-            .set_bitrate(opus2::Bitrate::Bits(profile.bitrate.min(24000) as i32))?;
-        result.encoder.set_vbr(false)?;
+        if profile.bitrate < 24000 {
+            result
+                .encoder
+                .set_bitrate(opus2::Bitrate::Bits(profile.bitrate as i32))?;
+            result.encoder.set_vbr(false)?;
+        }
         let bandwidth = match profile.playback_rate {
             0..=11999 => opus2::Bandwidth::Narrowband,
             12000..=15999 => opus2::Bandwidth::Mediumband,
@@ -269,7 +271,9 @@ impl OpusEncoder {
             24000..=47999 => opus2::Bandwidth::Superwideband,
             _ => opus2::Bandwidth::Fullband,
         };
-        result.encoder.set_max_bandwidth(bandwidth)?;
+        if profile.playback_rate < 48000 {
+            result.encoder.set_max_bandwidth(bandwidth)?;
+        }
         Ok(result)
     }
 }
@@ -438,6 +442,23 @@ mod tests {
 
         dec.decode(&encoded, &mut decoded).unwrap();
         assert_eq!(decoded.len(), 960);
+    }
+
+    #[test]
+    fn opus_unrestricted_conversion_preserves_existing_encoded_packets() {
+        let mut original = OpusEncoder::new().unwrap();
+        let mut profiled =
+            OpusEncoder::with_profile(super::super::sdp::OpusProfile::default()).unwrap();
+        let pcm: Vec<i16> = (0..960)
+            .map(|i| ((i as f64 * 0.07).sin() * 18000.0) as i16)
+            .collect();
+        for _ in 0..10 {
+            let mut original_packet = Vec::new();
+            let mut profiled_packet = Vec::new();
+            original.encode(&pcm, &mut original_packet).unwrap();
+            profiled.encode(&pcm, &mut profiled_packet).unwrap();
+            assert_eq!(profiled_packet, original_packet);
+        }
     }
 
     #[test]

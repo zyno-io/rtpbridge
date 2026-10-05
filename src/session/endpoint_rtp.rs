@@ -425,6 +425,7 @@ impl RtpEndpoint {
     /// `socket_pair` is consumed here. On SRTP init failure, the sockets are dropped
     /// (ports released back to OS). The SocketPool wraps its counter so these ports
     /// will be available for future allocations.
+    #[allow(dead_code)] // Source-free constructor remains part of the library API.
     pub fn from_offer(
         id: EndpointId,
         direction: EndpointDirection,

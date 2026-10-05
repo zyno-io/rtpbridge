@@ -59,8 +59,10 @@ Opus receive limits are directional. Source receive constraints shape an outgoin
 offer; an accepted destination's receive constraints shape an unanswered RTP caller's
 answer. Payload types and SRTP keys remain local to each endpoint. Plain RTP advertises
 20ms maximum packetization; unsupported Opus packetization is excluded before selection,
-and WebRTC rejects it before mutating negotiation state. Conversion uses mono 20ms Opus,
-constant bitrate up to the receiver ceiling (at most 24kbps), and compatible bandwidth.
+and WebRTC rejects it before mutating negotiation state. Conversion uses mono 20ms Opus
+at up to 24kbps and compatible bandwidth. It retains the existing variable-bitrate encoder
+when the receive ceiling permits 24kbps; a lower ceiling uses constant bitrate to bound
+each encoded packet without imposing that encoder cost on unconstrained destinations.
 Direct forwarding conservatively compares negotiated receive envelopes rather than
 assuming every packet is mono, fullband, or 20ms.
 

@@ -59,10 +59,11 @@ impl DestinationMixer {
         self.dest_codec == codec && self.dest_pt == payload_type
     }
 
-    /// Create a new mixer that outputs encoded audio for `dest_codec`.
     pub fn matches_profile(&self, profile: crate::media::sdp::OpusProfile) -> bool {
         self.dest_codec != AudioCodec::Opus || self.opus_profile == profile
     }
+    /// Create a new mixer with the default receive profile for `dest_codec`.
+    #[allow(dead_code)] // Default-profile constructor remains part of the library API.
     pub fn new(dest_codec: AudioCodec, dest_pt: u8) -> Result<Self> {
         Self::new_with_profile(
             dest_codec,

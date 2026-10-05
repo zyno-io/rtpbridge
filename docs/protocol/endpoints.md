@@ -450,3 +450,37 @@ Endpoint state is reported in `endpoint.state_changed` events and session detail
 Plain RTP/SRTP offers must contain at least one active audio media section. RTPBridge prefers a secure section with supported SDES key material over plain RTP and keeps the first section among equal choices. It returns an answer with the same media sections in the same order; every unselected section has port zero. If secure sections are offered but none has usable key material, negotiation fails rather than falling back to plain RTP. Answers to RTPBridge-originated single-section offers must contain exactly one active audio section. The selected section needs a supported RTP transport profile, a reachable configured address family, and supported codecs. Mandatory secure profiles and any supplied crypto attribute require a supported suite with a valid 30-byte SDES key; invalid negotiation returns `ENDPOINT_ERROR` without committing the new endpoint or replacing established state. Existing secure endpoints cannot silently downgrade. The `srtp` and `srtp_optional` options apply to RTPBridge-originated offers; `create_from_offer` has no require-SRTP option and accepts a plain-only offer. The explicitly requested opportunistic offer mode can accept a plain answer declining encryption.
 
 Same-key renegotiation preserves SRTP and SRTCP replay windows and rollover counters. A peer restarting the same SSRC and packet index must negotiate a fresh key. Rekey retires the old receive keys after five seconds, including idle and RTCP-only transitions. New SSRCs use independent bounded receive state. Source changes must satisfy the [configured peer policy](../guide/configuration.md); source tuple validation for plain RTP does not provide cryptographic authentication.
+
+## Source-aware negotiation
+
+`server.info.capabilities` advertises `source_codec_negotiation`. On offer creation, optional
+`codec_source` is tagged `{ "kind": "endpoint", "endpoint_id": "..." }` for a negotiated
+RTP/WebRTC peer in the bound session, or `{ "kind": "offer", "sdp": "..." }` for the original
+unanswered RTP offer. Other endpoint types and provisional endpoints are rejected.
+
+RTP offers with this context advertise one audio codec, preferring the established source
+or the source offer's formats in Opus/G722/PCMU order, then remaining formats. The result
+includes `codec_candidates` for bounded call-owned fallback; `codecs: [candidate]` selects
+a later candidate with the same source. Empty explicit subsets fail before port allocation.
+WebRTC offers select one compatible audio codec through str0m configuration
+(Opus/PCMU); G722 needs conversion. Source-free operations keep their existing defaults.
+
+RTP `create_from_offer` accepts optional exact `codec` or `peer_endpoint_id` (mutually
+exclusive). An exact codec must exist in the selected valid audio section. A peer codec
+is preferred when supported, otherwise the quality ranking applies. Creation from an
+offer and answer acceptance return a `codec` descriptor; offer creation returns a
+provisional `codec` plus candidate list. Do not confuse an offered codec with committed
+negotiation. `endpoint.codec` reads committed state without waiting for periodic stats.
+Source endpoint lookup is scoped to the attached session. SIP retry policy belongs to
+call control; only final 488 responses should advance candidates.
+
+Descriptors contain `name`, `payload_type`, `clock_rate`, `channels`, remote receive
+`fmtp`/`maxptime`, and locally advertised `receive_fmtp`/`receive_maxptime`. Fields without
+codec-specific constraints are null. Offer results also contain `source_codec` for a
+negotiated endpoint source, allowing the call owner to check that source again before
+committing a winner. `endpoint.codec` takes `{ "endpoint_id": "..." }` and returns the
+descriptor directly; missing, provisional, or non-conversational sources fail.
+
+Directional Opus forwarding and conversion eligibility are defined in the
+[codec reference](../reference/codecs.md#source-aware-negotiation). No control response
+exposes SRTP key material outside the endpoint SDP that already owns it.

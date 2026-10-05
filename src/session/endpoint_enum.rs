@@ -900,3 +900,37 @@ mod tests {
         );
     }
 }
+
+/// Opus receive restrictions requested by this endpoint's remote peer.
+pub fn endpoint_opus_send_profile(endpoint: &Endpoint) -> crate::media::sdp::OpusProfile {
+    match endpoint {
+        Endpoint::Rtp(ep) => ep
+            .send_codec
+            .as_ref()
+            .map(crate::media::sdp::OpusProfile::from_codec)
+            .unwrap_or_default(),
+        Endpoint::WebRtc(ep) => ep.opus_send_profile,
+        _ => crate::media::sdp::OpusProfile::default(),
+    }
+}
+
+pub fn endpoint_requires_transcoding(source: &Endpoint, destination: &Endpoint) -> bool {
+    match (
+        endpoint_audio_codec(source),
+        endpoint_audio_codec(destination),
+    ) {
+        (Some(a), Some(b)) if a != b => true,
+        (
+            Some(crate::media::codec::AudioCodec::Opus),
+            Some(crate::media::codec::AudioCodec::Opus),
+        ) => {
+            let sender = match source {
+                Endpoint::Rtp(ep) => ep.opus_receive_profile,
+                Endpoint::WebRtc(ep) => ep.opus_receive_profile,
+                _ => crate::media::sdp::OpusProfile::default(),
+            };
+            !endpoint_opus_send_profile(destination).permits(sender)
+        }
+        _ => false,
+    }
+}

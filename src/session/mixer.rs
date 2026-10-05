@@ -33,6 +33,7 @@ struct SourceState {
 /// path detects frame boundaries when a source contributes a second time.
 pub struct DestinationMixer {
     dest_codec: AudioCodec,
+    opus_profile: crate::media::sdp::OpusProfile,
     dest_pt: u8,
     encoder: Box<dyn AudioEncoder>,
     sources: HashMap<EndpointId, SourceState>,
@@ -59,13 +60,28 @@ impl DestinationMixer {
     }
 
     /// Create a new mixer that outputs encoded audio for `dest_codec`.
+    pub fn matches_profile(&self, profile: crate::media::sdp::OpusProfile) -> bool {
+        self.dest_codec != AudioCodec::Opus || self.opus_profile == profile
+    }
     pub fn new(dest_codec: AudioCodec, dest_pt: u8) -> Result<Self> {
-        let encoder = codec::make_encoder(dest_codec)?;
+        Self::new_with_profile(
+            dest_codec,
+            dest_pt,
+            crate::media::sdp::OpusProfile::default(),
+        )
+    }
+    pub fn new_with_profile(
+        dest_codec: AudioCodec,
+        dest_pt: u8,
+        opus_profile: crate::media::sdp::OpusProfile,
+    ) -> Result<Self> {
+        let encoder = codec::make_encoder_with_profile(dest_codec, opus_profile)?;
         let frame_samples = dest_codec.ptime_samples();
         let clock_increment = dest_codec.rtp_clock_rate() / 50; // 20ms
 
         Ok(Self {
             dest_codec,
+            opus_profile,
             dest_pt,
             encoder,
             sources: HashMap::new(),

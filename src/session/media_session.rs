@@ -86,21 +86,28 @@ pub enum SessionCommand {
         reply: oneshot::Sender<u64>,
     },
     CreateFromOffer {
-        reply: oneshot::Sender<anyhow::Result<(EndpointId, String)>>,
+        reply: oneshot::Sender<anyhow::Result<EndpointCreateFromOfferResult>>,
+        codec: Option<String>,
+        peer_endpoint_id: Option<EndpointId>,
         sdp: String,
         direction: EndpointDirection,
         expected_type: Option<EndpointType>,
     },
     CreateOffer {
-        reply: oneshot::Sender<anyhow::Result<(EndpointId, String)>>,
+        reply: oneshot::Sender<anyhow::Result<EndpointCreateOfferResult>>,
+        codec_source: Option<CodecSource>,
         direction: EndpointDirection,
         endpoint_type: EndpointType,
         srtp: bool,
         srtp_optional: bool,
         codecs: Option<Vec<String>>,
     },
+    EndpointCodec {
+        reply: oneshot::Sender<anyhow::Result<CodecDescriptor>>,
+        endpoint_id: EndpointId,
+    },
     AcceptAnswer {
-        reply: oneshot::Sender<anyhow::Result<()>>,
+        reply: oneshot::Sender<anyhow::Result<Option<CodecDescriptor>>>,
         endpoint_id: EndpointId,
         sdp: String,
         expected_type: Option<EndpointType>,
@@ -457,10 +464,56 @@ impl SessionState {
                 sdp,
                 direction,
                 expected_type,
+                codec,
+                peer_endpoint_id,
             } => {
-                let result = self
-                    .handle_create_from_offer(packet_tx, &sdp, direction, expected_type)
-                    .await;
+                let selected = self.answer_codec(&sdp, codec.as_deref(), peer_endpoint_id);
+                let result = match selected {
+                    Ok(selected) => {
+                        let created = self
+                            .handle_create_from_offer_with_codec(
+                                packet_tx,
+                                &sdp,
+                                direction,
+                                expected_type,
+                                selected.as_deref(),
+                            )
+                            .await;
+                        created.map(|(endpoint_id, mut sdp_answer)| {
+                            if let Some(peer) =
+                                peer_endpoint_id.and_then(|id| self.endpoints.get(&id))
+                            {
+                                let mut profile =
+                                    super::endpoint_enum::endpoint_opus_send_profile(peer);
+                                profile.stereo = false;
+                                profile.max_packet_ms = 20;
+                                if let Some(Endpoint::Rtp(ep)) =
+                                    self.endpoints.get_mut(&endpoint_id)
+                                    && let Some(codec) =
+                                        ep.send_codec.as_ref().filter(|codec| codec.name == "opus")
+                                {
+                                    let original = format!(
+                                        "a=fmtp:{} {}",
+                                        codec.pt,
+                                        sdp::CODEC_OPUS.fmtp.as_deref().unwrap()
+                                    );
+                                    sdp_answer = sdp_answer.replace(
+                                        &original,
+                                        &format!("a=fmtp:{} {}", codec.pt, profile.fmtp()),
+                                    );
+                                    ep.opus_receive_profile = profile;
+                                }
+                            }
+                            self.rebuild_routing();
+                            EndpointCreateFromOfferResult {
+                                codec: self.negotiated_codec(endpoint_id).ok(),
+                                endpoint_id,
+                                sdp_answer,
+                            }
+                        })
+                    }
+                    Err(error) => Err(error),
+                };
                 if result.is_ok() {
                     self.metrics.endpoints_total.inc();
                     self.metrics.endpoints_active.inc();
@@ -474,22 +527,48 @@ impl SessionState {
                 srtp,
                 srtp_optional,
                 codecs,
+                codec_source,
             } => {
-                let result = self
-                    .handle_create_offer(
-                        packet_tx,
-                        direction,
-                        endpoint_type,
-                        srtp,
-                        srtp_optional,
-                        codecs,
-                    )
-                    .await;
+                let source_codec = match &codec_source {
+                    Some(CodecSource::Endpoint { endpoint_id }) => {
+                        self.negotiated_codec(*endpoint_id).ok()
+                    }
+                    _ => None,
+                };
+                let profile = self.source_receive_profile(codec_source.as_ref());
+                let plan =
+                    self.codec_candidates(codec_source.as_ref(), endpoint_type, codecs.as_deref());
+                let result = match plan {
+                    Ok((selected, candidates)) => {
+                        let created = self
+                            .handle_create_offer_with_profile(
+                                packet_tx,
+                                direction,
+                                endpoint_type,
+                                srtp,
+                                srtp_optional,
+                                selected,
+                                profile,
+                            )
+                            .await;
+                        created.map(|(endpoint_id, sdp_offer)| EndpointCreateOfferResult {
+                            codec: self.offered_codec(endpoint_id),
+                            endpoint_id,
+                            sdp_offer,
+                            codec_candidates: candidates,
+                            source_codec,
+                        })
+                    }
+                    Err(error) => Err(error),
+                };
                 if result.is_ok() {
                     self.metrics.endpoints_total.inc();
                     self.metrics.endpoints_active.inc();
                 }
                 let _ = reply.send(result);
+            }
+            SessionCommand::EndpointCodec { reply, endpoint_id } => {
+                let _ = reply.send(self.negotiated_codec(endpoint_id));
             }
             SessionCommand::AcceptAnswer {
                 reply,
@@ -498,12 +577,15 @@ impl SessionState {
                 expected_type,
                 expected_generation,
             } => {
-                let _ = reply.send(self.handle_accept_answer(
-                    endpoint_id,
-                    &sdp,
-                    expected_type,
-                    expected_generation,
-                ));
+                let _ = reply.send(
+                    self.handle_accept_answer(
+                        endpoint_id,
+                        &sdp,
+                        expected_type,
+                        expected_generation,
+                    )
+                    .map(|()| self.negotiated_codec(endpoint_id).ok()),
+                );
             }
             SessionCommand::AcceptOffer {
                 reply,
@@ -955,12 +1037,184 @@ impl SessionState {
         }
     }
 
+    fn source_receive_profile(&self, source: Option<&CodecSource>) -> Option<sdp::OpusProfile> {
+        match source? {
+            CodecSource::Endpoint { endpoint_id } => self
+                .endpoints
+                .get(endpoint_id)
+                .map(super::endpoint_enum::endpoint_opus_send_profile),
+            CodecSource::Offer { sdp: offer } => sdp::parse_sdp(offer)
+                .codecs
+                .iter()
+                .find(|c| c.name == "opus")
+                .map(sdp::OpusProfile::from_codec),
+        }
+    }
+
+    fn offered_codec(&self, id: EndpointId) -> Option<CodecDescriptor> {
+        match self.endpoints.get(&id)? {
+            Endpoint::Rtp(ep) => ep.send_codec.as_ref().map(|c| CodecDescriptor {
+                name: c.name.to_string(),
+                payload_type: c.pt,
+                clock_rate: c.clock_rate,
+                channels: c.channels.unwrap_or(1),
+                fmtp: c.fmtp.as_deref().map(str::to_string),
+                receive_fmtp: (c.name == "opus").then(|| ep.opus_receive_profile.fmtp()),
+                maxptime: c.maxptime,
+                receive_maxptime: (c.name == "opus")
+                    .then_some(ep.opus_receive_profile.max_packet_ms),
+            }),
+            Endpoint::WebRtc(ep) => ep.negotiated_codec().map(|c| CodecDescriptor {
+                name: c.name.to_string(),
+                payload_type: c.pt,
+                clock_rate: c.clock_rate,
+                channels: c.channels,
+                fmtp: (c.name == "opus").then(|| ep.opus_send_profile.fmtp()),
+                receive_fmtp: (c.name == "opus").then(|| ep.opus_receive_profile.fmtp()),
+                maxptime: (c.name == "opus").then_some(ep.opus_send_profile.max_packet_ms),
+                receive_maxptime: (c.name == "opus")
+                    .then_some(ep.opus_receive_profile.max_packet_ms),
+            }),
+            _ => None,
+        }
+    }
+
+    fn negotiated_codec(&self, id: EndpointId) -> anyhow::Result<CodecDescriptor> {
+        match self.endpoints.get(&id) {
+            Some(Endpoint::Rtp(ep)) if ep.remote_rtp_addr.is_some() => {}
+            Some(Endpoint::WebRtc(ep)) if ep.negotiated_codec().is_some() => {}
+            _ => {
+                anyhow::bail!("Source must be a negotiated RTP or WebRTC endpoint in this session")
+            }
+        }
+        self.offered_codec(id)
+            .ok_or_else(|| anyhow::anyhow!("No negotiated audio codec"))
+    }
+
+    fn answer_codec(
+        &self,
+        offer: &str,
+        exact: Option<&str>,
+        peer: Option<EndpointId>,
+    ) -> anyhow::Result<Option<String>> {
+        if exact.is_some() && peer.is_some() {
+            anyhow::bail!("codec and peer_endpoint_id are mutually exclusive");
+        }
+        let parsed = sdp::parse_sdp(offer);
+        if let Some(exact) = exact {
+            if !parsed
+                .codecs
+                .iter()
+                .any(|c| c.name != "telephone-event" && c.name.eq_ignore_ascii_case(exact))
+            {
+                anyhow::bail!("Requested audio codec is absent from offer");
+            }
+            return Ok(Some(exact.to_string()));
+        }
+        if let Some(peer) = peer {
+            let codec = self.negotiated_codec(peer)?;
+            if parsed
+                .codecs
+                .iter()
+                .any(|c| c.name.eq_ignore_ascii_case(&codec.name))
+            {
+                return Ok(Some(codec.name));
+            }
+        }
+        Ok(None)
+    }
+
+    fn codec_candidates(
+        &self,
+        source: Option<&CodecSource>,
+        kind: EndpointType,
+        explicit: Option<&[String]>,
+    ) -> anyhow::Result<(Option<Vec<String>>, Vec<String>)> {
+        let Some(source) = source else {
+            return Ok((explicit.map(<[String]>::to_vec), vec![]));
+        };
+        let quality = ["opus", "G722", "PCMU"];
+        let preferred: Vec<String> = match source {
+            CodecSource::Endpoint { endpoint_id } => {
+                vec![self.negotiated_codec(*endpoint_id)?.name]
+            }
+            CodecSource::Offer { sdp: offer } => {
+                let parsed = sdp::parse_sdp(offer);
+                parsed.validate_plain_offer()?;
+                if !parsed
+                    .codecs
+                    .iter()
+                    .any(|codec| codec.name != "telephone-event")
+                {
+                    anyhow::bail!("Source offer has no supported audio codec");
+                }
+                quality
+                    .iter()
+                    .filter(|name| {
+                        parsed
+                            .codecs
+                            .iter()
+                            .any(|c| c.name.eq_ignore_ascii_case(name))
+                    })
+                    .map(|name| name.to_string())
+                    .collect()
+            }
+        };
+        let supported = |name: &str| {
+            kind == EndpointType::Rtp
+                || name.eq_ignore_ascii_case("opus")
+                || name.eq_ignore_ascii_case("PCMU")
+        };
+        let mut candidates: Vec<String> = preferred
+            .iter()
+            .filter(|name| supported(name))
+            .cloned()
+            .collect();
+        for name in quality {
+            if supported(name) && !candidates.iter().any(|c| c.eq_ignore_ascii_case(name)) {
+                candidates.push(name.to_string());
+            }
+        }
+        let selected = if let Some(names) = explicit {
+            if names.len() != 1 || !candidates.iter().any(|c| c.eq_ignore_ascii_case(&names[0])) {
+                anyhow::bail!("Source-aware RTP proposal must select one supported candidate");
+            }
+            names.to_vec()
+        } else if kind == EndpointType::Webrtc {
+            let subset: Vec<_> = preferred
+                .into_iter()
+                .filter(|name| supported(name))
+                .collect();
+            if subset.is_empty() {
+                vec!["opus".to_string()]
+            } else {
+                vec![subset[0].clone()]
+            }
+        } else {
+            vec![candidates[0].clone()]
+        };
+        Ok((Some(selected), candidates))
+    }
+
+    #[cfg(test)]
     async fn handle_create_from_offer(
         &mut self,
         packet_tx: &mpsc::Sender<InboundPacket>,
         sdp_str: &str,
         direction: EndpointDirection,
         expected_type: Option<EndpointType>,
+    ) -> anyhow::Result<(EndpointId, String)> {
+        self.handle_create_from_offer_with_codec(packet_tx, sdp_str, direction, expected_type, None)
+            .await
+    }
+
+    async fn handle_create_from_offer_with_codec(
+        &mut self,
+        packet_tx: &mpsc::Sender<InboundPacket>,
+        sdp_str: &str,
+        direction: EndpointDirection,
+        expected_type: Option<EndpointType>,
+        codec: Option<&str>,
     ) -> anyhow::Result<(EndpointId, String)> {
         if self.max_endpoints > 0
             && self.endpoints.len() + self.reserved_transfers.len() >= self.max_endpoints
@@ -1019,8 +1273,15 @@ impl SessionState {
             let bind_ip = binding.ip;
             let pool = Arc::clone(&binding.pool);
             let pair = pool.allocate_pair().await?;
-            let (mut ep, answer) =
-                RtpEndpoint::from_offer(id, direction, sdp_str, pair, bind_ip, packet_tx.clone())?;
+            let (mut ep, answer) = RtpEndpoint::from_offer_with_codec(
+                id,
+                direction,
+                sdp_str,
+                pair,
+                bind_ip,
+                packet_tx.clone(),
+                codec,
+            )?;
             ep.source_networks = Arc::clone(&self.media_bindings.source_networks);
             let te = ep.telephone_event_pt;
             info!(
@@ -1049,6 +1310,7 @@ impl SessionState {
         Ok((id, answer))
     }
 
+    #[cfg(test)]
     async fn handle_create_offer(
         &mut self,
         packet_tx: &mpsc::Sender<InboundPacket>,
@@ -1057,6 +1319,29 @@ impl SessionState {
         srtp: bool,
         srtp_optional: bool,
         codecs: Option<Vec<String>>,
+    ) -> anyhow::Result<(EndpointId, String)> {
+        self.handle_create_offer_with_profile(
+            packet_tx,
+            direction,
+            endpoint_type,
+            srtp,
+            srtp_optional,
+            codecs,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_create_offer_with_profile(
+        &mut self,
+        packet_tx: &mpsc::Sender<InboundPacket>,
+        direction: EndpointDirection,
+        endpoint_type: EndpointType,
+        srtp: bool,
+        srtp_optional: bool,
+        codecs: Option<Vec<String>>,
+        profile: Option<sdp::OpusProfile>,
     ) -> anyhow::Result<(EndpointId, String)> {
         if self.max_endpoints > 0
             && self.endpoints.len() + self.reserved_transfers.len() >= self.max_endpoints
@@ -1073,12 +1358,13 @@ impl SessionState {
                     .ips()
                     .map(|ip| SocketAddr::new(ip, 0))
                     .collect();
-                let (ep, offer) = WebRtcEndpoint::create_offer(
+                let (ep, offer) = WebRtcEndpoint::create_offer_with_codecs(
                     id,
                     direction,
                     &bind_addrs,
                     packet_tx.clone(),
                     self.metrics.clone(),
+                    codecs.as_deref(),
                 )
                 .await?;
                 info!(
@@ -1098,12 +1384,22 @@ impl SessionState {
                 let binding = self.media_bindings.primary();
                 let bind_ip = binding.ip;
                 let pool = Arc::clone(&binding.pool);
-                let pair = pool.allocate_pair().await?;
                 // Advertise the caller's preferred codec order, or highest-
                 // quality-first (Opus > G.722 > PCMU) when unspecified, so the
                 // SIP answerer's default first-match selection stays as wideband
                 // as it can instead of dropping to PCMU. See `offer_codec_list`.
-                let offer_codecs = sdp::offer_codec_list(codecs.as_deref());
+                let mut offer_codecs = sdp::offer_codec_list(codecs.as_deref());
+                if let Some(profile) = profile {
+                    for codec in &mut offer_codecs {
+                        if codec.name == "opus" {
+                            codec.fmtp = Some(std::borrow::Cow::Owned(profile.fmtp()));
+                        }
+                    }
+                }
+                if !offer_codecs.iter().any(|c| c.name != "telephone-event") {
+                    anyhow::bail!("No supported audio codecs requested");
+                }
+                let pair = pool.allocate_pair().await?;
                 let media_security = if srtp {
                     RtpMediaSecurity::Srtp
                 } else if srtp_optional {
@@ -2224,17 +2520,23 @@ impl SessionState {
         {
             return true;
         }
-        let source = self
-            .endpoints
-            .get(&endpoint_id)
-            .and_then(endpoint_audio_codec);
-        self.routing.destinations(&endpoint_id).is_some_and(|destinations| {
-            destinations.iter().any(|destination| {
-                let codec = self.endpoints.get(destination).and_then(endpoint_audio_codec);
-                self.mixers.contains_key(destination)
-                    || matches!((source, codec), (Some(source), Some(destination)) if source != destination)
+        self.routing
+            .destinations(&endpoint_id)
+            .is_some_and(|destinations| {
+                destinations.iter().any(|destination| {
+                    self.mixers.contains_key(destination)
+                        || self
+                            .endpoints
+                            .get(&endpoint_id)
+                            .zip(self.endpoints.get(destination))
+                            .is_some_and(|(source, destination)| {
+                                super::endpoint_enum::endpoint_requires_transcoding(
+                                    source,
+                                    destination,
+                                )
+                            })
+                })
             })
-        })
     }
 
     // ── WebRTC / SRTP ───────────────────────────────────────────────
@@ -2515,13 +2817,18 @@ impl SessionState {
             .update(self.session_id, &self.endpoints, &self.routing);
         // Discard obsolete edges before admitting new encoder state. Active
         // single-source destinations fit the validated pipeline budget.
-        self.transcode_cache.retain(|(source, destination), _| {
-            !self.routing.is_multi_source(destination)
-                && self
-                    .routing
-                    .destinations(source)
-                    .is_some_and(|destinations| destinations.contains(destination))
-        });
+        self.transcode_cache
+            .retain(|(source, destination), cached| {
+                self.endpoints.get(destination).is_some_and(|ep| {
+                    cached
+                        .pipeline
+                        .matches_profile(super::endpoint_enum::endpoint_opus_send_profile(ep))
+                }) && !self.routing.is_multi_source(destination)
+                    && self
+                        .routing
+                        .destinations(source)
+                        .is_some_and(|destinations| destinations.contains(destination))
+            });
         self.rebuild_mixers();
         let unused_decoders: Vec<_> = self
             .analysis_decoders
@@ -2554,7 +2861,12 @@ impl SessionState {
             multi.contains(dest_id)
                 && self.endpoints.get(dest_id).is_some_and(|ep| {
                     match (endpoint_audio_codec(ep), endpoint_send_pt(ep)) {
-                        (Some(codec), Some(pt)) => mixer.matches_output(codec, pt),
+                        (Some(codec), Some(pt)) => {
+                            mixer.matches_output(codec, pt)
+                                && mixer.matches_profile(
+                                    super::endpoint_enum::endpoint_opus_send_profile(ep),
+                                )
+                        }
                         _ => false,
                     }
                 })
@@ -2566,7 +2878,11 @@ impl SessionState {
                 && let Some(ep) = self.endpoints.get(&dest_id)
                 && let (Some(codec), Some(pt)) = (endpoint_audio_codec(ep), endpoint_send_pt(ep))
             {
-                match super::mixer::DestinationMixer::new(codec, pt) {
+                match super::mixer::DestinationMixer::new_with_profile(
+                    codec,
+                    pt,
+                    super::endpoint_enum::endpoint_opus_send_profile(ep),
+                ) {
                     Ok(mut mixer) => {
                         // Seed timestamp from the endpoint's last outbound
                         // timestamp for seamless passthrough→mixer transition.
@@ -2662,7 +2978,6 @@ impl SessionState {
                     };
                 }
                 let dests = dests.expect("has_dests implies Some");
-                let src_codec = endpoint_audio_codec(ep);
                 let mut mixed = false;
                 let mut opaque = false;
                 let mut all_transparent = true;
@@ -2672,7 +2987,8 @@ impl SessionState {
                     }
                     match self.endpoints.get(did) {
                         Some(dep) => {
-                            let transcodes = endpoint_audio_codec(dep) != src_codec;
+                            let transcodes =
+                                super::endpoint_enum::endpoint_requires_transcoding(ep, dep);
                             let is_plain_rtp = matches!(dep, Endpoint::Rtp(_));
                             if transcodes || is_plain_rtp {
                                 opaque = true;
@@ -3952,10 +4268,16 @@ async fn poll_and_route(
             .collect();
         let want_vad = vad_monitors.contains_key(&pkt.source_endpoint_id);
         let want_fax = fax_detectors.contains_key(&pkt.source_endpoint_id);
-        let needs_pcm =
-            want_vad || want_fax || dest_info.iter().any(|(id, codec, _, _)| {
+        let needs_pcm = want_vad
+            || want_fax
+            || dest_info.iter().any(|(id, _, _, _)| {
                 mixers.contains_key(id)
-                    || matches!((src_codec, codec), (Some(source), Some(dest)) if source != *dest)
+                    || endpoints
+                        .get(&pkt.source_endpoint_id)
+                        .zip(endpoints.get(id))
+                        .is_some_and(|(source, destination)| {
+                            super::endpoint_enum::endpoint_requires_transcoding(source, destination)
+                        })
             });
         let mut frames = Vec::new();
         if needs_pcm {
@@ -4037,10 +4359,12 @@ async fn poll_and_route(
                 }
 
                 // Single-source destinations: transcode/passthrough as before
-                let needs_transcode = matches!(
-                    (src_codec, dest_codec),
-                    (Some(s), Some(d)) if s != d
-                );
+                let needs_transcode = endpoints
+                    .get(&pkt.source_endpoint_id)
+                    .zip(endpoints.get(&dest_id))
+                    .is_some_and(|(source, destination)| {
+                        super::endpoint_enum::endpoint_requires_transcoding(source, destination)
+                    });
 
                 let routed_packets = if needs_transcode {
                     let cache_key = (pkt.source_endpoint_id, dest_id);
@@ -4069,7 +4393,14 @@ async fn poll_and_route(
                                 continue;
                             }
                         };
-                        match TranscodePipeline::for_pcm(sc, dc) {
+                        match TranscodePipeline::for_pcm_with_profile(
+                            sc,
+                            dc,
+                            endpoints
+                                .get(&dest_id)
+                                .map(super::endpoint_enum::endpoint_opus_send_profile)
+                                .unwrap_or_default(),
+                        ) {
                             Ok(p) => {
                                 // Evict oldest entry if cache is at capacity
                                 // O(n) LRU scan; acceptable for typical cache sizes (≤ 100 entries)

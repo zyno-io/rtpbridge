@@ -1230,3 +1230,20 @@ async fn test_recording_addrs_picks_nominated_family() {
         "local must match the nominated IPv4 family, got {local:?}"
     );
 }
+
+#[tokio::test]
+async fn codec_webrtc_invalid_packetization_preserves_pending_offer() {
+    let mut endpoint = mk_webrtc_ts_endpoint().await;
+    endpoint.add_host_candidates().unwrap();
+    let mut api = endpoint.rtc.sdp_api();
+    api.add_media(MediaKind::Audio, Direction::SendRecv, None, None, None);
+    let (offer, pending) = api.apply().unwrap();
+    endpoint.pending_offer = Some(pending);
+    let mut peer = RtcConfig::new().build(Instant::now());
+    let answer = peer.sdp_api().accept_offer(offer).unwrap().to_sdp_string();
+    let invalid = answer.replace("minptime=10", "minptime=40");
+    assert_ne!(invalid, answer);
+    assert!(endpoint.accept_answer(&invalid).is_err());
+    assert!(endpoint.pending_offer.is_some());
+    endpoint.accept_answer(&answer).unwrap();
+}

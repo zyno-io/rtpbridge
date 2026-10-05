@@ -256,6 +256,33 @@ impl OpusEncoder {
         encoder.set_bitrate(opus2::Bitrate::Bits(24000))?;
         Ok(Self { encoder })
     }
+    pub fn with_profile(profile: super::sdp::OpusProfile) -> Result<Self> {
+        let mut result = Self::new()?;
+        result
+            .encoder
+            .set_bitrate(opus2::Bitrate::Bits(profile.bitrate.min(24000) as i32))?;
+        result.encoder.set_vbr(false)?;
+        let bandwidth = match profile.playback_rate {
+            0..=11999 => opus2::Bandwidth::Narrowband,
+            12000..=15999 => opus2::Bandwidth::Mediumband,
+            16000..=23999 => opus2::Bandwidth::Wideband,
+            24000..=47999 => opus2::Bandwidth::Superwideband,
+            _ => opus2::Bandwidth::Fullband,
+        };
+        result.encoder.set_max_bandwidth(bandwidth)?;
+        Ok(result)
+    }
+}
+
+pub fn make_encoder_with_profile(
+    codec: AudioCodec,
+    profile: super::sdp::OpusProfile,
+) -> Result<Box<dyn AudioEncoder>> {
+    if codec == AudioCodec::Opus {
+        Ok(Box::new(OpusEncoder::with_profile(profile)?))
+    } else {
+        make_encoder(codec)
+    }
 }
 
 impl AudioEncoder for OpusEncoder {
@@ -411,6 +438,33 @@ mod tests {
 
         dec.decode(&encoded, &mut decoded).unwrap();
         assert_eq!(decoded.len(), 960);
+    }
+
+    #[test]
+    fn opus_conversion_honors_receive_bitrate_bandwidth_and_packetization() {
+        let profile = super::super::sdp::OpusProfile::parse(Some(
+            "maxaveragebitrate=12000;maxplaybackrate=8000;stereo=0",
+        ));
+        let mut encoder = OpusEncoder::with_profile(profile).unwrap();
+        let mut decoder = OpusDecoder::new().unwrap();
+        let pcm: Vec<i16> = (0..960)
+            .map(|i| ((i as f64 * 0.07).sin() * 18000.0) as i16)
+            .collect();
+        for _ in 0..10 {
+            let mut packet = Vec::new();
+            encoder.encode(&pcm, &mut packet).unwrap();
+            assert!(
+                packet.len() <= 30,
+                "20ms at 12kbps must stay within 30 bytes"
+            );
+            assert_eq!(
+                opus2::packet::get_bandwidth(&packet).unwrap(),
+                opus2::Bandwidth::Narrowband
+            );
+            let mut decoded = Vec::new();
+            decoder.decode(&packet, &mut decoded).unwrap();
+            assert_eq!(decoded.len(), 960);
+        }
     }
 
     #[test]

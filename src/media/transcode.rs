@@ -9,6 +9,7 @@ use super::resample::Resampler;
 pub struct TranscodePipeline {
     decoder: Option<Box<dyn AudioDecoder>>,
     source: AudioCodec,
+    profile: super::sdp::OpusProfile,
     timeline: Option<(u32, u32)>,
     encoder: Box<dyn AudioEncoder>,
     resampler: Option<Resampler>,
@@ -42,6 +43,7 @@ impl TranscodePipeline {
         Ok(Self {
             decoder: Some(decoder),
             source: from,
+            profile: super::sdp::OpusProfile::default(),
             timeline: None,
             encoder,
             resampler,
@@ -53,12 +55,23 @@ impl TranscodePipeline {
         })
     }
 
+    pub fn matches_profile(&self, profile: super::sdp::OpusProfile) -> bool {
+        self.encoder.codec() != AudioCodec::Opus || self.profile == profile
+    }
     pub fn for_pcm(from: AudioCodec, to: AudioCodec) -> Result<Self> {
+        Self::for_pcm_with_profile(from, to, super::sdp::OpusProfile::default())
+    }
+    pub fn for_pcm_with_profile(
+        from: AudioCodec,
+        to: AudioCodec,
+        profile: super::sdp::OpusProfile,
+    ) -> Result<Self> {
         Ok(Self {
             decoder: None,
             source: from,
+            profile,
             timeline: None,
-            encoder: codec::make_encoder(to)?,
+            encoder: codec::make_encoder_with_profile(to, profile)?,
             resampler: None,
             passthrough: false,
             decode_buf: Vec::new(),

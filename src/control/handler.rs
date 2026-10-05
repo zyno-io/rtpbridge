@@ -96,6 +96,15 @@ pub async fn handle_request(
         return Response::err(id, "INVALID_REQUEST", "request id must be non-empty");
     }
 
+    if req
+        .params
+        .get("codec_source")
+        .and_then(|source| source.get("sdp"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|sdp| sdp.len() > manager.max_sdp_size())
+    {
+        return Response::err(id, "INVALID_PARAMS", "Source SDP too large");
+    }
     match req.method.as_str() {
         "session.create" => {
             handle_session_create(
@@ -179,6 +188,7 @@ pub async fn handle_request(
         "endpoint.webrtc.accept_offer" => {
             handle_endpoint_accept_offer(id, req.params, state, manager).await
         }
+        "endpoint.codec" => handle_endpoint_codec(id, req.params, state).await,
         "endpoint.remove" => handle_endpoint_remove(id, req.params, state).await,
 
         "endpoint.dtmf.inject" => handle_dtmf_inject(id, req.params, state).await,
@@ -407,6 +417,7 @@ fn handle_server_info(id: String, manager: &Arc<SessionManager>) -> Response {
             hostname: server_hostname(),
             version: crate::version::BUILD_VERSION,
             media_ip: manager.media_ips(),
+            capabilities: vec!["source_codec_negotiation"],
         },
     )
 }
@@ -486,6 +497,8 @@ async fn handle_endpoint_create_from_offer_inner(
         SessionCommand::CreateFromOffer {
             reply: reply_tx,
             sdp: params.sdp,
+            codec: params.codec,
+            peer_endpoint_id: params.peer_endpoint_id,
             direction: params.direction,
             expected_type,
         },
@@ -494,13 +507,7 @@ async fn handle_endpoint_create_from_offer_inner(
     )
     .await
     {
-        Ok(Ok((endpoint_id, sdp_answer))) => Response::ok(
-            id,
-            EndpointCreateFromOfferResult {
-                endpoint_id,
-                sdp_answer,
-            },
-        ),
+        Ok(Ok(result)) => Response::ok(id, result),
         Ok(Err(e)) => Response::err(id, "ENDPOINT_ERROR", e.to_string()),
         Err(resp) => resp,
     }
@@ -523,6 +530,7 @@ async fn handle_endpoint_create_offer(
         params.srtp,
         params.srtp_optional,
         params.codecs,
+        params.codec_source,
     )
     .await
 }
@@ -544,6 +552,7 @@ async fn handle_endpoint_create_offer_webrtc(
         false,
         false,
         None,
+        params.codec_source,
     )
     .await
 }
@@ -565,10 +574,12 @@ async fn handle_endpoint_create_offer_rtp(
         params.srtp,
         params.srtp_optional,
         params.codecs,
+        params.codec_source,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_endpoint_create_offer_inner(
     id: String,
     state: &mut ConnectionState,
@@ -577,6 +588,7 @@ async fn handle_endpoint_create_offer_inner(
     srtp: bool,
     srtp_optional: bool,
     codecs: Option<Vec<String>>,
+    codec_source: Option<CodecSource>,
 ) -> Response {
     if srtp && srtp_optional {
         return Response::err(
@@ -601,19 +613,14 @@ async fn handle_endpoint_create_offer_inner(
             srtp,
             srtp_optional,
             codecs,
+            codec_source,
         },
         reply_rx,
         &id,
     )
     .await
     {
-        Ok(Ok((endpoint_id, sdp_offer))) => Response::ok(
-            id,
-            EndpointCreateOfferResult {
-                endpoint_id,
-                sdp_offer,
-            },
-        ),
+        Ok(Ok(result)) => Response::ok(id, result),
         Ok(Err(e)) => Response::err(id, "ENDPOINT_ERROR", e.to_string()),
         Err(resp) => resp,
     }
@@ -675,7 +682,7 @@ async fn handle_endpoint_accept_answer_inner(
     )
     .await
     {
-        Ok(Ok(())) => Response::ok(id, serde_json::json!({})),
+        Ok(Ok(codec)) => Response::ok(id, serde_json::json!({ "codec": codec })),
         Ok(Err(e)) => Response::err(id, "ENDPOINT_ERROR", e.to_string()),
         Err(resp) => resp,
     }
@@ -2034,5 +2041,36 @@ mod tests {
 
         std::fs::remove_file(&link).ok();
         std::fs::remove_dir_all(&real_sub).ok();
+    }
+}
+
+async fn handle_endpoint_codec(
+    id: String,
+    params: serde_json::Value,
+    state: &mut ConnectionState,
+) -> Response {
+    let cmd_tx = match state.require_session(&id) {
+        Ok(tx) => tx.clone(),
+        Err(resp) => return resp,
+    };
+    let params: EndpointCodecParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(error) => return Response::err(id, "INVALID_PARAMS", error.to_string()),
+    };
+    let (reply, receiver) = oneshot::channel();
+    match send_and_recv(
+        &cmd_tx,
+        SessionCommand::EndpointCodec {
+            reply,
+            endpoint_id: params.endpoint_id,
+        },
+        receiver,
+        &id,
+    )
+    .await
+    {
+        Ok(Ok(codec)) => Response::ok(id, codec),
+        Ok(Err(error)) => Response::err(id, "ENDPOINT_ERROR", error.to_string()),
+        Err(response) => response,
     }
 }

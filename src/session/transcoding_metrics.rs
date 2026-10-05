@@ -49,7 +49,7 @@ impl TranscodingMetrics {
                 let Some(destination_codec) = endpoint_audio_codec(destination) else {
                     continue;
                 };
-                if source_codec == destination_codec {
+                if !super::endpoint_enum::endpoint_requires_transcoding(source, destination) {
                     continue;
                 }
                 if source_is_file {
@@ -73,6 +73,7 @@ impl TranscodingMetrics {
                 destination_endpoint_id = %destination_id,
                 ?source_codec,
                 ?destination_codec,
+                reason = if source_codec == destination_codec { "opus_receive_profile" } else { "codec_mismatch" },
                 "session requires peer codec transcoding"
             );
         }

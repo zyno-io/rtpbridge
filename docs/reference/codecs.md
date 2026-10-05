@@ -24,7 +24,10 @@ The resample step handles rate conversion between 8 kHz, 16 kHz, and 48 kHz usin
 
 ### Passthrough
 
-If source and destination use the same codec, packets are forwarded directly without transcoding.
+Matching codecs forward directly when their directional Opus receive profiles permit it.
+A stricter bitrate, playback bandwidth, stereo, or packetization requirement can require
+decode/encode even when both legs use Opus. These routes contribute to peer conversion
+metrics with the reason `opus_receive_profile`; ordinary codec differences use `codec_mismatch`.
 
 ### DTMF Bypass
 
@@ -43,3 +46,24 @@ All codecs use 20ms ptime:
 ## Telephone-Event
 
 For WebRTC endpoints, RFC 4733 telephone-event uses PT 101. For plain RTP/SRTP endpoints, generated SDP includes telephone-event by default and answers retain the offered telephone-event payload type and clock rate. The `a=fmtp:101 0-16` line supports digits 0-9, *, #, A-D, and flash. File, tone, bridge, and WebSocket audio endpoints do not negotiate telephone-event.
+
+## Source-aware negotiation
+
+An established conversational source takes priority over the default Opus/G.722/PCMU
+quality ranking. For an unanswered source, its supported codecs take priority in quality
+order. SIP proposals use one audio codec; WebRTC enables one compatible Opus/PCMU codec
+through str0m. G.722 requires conversion on a WebRTC leg. Operations without source
+context retain their existing codec defaults.
+
+Opus receive limits are directional. Source receive constraints shape an outgoing RTP
+offer; an accepted destination's receive constraints shape an unanswered RTP caller's
+answer. Payload types and SRTP keys remain local to each endpoint. Plain RTP advertises
+20ms maximum packetization; unsupported Opus packetization is excluded before selection,
+and WebRTC rejects it before mutating negotiation state. Conversion uses mono 20ms Opus,
+constant bitrate up to the receiver ceiling (at most 24kbps), and compatible bandwidth.
+Direct forwarding conservatively compares negotiated receive envelopes rather than
+assuming every packet is mono, fullband, or 20ms.
+
+The additive control fields, capability detection, descriptors, and session-scoped source
+lookup are documented in [the endpoint protocol](../protocol/endpoints.md#source-aware-negotiation).
+SIP rejection retries and endpoint sharing remain owned by the call controller.

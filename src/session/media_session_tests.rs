@@ -1087,6 +1087,7 @@ fn test_endpoint_audio_codec_resolves_non_standard_opus_pt() {
         clock_rate: 48000,
         channels: Some(2),
         fmtp: None,
+        maxptime: None,
     };
 
     // Old approach: from_pt(96) → None (broken for dynamic PTs)
@@ -2040,4 +2041,485 @@ async fn double_check_duplicate_transfer_cannot_release_another_rollback_slot() 
         .await;
     assert!(state.endpoints.contains_key(&endpoint_id));
     assert!(state.reserved_transfers.is_empty());
+}
+
+fn codec_test_offer(formats: &str, mappings: &str) -> String {
+    format!(
+        "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 31000 RTP/AVP {formats}\r\n{mappings}"
+    )
+}
+
+#[tokio::test]
+async fn codec_source_prefers_established_pcmu_and_rejects_provisional_or_foreign_sources() {
+    let mut state = test_session_state();
+    let (packets, _) = mpsc::channel(16);
+    let pcmu = codec_test_offer("0", "a=rtpmap:0 PCMU/8000\r\n");
+    let (caller, _) = state
+        .handle_create_from_offer(
+            &packets,
+            &pcmu,
+            EndpointDirection::SendRecv,
+            Some(EndpointType::Rtp),
+        )
+        .await
+        .unwrap();
+    let (chosen, candidates) = state
+        .codec_candidates(
+            Some(&CodecSource::Endpoint {
+                endpoint_id: caller,
+            }),
+            EndpointType::Rtp,
+            None,
+        )
+        .unwrap();
+    assert_eq!(chosen.unwrap(), ["PCMU"]);
+    assert_eq!(candidates, ["PCMU", "opus", "G722"]);
+    let (pending, _) = state
+        .handle_create_offer(
+            &packets,
+            EndpointDirection::Inactive,
+            EndpointType::Rtp,
+            false,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+    for endpoint_id in [pending, EndpointId::new_v4()] {
+        assert!(
+            state
+                .codec_candidates(
+                    Some(&CodecSource::Endpoint { endpoint_id }),
+                    EndpointType::Rtp,
+                    None
+                )
+                .is_err()
+        );
+    }
+    assert!(state.routing.destinations(&caller).is_none());
+    assert_eq!(state.metrics.transcoding_sessions_active.get(), 0);
+}
+
+#[tokio::test]
+async fn codec_source_fresh_offer_uses_quality_intersection_and_webrtc_subset() {
+    let state = test_session_state();
+    let offer = codec_test_offer(
+        "0 9 123",
+        "a=rtpmap:0 PCMU/8000\r\na=rtpmap:9 G722/8000\r\na=rtpmap:123 opus/48000/2\r\n",
+    );
+    let source = CodecSource::Offer { sdp: offer };
+    let (selected, candidates) = state
+        .codec_candidates(Some(&source), EndpointType::Rtp, None)
+        .unwrap();
+    assert_eq!(selected.unwrap(), ["opus"]);
+    assert_eq!(candidates, ["opus", "G722", "PCMU"]);
+    let (subset, _) = state
+        .codec_candidates(Some(&source), EndpointType::Webrtc, None)
+        .unwrap();
+    assert_eq!(subset.unwrap(), ["opus"]);
+    for offer in [
+        codec_test_offer("101", "a=rtpmap:101 telephone-event/8000\r\n"),
+        codec_test_offer("111", "a=rtpmap:111 opus/48000/1\r\n"),
+    ] {
+        assert!(
+            state
+                .codec_candidates(
+                    Some(&CodecSource::Offer { sdp: offer }),
+                    EndpointType::Rtp,
+                    None
+                )
+                .is_err()
+        );
+    }
+    assert!(
+        state
+            .codec_candidates(Some(&source), EndpointType::Rtp, Some(&[]))
+            .is_err()
+    );
+    assert!(
+        state
+            .codec_candidates(
+                Some(&source),
+                EndpointType::Rtp,
+                Some(&["PCMA".to_string()])
+            )
+            .is_err()
+    );
+    let only_g722 = CodecSource::Offer {
+        sdp: codec_test_offer("9", "a=rtpmap:9 G722/8000\r\n"),
+    };
+    let (subset, _) = state
+        .codec_candidates(Some(&only_g722), EndpointType::Webrtc, None)
+        .unwrap();
+    assert_eq!(subset.unwrap(), ["opus"]);
+}
+
+#[tokio::test]
+async fn codec_winner_answer_preserves_dynamic_payloads_and_directional_opus_constraints() {
+    let mut state = test_session_state();
+    let (packets, mut inbound) = mpsc::channel(16);
+    let bound_caller = tokio::net::UdpSocket::bind("127.0.0.1:0").await;
+    let caller_socket = bound_caller.unwrap();
+    let bound_peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await;
+    let peer_socket = bound_peer.unwrap();
+    let caller_addr = caller_socket.local_addr().unwrap();
+    let peer_addr = peer_socket.local_addr().unwrap();
+    let caller_offer = codec_test_offer(
+        "0 123 101 108",
+        "a=rtpmap:123 opus/48000/2\r\na=fmtp:123 maxplaybackrate=16000\r\na=rtpmap:101 telephone-event/8000\r\na=rtpmap:108 telephone-event/48000\r\n",
+    ).replace("m=audio 31000", &format!("m=audio {}", caller_addr.port()));
+    let (reply, receiver) = tokio::sync::oneshot::channel();
+    state
+        .handle_command(
+            SessionCommand::CreateOffer {
+                reply,
+                direction: EndpointDirection::Inactive,
+                endpoint_type: EndpointType::Rtp,
+                srtp: false,
+                srtp_optional: false,
+                codecs: None,
+                codec_source: Some(CodecSource::Offer {
+                    sdp: caller_offer.clone(),
+                }),
+            },
+            &packets,
+        )
+        .await;
+    let offer = receiver.await.unwrap().unwrap();
+    let parsed = sdp::parse_sdp(&offer.sdp_offer);
+    assert_eq!(
+        parsed
+            .codecs
+            .iter()
+            .filter(|c| c.name != "telephone-event")
+            .map(|c| c.name)
+            .collect::<Vec<_>>(),
+        ["opus"]
+    );
+    assert!(offer.sdp_offer.contains("maxplaybackrate=16000"));
+    let peer_answer = codec_test_offer(
+        "111 101",
+        "a=rtpmap:111 opus/48000/2\r\na=fmtp:111 maxaveragebitrate=12000;maxplaybackrate=16000;stereo=0\r\na=rtpmap:101 telephone-event/8000\r\n",
+    ).replace("m=audio 31000", &format!("m=audio {}", peer_addr.port()));
+    state
+        .handle_accept_answer(
+            offer.endpoint_id,
+            &peer_answer,
+            Some(EndpointType::Rtp),
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        state
+            .negotiated_codec(offer.endpoint_id)
+            .unwrap()
+            .payload_type,
+        111
+    );
+    let (reply, receiver) = tokio::sync::oneshot::channel();
+    state
+        .handle_command(
+            SessionCommand::CreateFromOffer {
+                reply,
+                sdp: caller_offer,
+                direction: EndpointDirection::SendRecv,
+                expected_type: Some(EndpointType::Rtp),
+                codec: None,
+                peer_endpoint_id: Some(offer.endpoint_id),
+            },
+            &packets,
+        )
+        .await;
+    let caller = receiver.await.unwrap().unwrap();
+    let codec = caller.codec.unwrap();
+    assert_eq!(codec.name, "opus");
+    assert_eq!(codec.payload_type, 123);
+    assert!(caller.sdp_answer.contains("maxaveragebitrate=12000"));
+    assert!(
+        caller
+            .sdp_answer
+            .contains("a=rtpmap:108 telephone-event/48000")
+    );
+    assert!(
+        !crate::session::endpoint_enum::endpoint_requires_transcoding(
+            &state.endpoints[&caller.endpoint_id],
+            &state.endpoints[&offer.endpoint_id]
+        )
+    );
+    assert!(
+        !crate::session::endpoint_enum::endpoint_requires_transcoding(
+            &state.endpoints[&offer.endpoint_id],
+            &state.endpoints[&caller.endpoint_id]
+        )
+    );
+    state
+        .handle_update_direction(offer.endpoint_id, EndpointDirectionUpdate::Auto)
+        .unwrap();
+    let mut encoder = crate::media::codec::OpusEncoder::with_profile(sdp::OpusProfile::parse(
+        Some("maxaveragebitrate=12000;maxplaybackrate=16000"),
+    ))
+    .unwrap();
+    let mut payload = Vec::new();
+    crate::media::codec::AudioEncoder::encode(&mut encoder, &[300; 960], &mut payload).unwrap();
+    // Learn both symmetric-RTP addresses before testing media forwarding.
+    for (source, sender, pt, addr) in [
+        (caller.endpoint_id, &caller_socket, 123, caller_addr),
+        (offer.endpoint_id, &peer_socket, 111, peer_addr),
+    ] {
+        let Endpoint::Rtp(endpoint) = &state.endpoints[&source] else {
+            panic!("expected RTP endpoint")
+        };
+        let seed = crate::media::rtp::RtpHeader::build(pt, 0, 0, 333, true, &payload);
+        let sent = sender.send_to(&seed, endpoint.local_rtp_addr).await;
+        sent.unwrap();
+        let received = tokio::time::timeout(Duration::from_secs(1), inbound.recv()).await;
+        let packet = received.unwrap().unwrap();
+        assert_eq!(packet.source, addr);
+        let (routed, _, _) = handle_inbound_packet(&mut state.endpoints, &packet, &state.metrics);
+        assert!(routed.is_some());
+    }
+    for (source, sender, source_pt) in [
+        (caller.endpoint_id, &caller_socket, 123),
+        (offer.endpoint_id, &peer_socket, 111),
+    ] {
+        let Endpoint::Rtp(endpoint) = &state.endpoints[&source] else {
+            panic!("expected RTP endpoint")
+        };
+        let local_addr = endpoint.local_rtp_addr;
+        // Prime the real jitter buffer with a short burst of consecutive 20ms packets.
+        for sequence in 1..=4 {
+            let data = crate::media::rtp::RtpHeader::build(
+                source_pt,
+                sequence,
+                u32::from(sequence) * 960,
+                333,
+                sequence == 1,
+                &payload,
+            );
+            let sent = sender.send_to(&data, local_addr).await;
+            sent.unwrap();
+            let received = tokio::time::timeout(Duration::from_secs(1), inbound.recv()).await;
+            let packet = received.unwrap().unwrap();
+            let (routed, _, _) =
+                handle_inbound_packet(&mut state.endpoints, &packet, &state.metrics);
+            codec_test_route(&mut state, vec![routed.unwrap()]).await;
+        }
+    }
+    for (receiver, destination_pt) in [(&peer_socket, 111), (&caller_socket, 123)] {
+        let mut received = [0; 2048];
+        let mut length = None;
+        for _ in 0..100 {
+            match receiver.try_recv_from(&mut received) {
+                Ok((n, _)) => {
+                    length = Some(n);
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("media receive failed: {error}"),
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            codec_test_route(&mut state, vec![]).await;
+        }
+        let length = length.unwrap_or_else(|| {
+            panic!(
+                "buffered RTP must reach PT {destination_pt}; routed {}",
+                state.metrics.packets_routed.get()
+            )
+        });
+        let header = crate::media::rtp::RtpHeader::parse(&received[..length]).unwrap();
+        assert_eq!(header.payload_type, destination_pt);
+        assert_eq!(
+            header.payload(&received[..length]),
+            payload,
+            "compatible profiles must preserve the encoded audio"
+        );
+    }
+    assert!(state.transcode_cache.is_empty());
+    assert_eq!(state.metrics.transcoding_sessions_active.get(), 0);
+}
+
+#[tokio::test]
+async fn codec_constrained_answer_rejects_payload_changes_without_partial_mutation() {
+    let mut state = test_session_state();
+    let (packets, _) = mpsc::channel(16);
+    let (id, _) = state
+        .handle_create_offer(
+            &packets,
+            EndpointDirection::Inactive,
+            EndpointType::Rtp,
+            false,
+            false,
+            Some(vec!["opus".to_string()]),
+        )
+        .await
+        .unwrap();
+    for answer in [
+        codec_test_offer("123", "a=rtpmap:123 opus/48000/2\r\n"),
+        codec_test_offer(
+            "111 120",
+            "a=rtpmap:111 opus/48000/2\r\na=rtpmap:120 opus/48000/2\r\n",
+        ),
+        codec_test_offer("101", "a=rtpmap:101 telephone-event/8000\r\n"),
+    ] {
+        assert!(
+            state
+                .handle_accept_answer(id, &answer, Some(EndpointType::Rtp), None)
+                .is_err()
+        );
+        assert!(state.negotiated_codec(id).is_err());
+        assert_eq!(state.endpoints[&id].state(), EndpointState::Connecting);
+    }
+    let count = state.endpoints.len();
+    assert!(
+        state
+            .handle_create_offer(
+                &packets,
+                EndpointDirection::Inactive,
+                EndpointType::Rtp,
+                false,
+                false,
+                Some(vec![])
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(state.endpoints.len(), count);
+}
+
+#[tokio::test]
+async fn codec_opus_profile_conversion_counts_routes_and_preserves_remote_hold() {
+    let mut state = test_session_state();
+    let (packets, _) = mpsc::channel(16);
+    let (source, _) = state
+        .handle_create_from_offer(
+            &packets,
+            &codec_test_offer("111", "a=rtpmap:111 opus/48000/2\r\n"),
+            EndpointDirection::SendRecv,
+            Some(EndpointType::Rtp),
+        )
+        .await
+        .unwrap();
+    let (destination, _) = state
+        .handle_create_from_offer(
+            &packets,
+            &codec_test_offer(
+                "111",
+                "a=rtpmap:111 opus/48000/2\r\na=fmtp:111 maxaveragebitrate=12000\r\n",
+            ),
+            EndpointDirection::SendRecv,
+            Some(EndpointType::Rtp),
+        )
+        .await
+        .unwrap();
+    assert!(
+        crate::session::endpoint_enum::endpoint_requires_transcoding(
+            &state.endpoints[&source],
+            &state.endpoints[&destination]
+        )
+    );
+    assert!(
+        !crate::session::endpoint_enum::endpoint_requires_transcoding(
+            &state.endpoints[&destination],
+            &state.endpoints[&source]
+        )
+    );
+    assert_eq!(state.metrics.transcoding_sessions_active.get(), 1);
+    state.handle_remove_endpoint(destination).await.unwrap();
+    assert_eq!(state.metrics.transcoding_sessions_active.get(), 0);
+
+    let (pending, _) = state
+        .handle_create_offer(
+            &packets,
+            EndpointDirection::Inactive,
+            EndpointType::Rtp,
+            false,
+            false,
+            Some(vec!["opus".to_string()]),
+        )
+        .await
+        .unwrap();
+    let held_answer = codec_test_offer("111", "a=rtpmap:111 opus/48000/2\r\na=sendonly\r\n");
+    state
+        .handle_accept_answer(pending, &held_answer, Some(EndpointType::Rtp), None)
+        .unwrap();
+    if let Endpoint::Rtp(ep) = state.endpoints.get_mut(&pending).unwrap() {
+        ep.set_direction_override(EndpointDirectionUpdate::Auto);
+        assert_eq!(ep.config.direction, EndpointDirection::SendOnly);
+    }
+}
+
+#[tokio::test]
+async fn codec_webrtc_pcmu_source_generates_exclusive_initial_offer() {
+    let mut state = test_session_state();
+    let (packets, _) = mpsc::channel(16);
+    let source = CodecSource::Offer {
+        sdp: codec_test_offer("0 101", "a=rtpmap:101 telephone-event/8000\r\n"),
+    };
+    let (codecs, _) = state
+        .codec_candidates(Some(&source), EndpointType::Webrtc, None)
+        .unwrap();
+    let (_, offer) = state
+        .handle_create_offer(
+            &packets,
+            EndpointDirection::SendRecv,
+            EndpointType::Webrtc,
+            false,
+            false,
+            codecs,
+        )
+        .await
+        .unwrap();
+    let parsed = sdp::parse_sdp(&offer);
+    assert_eq!(
+        parsed
+            .codecs
+            .iter()
+            .filter(|c| c.name != "telephone-event")
+            .map(|c| c.name)
+            .collect::<Vec<_>>(),
+        ["PCMU"]
+    );
+}
+
+#[test]
+fn codec_parser_excludes_opus_packetization_that_the_encoder_cannot_satisfy() {
+    for attributes in ["a=fmtp:111 minptime=40\r\n", "a=maxptime:10\r\n"] {
+        let offer = codec_test_offer(
+            "111 0",
+            &format!("a=rtpmap:111 opus/48000/2\r\n{attributes}"),
+        );
+        let parsed = sdp::parse_sdp(&offer);
+        assert!(!parsed.opus_profile.unwrap().encodable());
+        assert_eq!(
+            sdp::select_answer_codec(&parsed.codecs).unwrap().name,
+            "PCMU"
+        );
+    }
+}
+
+async fn codec_test_route(state: &mut SessionState, packets: Vec<RoutedRtpPacket>) {
+    poll_and_route(
+        &mut state.endpoints,
+        &mut state.dtmf_state,
+        &state.sensitive_dtmf_endpoints,
+        &state.routing,
+        &state.event_tx,
+        &state.critical_event_tx,
+        &state.dropped_events,
+        &mut state.recording_mgr,
+        &mut state.vad_monitors,
+        &mut state.fax_detectors,
+        &mut state.analysis_decoders,
+        &state.metrics,
+        packets,
+        &mut state.file_rtp_states,
+        &mut state.tone_rtp_states,
+        &mut state.transcode_cache,
+        128,
+        &mut state.mixers,
+        &mut state.playout_buffers,
+        &state.playout_policy,
+        &mut state.mix_grid,
+    )
+    .await;
 }

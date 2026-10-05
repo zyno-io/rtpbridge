@@ -91,6 +91,12 @@ fn project_known_object(
 fn project_known_field(key: &str, value: &Value, sensitive_dtmf: Option<bool>) -> Value {
     match key {
         "sdp" | "sdp_offer" | "sdp_answer" => summarize_sdp(value),
+        "codec_source" => project_known_object(value, &["kind", "endpoint_id", "sdp"], None),
+        "source_codec" => project_known_object(
+            value,
+            &["name", "payload_type", "clock_rate", "channels"],
+            None,
+        ),
         "source" => summarize_source(value),
         "file_path" => summarize_file_path(value),
         "headers" => summarize_headers(value),
@@ -98,7 +104,9 @@ fn project_known_field(key: &str, value: &Value, sensitive_dtmf: Option<bool>) -
         "digit" => summarize_digit(value, sensitive_dtmf.unwrap_or(true)),
         key if key.ends_with("_id") => summarize_id(value),
         "media_ip" | "endpoints" | "recordings" | "sessions" | "vad_active"
-        | "fax_detect_active" | "ssrc_list" | "codecs" => summarize_array(value),
+        | "fax_detect_active" | "ssrc_list" | "codecs" | "codec_candidates" | "capabilities" => {
+            summarize_array(value)
+        }
         "direction" | "type" | "endpoint_type" | "state" | "old_state" | "new_state"
         | "ice_state" | "reason" | "tone" | "codec" => summarize_enum(value),
         _ => match value {
@@ -385,10 +393,23 @@ fn request_fields(method: &str) -> &'static [&'static str] {
         "session.attach" => &["session_id"],
         "endpoint.create_from_offer"
         | "endpoint.webrtc.create_from_offer"
-        | "endpoint.rtp.create_from_offer" => &["sdp", "direction"],
-        "endpoint.create_offer" => &["direction", "type", "srtp", "srtp_optional", "codecs"],
-        "endpoint.webrtc.create_offer" => &["direction"],
-        "endpoint.rtp.create_offer" => &["direction", "srtp", "srtp_optional", "codecs"],
+        | "endpoint.rtp.create_from_offer" => &["sdp", "direction", "codec", "peer_endpoint_id"],
+        "endpoint.create_offer" => &[
+            "direction",
+            "type",
+            "srtp",
+            "srtp_optional",
+            "codecs",
+            "codec_source",
+        ],
+        "endpoint.webrtc.create_offer" => &["direction", "codec_source"],
+        "endpoint.rtp.create_offer" => &[
+            "direction",
+            "srtp",
+            "srtp_optional",
+            "codecs",
+            "codec_source",
+        ],
         "endpoint.accept_answer"
         | "endpoint.webrtc.accept_answer"
         | "endpoint.rtp.accept_answer" => &["endpoint_id", "sdp", "offer_generation"],
@@ -451,13 +472,18 @@ fn response_fields(method: &str) -> &'static [&'static str] {
             "fax_detect_active",
         ],
         "session.list" => &["sessions"],
-        "server.info" => &["hostname", "version", "media_ip"],
+        "server.info" => &["hostname", "version", "media_ip", "capabilities"],
         "session.timeline.mark" => &["marked_at_epoch_ms"],
         "endpoint.create_from_offer"
         | "endpoint.webrtc.create_from_offer"
         | "endpoint.rtp.create_from_offer" => &["endpoint_id", "sdp_answer"],
         "endpoint.create_offer" | "endpoint.webrtc.create_offer" | "endpoint.rtp.create_offer" => {
-            &["endpoint_id", "sdp_offer"]
+            &[
+                "endpoint_id",
+                "sdp_offer",
+                "codec_candidates",
+                "source_codec",
+            ]
         }
         "endpoint.accept_offer" | "endpoint.webrtc.accept_offer" => &["sdp_answer"],
         "endpoint.ice_restart" | "endpoint.webrtc.ice_restart" => {

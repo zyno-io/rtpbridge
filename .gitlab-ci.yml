@@ -112,6 +112,8 @@ bench:baseline:
 bench:regression:
   extends: .rust-base
   stage: test
+  variables:
+    GIT_DEPTH: "0"
   rules:
     - if: $CI_COMMIT_TAG
       when: never
@@ -120,28 +122,12 @@ bench:regression:
     - if: $CI_COMMIT_BRANCH == "main"
       when: never
     - when: always
-  cache:
-    key: bench-baseline
-    paths:
-      - .bench-cache/
-    policy: pull
   script:
     - |
-      if [ ! -d .bench-cache ]; then
-        echo "No baseline found — run benchmarks without comparison"
-        cargo bench --bench '*'
-        exit 0
-      fi
-    - mkdir -p target
-    - cp -r .bench-cache target/criterion
-    - cargo bench --bench '*' -- --baseline main 2>&1 | tee bench-output.txt
-    - |
-      if grep -q "Performance has regressed" bench-output.txt; then
-        echo ""
-        echo "========== BENCHMARK REGRESSIONS DETECTED =========="
-        grep -B 4 "Performance has regressed" bench-output.txt
-        exit 1
-      fi
+      bench_target_branch="${CI_MERGE_REQUEST_TARGET_BRANCH_NAME:-main}"
+      git fetch --no-tags origin "$bench_target_branch"
+      bench_base_sha="$(git merge-base "$CI_COMMIT_SHA" FETCH_HEAD)"
+      bash scripts/compare-benchmarks.sh "$bench_base_sha"
 
 .build-base:
   stage: build

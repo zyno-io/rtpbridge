@@ -76,6 +76,9 @@ pub trait AudioEncoder: Send {
     fn encode(&mut self, pcm_in: &[i16], encoded_out: &mut Vec<u8>) -> Result<()>;
     #[allow(dead_code)] // called through Box<dyn AudioEncoder> — invisible to compiler
     fn codec(&self) -> AudioCodec;
+    fn opus_profile(&self) -> super::sdp::OpusProfile {
+        super::sdp::OpusProfile::default()
+    }
 }
 
 // ── PCMU (G.711 mu-law) ────────────────────────────────────────────────
@@ -247,6 +250,7 @@ impl AudioDecoder for OpusDecoder {
 
 pub struct OpusEncoder {
     encoder: opus2::Encoder,
+    profile: super::sdp::OpusProfile,
 }
 
 impl OpusEncoder {
@@ -254,10 +258,14 @@ impl OpusEncoder {
         let mut encoder =
             opus2::Encoder::new(48000, opus2::Channels::Mono, opus2::Application::Voip)?;
         encoder.set_bitrate(opus2::Bitrate::Bits(24000))?;
-        Ok(Self { encoder })
+        Ok(Self {
+            encoder,
+            profile: super::sdp::OpusProfile::default(),
+        })
     }
     pub fn with_profile(profile: super::sdp::OpusProfile) -> Result<Self> {
         let mut result = Self::new()?;
+        result.profile = profile;
         if profile.bitrate < 24000 {
             result
                 .encoder
@@ -300,6 +308,9 @@ impl AudioEncoder for OpusEncoder {
 
     fn codec(&self) -> AudioCodec {
         AudioCodec::Opus
+    }
+    fn opus_profile(&self) -> super::sdp::OpusProfile {
+        self.profile
     }
 }
 

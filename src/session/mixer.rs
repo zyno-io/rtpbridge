@@ -33,7 +33,6 @@ struct SourceState {
 /// path detects frame boundaries when a source contributes a second time.
 pub struct DestinationMixer {
     dest_codec: AudioCodec,
-    opus_profile: crate::media::sdp::OpusProfile,
     dest_pt: u8,
     encoder: Box<dyn AudioEncoder>,
     sources: HashMap<EndpointId, SourceState>,
@@ -60,7 +59,7 @@ impl DestinationMixer {
     }
 
     pub fn matches_profile(&self, profile: crate::media::sdp::OpusProfile) -> bool {
-        self.dest_codec != AudioCodec::Opus || self.opus_profile == profile
+        self.dest_codec != AudioCodec::Opus || self.encoder.opus_profile() == profile
     }
     /// Create a new mixer with the default receive profile for `dest_codec`.
     #[allow(dead_code)] // Default-profile constructor remains part of the library API.
@@ -82,7 +81,6 @@ impl DestinationMixer {
 
         Ok(Self {
             dest_codec,
-            opus_profile,
             dest_pt,
             encoder,
             sources: HashMap::new(),

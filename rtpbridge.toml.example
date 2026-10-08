@@ -38,11 +38,16 @@
 # (e.g., control on a private management VLAN, media on a public-facing IP).
 media_ip = "203.0.113.10"
 
-# UDP port range for plain RTP endpoint socket allocation (inclusive).
-# WebRTC endpoints ignore this and use OS-assigned ports.
-# Size the range for your expected concurrent RTP streams — each endpoint
-# binds a pair of ports (even for RTP, odd for RTCP) from this pool.
+# Inclusive UDP port range shared by RTP and WebRTC endpoints by default.
+# Plain RTP binds an even/odd pair; WebRTC binds one port per media family.
+# Size the range for both endpoint types, or reserve separate WebRTC capacity
+# with the optional webrtc_port_range override below.
 rtp_port_range = [30000, 39999]
+
+# Optional inclusive range for WebRTC ICE/DTLS/SRTP sockets (one port per family).
+# Occupied ports are skipped; exhaustion fails rather than using another range.
+# Omit to share rtp_port_range.
+# webrtc_port_range = [49152, 65535]
 
 # Source networks allowed to establish the initial symmetric RTP/RTCP tuple.
 # "*" is the default: any source may establish the tuple, which is then locked

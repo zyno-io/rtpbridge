@@ -1247,3 +1247,111 @@ async fn codec_webrtc_invalid_packetization_preserves_pending_offer() {
     assert!(endpoint.pending_offer.is_some());
     endpoint.accept_answer(&answer).unwrap();
 }
+
+#[tokio::test]
+async fn test_webrtc_port_range_exhaustion_and_socket_release() {
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let occupied = UdpSocket::bind(bind_addr).await.unwrap();
+    let port = occupied.local_addr().unwrap().port();
+    let error = bind_webrtc_socket(bind_addr, Some((port, port)))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("exhausted"));
+    drop(occupied);
+    let allocated = bind_webrtc_socket(bind_addr, Some((port, port)))
+        .await
+        .unwrap();
+    assert_eq!(allocated.local_addr().unwrap().port(), port);
+    drop(allocated);
+    let reused = bind_webrtc_socket(bind_addr, Some((port, port)))
+        .await
+        .unwrap();
+    assert_eq!(reused.local_addr().unwrap().port(), port);
+}
+
+#[tokio::test]
+async fn test_webrtc_port_range_skips_occupied_ports() {
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let (occupied, free) = loop {
+        let occupied = UdpSocket::bind(bind_addr).await.unwrap();
+        let port = occupied.local_addr().unwrap().port();
+        if port == 65535 {
+            continue;
+        }
+        if let Ok(free) = UdpSocket::bind(SocketAddr::new(bind_addr.ip(), port + 1)).await {
+            break (occupied, free);
+        }
+    };
+    let start = occupied.local_addr().unwrap().port();
+    drop(free);
+    let socket = bind_webrtc_socket(bind_addr, Some((start, start + 1)))
+        .await
+        .unwrap();
+    assert_eq!(socket.local_addr().unwrap().port(), start + 1);
+}
+
+#[tokio::test]
+async fn test_webrtc_port_range_failed_second_binding_releases_first() {
+    let available = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let port = available.local_addr().unwrap().port();
+    drop(available);
+    let result = WebRtcEndpoint::new_with_socket_and_codecs(
+        EndpointId::new_v4(),
+        EndpointConfig {
+            direction: EndpointDirection::SendRecv,
+        },
+        &[
+            "127.0.0.1:0".parse().unwrap(),
+            "[2001:db8::bad]:0".parse().unwrap(),
+        ],
+        Arc::new(Metrics::new()),
+        None,
+        Some((port, port)),
+    )
+    .await;
+    assert!(result.is_err());
+    let released = UdpSocket::bind(SocketAddr::new("127.0.0.1".parse().unwrap(), port)).await;
+    assert!(
+        released.is_ok(),
+        "failed endpoint creation must release its first socket"
+    );
+}
+
+#[tokio::test]
+async fn test_webrtc_port_range_shares_occupied_ports_with_rtp_pool() {
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let reserved = loop {
+        let socket = UdpSocket::bind(bind_addr).await.unwrap();
+        let start = socket.local_addr().unwrap().port();
+        if !start.is_multiple_of(2) || start > 65532 {
+            continue;
+        }
+        let mut sockets = vec![socket];
+        for port in start + 1..=start + 3 {
+            match UdpSocket::bind(SocketAddr::new(bind_addr.ip(), port)).await {
+                Ok(socket) => sockets.push(socket),
+                Err(_) => break,
+            }
+        }
+        if sockets.len() == 4 {
+            break sockets;
+        }
+    };
+    let start = reserved[0].local_addr().unwrap().port();
+    let range = (start, start + 3);
+    let pool = crate::net::socket_pool::SocketPool::new(bind_addr.ip(), range.0, range.1).unwrap();
+    drop(reserved);
+    let first_pair = pool.allocate_pair().await.unwrap();
+    let webrtc = bind_webrtc_socket(bind_addr, Some(range)).await.unwrap();
+    let port = webrtc.local_addr().unwrap().port();
+    assert!((start + 2..=start + 3).contains(&port));
+    assert!(
+        pool.allocate_pair().await.is_err(),
+        "RTP must skip the pair partially occupied by WebRTC"
+    );
+    drop(webrtc);
+    let second_pair = pool.allocate_pair().await.unwrap();
+    assert_eq!(second_pair.rtp_addr.port(), start + 2);
+    assert_eq!(second_pair.rtcp_addr.port(), start + 3);
+    assert_eq!(first_pair.rtp_addr.port(), start);
+}

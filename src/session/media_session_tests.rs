@@ -2523,3 +2523,92 @@ async fn codec_test_route(state: &mut SessionState, packets: Vec<RoutedRtpPacket
     )
     .await;
 }
+
+#[tokio::test]
+async fn test_webrtc_port_range_applies_to_generated_offer_and_answer() {
+    assert_webrtc_port_range_for_offer_and_answer(true).await;
+}
+
+#[tokio::test]
+async fn test_webrtc_port_range_inherits_rtp_for_offer_and_answer() {
+    assert_webrtc_port_range_for_offer_and_answer(false).await;
+}
+
+async fn assert_webrtc_port_range_for_offer_and_answer(use_override: bool) {
+    let mut state = test_session_state();
+    assert_eq!(state.media_bindings.webrtc_port_range, Some((50000, 50100)));
+    let offer_slot = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let answer_slot = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let offer_port = offer_slot.local_addr().unwrap().port();
+    let answer_port = answer_slot.local_addr().unwrap().port();
+    if use_override {
+        Arc::get_mut(&mut state.media_bindings)
+            .unwrap()
+            .webrtc_port_range = Some((offer_port, offer_port));
+    }
+    let offer_range = state.media_bindings.webrtc_port_range.unwrap();
+    drop(offer_slot);
+    drop(answer_slot);
+    let (tx, _rx) = mpsc::channel(16);
+    let (offer_id, offer) = state
+        .handle_create_offer(
+            &tx,
+            EndpointDirection::SendRecv,
+            EndpointType::Webrtc,
+            false,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+    if use_override {
+        Arc::get_mut(&mut state.media_bindings)
+            .unwrap()
+            .webrtc_port_range = Some((answer_port, answer_port));
+    }
+    let answer_range = state.media_bindings.webrtc_port_range.unwrap();
+    let peer_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut peer = str0m::RtcConfig::new().build(Instant::now());
+    peer.add_local_candidate(
+        str0m::Candidate::host(peer_socket.local_addr().unwrap(), "udp").unwrap(),
+    );
+    let mut api = peer.sdp_api();
+    api.add_media(
+        str0m::media::MediaKind::Audio,
+        str0m::media::Direction::SendRecv,
+        None,
+        None,
+        None,
+    );
+    let (peer_offer, _) = api.apply().unwrap();
+    let (answer_id, answer) = state
+        .handle_create_from_offer(
+            &tx,
+            &peer_offer.to_sdp_string(),
+            EndpointDirection::SendRecv,
+            Some(EndpointType::Webrtc),
+        )
+        .await
+        .unwrap();
+    for (sdp, id, (start, end)) in [
+        (&offer, offer_id, offer_range),
+        (&answer, answer_id, answer_range),
+    ] {
+        let candidates: Vec<_> = sdp
+            .lines()
+            .filter(|line| line.starts_with("a=candidate:"))
+            .collect();
+        assert_eq!(candidates.len(), 1);
+        let port = candidates[0]
+            .split_whitespace()
+            .nth(5)
+            .unwrap()
+            .parse::<u16>()
+            .unwrap();
+        assert!((start..=end).contains(&port));
+        let Endpoint::WebRtc(endpoint) = state.endpoints.get(&id).unwrap() else {
+            panic!("expected WebRTC endpoint");
+        };
+        assert_eq!(endpoint.sockets[0].0.port(), port);
+    }
+}

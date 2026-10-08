@@ -24,6 +24,40 @@ use crate::control::protocol::{
 use crate::media::rtcp::RtcpStats;
 use crate::metrics::Metrics;
 
+async fn bind_webrtc_socket(
+    bind_addr: SocketAddr,
+    port_range: Option<(u16, u16)>,
+) -> anyhow::Result<UdpSocket> {
+    let Some((start, end)) = port_range else {
+        return Ok(UdpSocket::bind(bind_addr).await?);
+    };
+    anyhow::ensure!(start >= 1024 && start <= end, "invalid webrtc_port_range");
+    if bind_addr.port() != 0 {
+        anyhow::ensure!(
+            (start..=end).contains(&bind_addr.port()),
+            "explicit WebRTC bind port is outside webrtc_port_range"
+        );
+        return Ok(UdpSocket::bind(bind_addr).await?);
+    }
+
+    let first = rand::random_range(start..=end) as u32;
+    let count = u32::from(end) - u32::from(start) + 1;
+    for attempt in 0..count {
+        let port = u32::from(start) + (first - u32::from(start) + attempt) % count;
+        let mut addr = bind_addr;
+        addr.set_port(port as u16);
+        match UdpSocket::bind(addr).await {
+            Ok(socket) => return Ok(socket),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    anyhow::bail!(
+        "WebRTC UDP port range {start}..={end} exhausted for {}",
+        bind_addr.ip()
+    );
+}
+
 /// Default before a WebRTC audio codec has been negotiated.
 const WEBRTC_OPUS_RTP_CLOCK_HZ: u32 = 48_000;
 
@@ -300,7 +334,7 @@ impl WebRtcEndpoint {
         bind_addrs: &[SocketAddr],
         metrics: Arc<Metrics>,
     ) -> anyhow::Result<Self> {
-        Self::new_with_socket_and_codecs(id, config, bind_addrs, metrics, None).await
+        Self::new_with_socket_and_codecs(id, config, bind_addrs, metrics, None, None).await
     }
 
     async fn new_with_socket_and_codecs(
@@ -309,9 +343,9 @@ impl WebRtcEndpoint {
         bind_addrs: &[SocketAddr],
         metrics: Arc<Metrics>,
         codecs: Option<&[String]>,
+        port_range: Option<(u16, u16)>,
     ) -> anyhow::Result<Self> {
-        // WebRTC endpoints use OS-assigned ephemeral ports (not rtp_port_range).
-        // ICE negotiates connectivity dynamically, so fixed port ranges don't apply.
+        // WebRTC uses single sockets rather than the plain RTP/RTCP pair allocator.
         // One socket per configured address family (dual-stack): each becomes an
         // ICE host candidate, and ICE nominates the working pair.
         if bind_addrs.is_empty() {
@@ -333,7 +367,7 @@ impl WebRtcEndpoint {
         }
         let mut sockets = Vec::with_capacity(bind_addrs.len());
         for &bind_addr in bind_addrs {
-            let socket = UdpSocket::bind(bind_addr).await?;
+            let socket = bind_webrtc_socket(bind_addr, port_range).await?;
             let local_addr = socket.local_addr()?;
             sockets.push((local_addr, Arc::new(socket)));
         }
@@ -725,6 +759,7 @@ impl WebRtcEndpoint {
     }
 
     /// Create from a remote SDP offer, returning the SDP answer string
+    #[allow(dead_code)] // Preserve the OS-assigned-port constructor for library users.
     pub async fn from_offer(
         id: EndpointId,
         direction: EndpointDirection,
@@ -733,9 +768,26 @@ impl WebRtcEndpoint {
         packet_tx: mpsc::Sender<InboundPacket>,
         metrics: Arc<Metrics>,
     ) -> anyhow::Result<(Self, String)> {
+        Self::from_offer_with_port_range(
+            id, direction, offer_sdp, bind_addrs, packet_tx, metrics, None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn from_offer_with_port_range(
+        id: EndpointId,
+        direction: EndpointDirection,
+        offer_sdp: &str,
+        bind_addrs: &[SocketAddr],
+        packet_tx: mpsc::Sender<InboundPacket>,
+        metrics: Arc<Metrics>,
+        port_range: Option<(u16, u16)>,
+    ) -> anyhow::Result<(Self, String)> {
         let config = EndpointConfig { direction };
         let mut endpoint =
-            Self::new_with_socket_and_codecs(id, config, bind_addrs, metrics, None).await?;
+            Self::new_with_socket_and_codecs(id, config, bind_addrs, metrics, None, port_range)
+                .await?;
 
         // One ICE host candidate per bound socket (IPv4 and/or IPv6).
         endpoint.add_host_candidates()?;
@@ -781,9 +833,26 @@ impl WebRtcEndpoint {
         metrics: Arc<Metrics>,
         codecs: Option<&[String]>,
     ) -> anyhow::Result<(Self, String)> {
+        Self::create_offer_with_codecs_and_port_range(
+            id, direction, bind_addrs, packet_tx, metrics, codecs, None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_offer_with_codecs_and_port_range(
+        id: EndpointId,
+        direction: EndpointDirection,
+        bind_addrs: &[SocketAddr],
+        packet_tx: mpsc::Sender<InboundPacket>,
+        metrics: Arc<Metrics>,
+        codecs: Option<&[String]>,
+        port_range: Option<(u16, u16)>,
+    ) -> anyhow::Result<(Self, String)> {
         let config = EndpointConfig { direction };
         let mut endpoint =
-            Self::new_with_socket_and_codecs(id, config, bind_addrs, metrics, codecs).await?;
+            Self::new_with_socket_and_codecs(id, config, bind_addrs, metrics, codecs, port_range)
+                .await?;
 
         // One ICE host candidate per bound socket (IPv4 and/or IPv6).
         endpoint.add_host_candidates()?;

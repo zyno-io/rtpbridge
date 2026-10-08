@@ -26,7 +26,7 @@ If you see frequent orphaning, check network stability between your application 
 1. **Check endpoint directions** — Verify `sendrecv` / `sendonly` / `recvonly` / `inactive` are set correctly. A `recvonly` endpoint won't forward media, and an `inactive` endpoint is isolated.
 2. **Check routing** — Use `stats.subscribe` to monitor packet counts. If `inbound.packets` increments but `outbound.packets` doesn't, the routing table may not include the expected path.
 3. **Check codec mismatch** — If two endpoints negotiate different codecs, transcoding kicks in automatically. Monitor `rtpbridge_transcode_errors_total` for failures.
-4. **Check NAT/firewall** — For plain RTP endpoints, ensure the remote can reach `media_ip` and the allocated even/odd ports from `rtp_port_range`. For WebRTC endpoints, ensure peers can reach the advertised `media_ip:port` ICE host candidate; WebRTC uses OS-assigned UDP ports, not `rtp_port_range`.
+4. **Check NAT/firewall** — Ensure the remote can reach `media_ip` and the allocated ports from `rtp_port_range`: even/odd pairs for plain RTP, single ICE host-candidate ports for WebRTC. If `webrtc_port_range` overrides the default, allow that range as well. See [WebRTC UDP ports](./configuration#webrtc-udp-ports).
 
 ### SRTP errors
 
@@ -142,4 +142,4 @@ max_recordings_per_session = 100
 
 Also check OS-level limits:
 - **Open file descriptors** — Each UDP socket and recording file consumes an fd. With 10,000 sessions and multiple endpoints each, you may need `ulimit -n` in the hundreds of thousands.
-- **UDP port range** — The `rtp_port_range` must have enough ports for all concurrent plain RTP endpoints. WebRTC endpoints use OS-assigned UDP ports outside this range.
+- **UDP port range** — Size `rtp_port_range` for both plain RTP pairs and WebRTC single-port allocations. A shared range can run out of complete RTP pairs before every port is occupied. Use `webrtc_port_range` to reserve separate WebRTC capacity if needed.

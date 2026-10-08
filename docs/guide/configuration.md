@@ -34,8 +34,11 @@ auth_hmac_max_age_secs = 60
 media_ip = "203.0.113.5"
 # media_ip = "203.0.113.5, 2001:db8::5"   # dual-stack
 
-# UDP port range for plain RTP endpoints [start, end]
+# UDP port range shared by RTP and WebRTC endpoints [start, end]
 rtp_port_range = [30000, 39999]
+
+# Optional WebRTC UDP range override (inclusive); defaults to rtp_port_range.
+# webrtc_port_range = [49152, 65535]
 
 # Session disconnect timeout (seconds)
 # When a WS connection drops, the session stays alive for this long
@@ -143,6 +146,26 @@ Behavior:
 Validation rejects unspecified (`0.0.0.0` / `::`) and multicast media addresses; loopback and link-local addresses warn (IPv6 link-local cannot carry a scope id in SDP).
 
 **Limitation:** PCAP recordings always synthesize IPv4 framing regardless of the real media family — recorded packets do not carry real IPv6 headers.
+
+## WebRTC UDP ports
+
+WebRTC sockets and their advertised ICE host candidates use `rtp_port_range`
+by default, for both generated offers and answers. Existing deployments with
+a firewall-approved RTP range therefore need no additional setting. WebRTC
+multiplexes RTP, RTCP and DTLS on one UDP socket per configured media address
+family; plain RTP still allocates even/odd socket pairs.
+
+Optional `webrtc_port_range = [49152, 65535]` overrides the WebRTC range only.
+It is inclusive and accepts single-port ranges and odd ports. Port zero and
+privileged ports are rejected. Use the override to reserve separate capacity:
+WebRTC single-port allocations can leave free ports without an available RTP
+pair when sharing the range.
+
+Choose a range allowed by the deployment firewall. Both allocators skip ports
+already bound by other endpoints or a colocated TURN server. If no suitable
+port or pair is available, endpoint creation fails without falling back outside
+its range. Sockets remain owned by the endpoint, including ICE restart and
+transfer, and are released on teardown.
 
 ## HTTP REST API
 
@@ -303,7 +326,8 @@ All configuration options with their types, defaults, and descriptions. All chan
 | `auth_hmac_secret_file` | path | — | Optional mounted HMAC key file (minimum 32 bytes) for control-plane authorization. |
 | `auth_hmac_max_age_secs` | `u64` | `60` | Accepted signature age; must be 1–300 seconds. |
 | `media_ip` | `ip[,ip]` | `127.0.0.1` | IP(s) for RTP/WebRTC UDP sockets; appears in SDP and ICE candidates. Comma-separated for dual-stack (≤1 IPv4, ≤1 IPv6) |
-| `rtp_port_range` | `[u16, u16]` | `[30000, 39999]` | UDP port range for plain RTP endpoints (must start even, >= 1024) |
+| `rtp_port_range` | `[u16, u16]` | `[30000, 39999]` | Inclusive UDP range for RTP and, by default, WebRTC (must start even, >= 1024) |
+| `webrtc_port_range` | `[u16, u16]?` | `rtp_port_range` | Optional inclusive WebRTC UDP range override (>= 1024; single and odd ports allowed) |
 | `disconnect_timeout_secs` | `u64` | `30` | Seconds to keep orphaned sessions alive after WebSocket disconnect |
 | `shutdown_max_wait_secs` | `u64` | `300` | Maximum wait for session drain on graceful shutdown |
 | `media_dir` | `path?` | *(none)* | Base directory for local file playback; unset disables local files |

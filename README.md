@@ -74,6 +74,9 @@ websocat ws://localhost:9100
 listen = "127.0.0.1:9100"
 media_ip = "203.0.113.5"            # or "203.0.113.5, 2001:db8::5" for dual-stack
 rtp_port_range = [30000, 39999]
+
+# Optional WebRTC UDP range override (inclusive); defaults to rtp_port_range.
+# webrtc_port_range = [49152, 65535]
 disconnect_timeout_secs = 30
 shutdown_max_wait_secs = 300
 max_sessions = 10000

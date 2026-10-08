@@ -1247,13 +1247,14 @@ impl SessionState {
                 .ips()
                 .map(|ip| SocketAddr::new(ip, 0))
                 .collect();
-            let (ep, answer) = WebRtcEndpoint::from_offer(
+            let (ep, answer) = WebRtcEndpoint::from_offer_with_port_range(
                 id,
                 direction,
                 sdp_str,
                 &bind_addrs,
                 packet_tx.clone(),
                 self.metrics.clone(),
+                self.media_bindings.webrtc_port_range,
             )
             .await?;
             info!(
@@ -1358,13 +1359,14 @@ impl SessionState {
                     .ips()
                     .map(|ip| SocketAddr::new(ip, 0))
                     .collect();
-                let (ep, offer) = WebRtcEndpoint::create_offer_with_codecs(
+                let (ep, offer) = WebRtcEndpoint::create_offer_with_codecs_and_port_range(
                     id,
                     direction,
                     &bind_addrs,
                     packet_tx.clone(),
                     self.metrics.clone(),
                     codecs.as_deref(),
+                    self.media_bindings.webrtc_port_range,
                 )
                 .await?;
                 info!(

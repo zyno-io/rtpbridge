@@ -45,7 +45,9 @@ be handled.
 
 ### Per-Endpoint Sockets
 
-Each socket-backed endpoint binds its own UDP socket(s) rather than sharing a mux. WebRTC endpoints use one OS-assigned UDP socket, with ICE multiplexing RTP/RTCP and DTLS/SRTP on that port. Plain RTP/SRTP endpoints allocate an even/odd pair from `rtp_port_range` for RTP and RTCP sockets; if `rtcp-mux` is negotiated, RTCP traffic is demuxed on the RTP socket but the local pair is still allocated. For WebRTC, the OS-assigned port becomes the ICE host candidate.
+Each socket-backed endpoint binds its own UDP socket(s) rather than sharing a mux. Session-created WebRTC endpoints bind one socket per configured media address family, with ICE multiplexing RTP/RTCP and DTLS/SRTP on that port. Both offer and answer creation use the inclusive `rtp_port_range` by default; optional `webrtc_port_range` overrides it for WebRTC only. `MediaBindings` carries the effective range for managers created directly or from configuration. Allocation starts at a random port, scans each port at most once, and skips addresses already in use. Exhaustion or another bind error fails endpoint creation; it never falls back outside the effective range. ICE host candidates advertise the actual bound socket addresses. A failed dual-stack allocation drops any sockets already bound for that endpoint.
+
+Plain RTP/SRTP endpoints allocate an even/odd pair from `rtp_port_range` for RTP and RTCP sockets; if `rtcp-mux` is negotiated, RTCP traffic is demuxed on the RTP socket but the local pair is still allocated. When the ranges overlap, socket binding coordinates ownership: each allocator skips occupied ports, and a failed RTCP bind releases the tentative RTP socket. Single WebRTC sockets can fragment free RTP pairs, so deployments needing separate capacity can use the override. Endpoint teardown releases sockets, and ICE restart retains the existing endpoint sockets and ports.
 
 ### Symmetric RTP
 

@@ -85,7 +85,7 @@ Resource requirements depend on workload — transcoding (especially Opus) is CP
 
 Plain RTP endpoints allocate even/odd RTP/RTCP port pairs from `rtp_port_range` (default: 30000-39999), so expose that UDP range for plain RTP/SRTP.
 
-WebRTC endpoints do **not** use `rtp_port_range`: each WebRTC endpoint binds one OS-assigned UDP port on `media_ip`, and that port is advertised as the ICE host candidate. In environments with external firewalls or NAT, allow the host/container ephemeral UDP range or run with a network model where those OS-assigned host-candidate ports are directly reachable.
+WebRTC endpoints also use `rtp_port_range` by default: each binds one UDP socket per configured `media_ip` family and advertises its actual bound port as an ICE host candidate. Optional `webrtc_port_range` reserves a separate range for WebRTC. Allow the effective ranges through external firewalls or NAT, and size a shared range for both plain RTP pairs and WebRTC single-port allocations. See [WebRTC UDP ports](./configuration#webrtc-udp-ports).
 
 ### Health Checks
 
@@ -308,7 +308,7 @@ rtpbridge uses **ICE-lite** for WebRTC endpoints: the server is always the contr
 This means:
 
 - **`media_ip` must be directly reachable** by all peers. Set it to the public/external IP address if peers connect over the internet.
-- **For NAT environments**: Set `media_ip` to the public IP. Forward `rtp_port_range` (UDP) for plain RTP/SRTP endpoints, and also allow/forward the OS-assigned UDP ports used by WebRTC endpoints.
+- **For NAT environments**: Set `media_ip` to the public IP. Forward `rtp_port_range` (UDP) for RTP/SRTP and WebRTC endpoints; if `webrtc_port_range` is configured, also forward that override range.
 - **WebRTC peers** must be able to reach the advertised `media_ip:port` host candidates directly. Since rtpbridge only offers host candidates (no server-reflexive or relay candidates), peers behind symmetric NATs may fail to connect unless they use a TURN server on the peer side.
 - **Plain RTP endpoints** use even/odd port pairs from `rtp_port_range` for RTP/RTCP. Ensure this range is open in your firewall.
 - **Firewall rules**: Open `rtp_port_range` (UDP) for plain RTP/SRTP, the reachable WebRTC UDP host-candidate port range, and the control port (default 9100 TCP) for WebSocket/HTTP.

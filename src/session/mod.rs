@@ -177,6 +177,7 @@ impl SessionManager {
         let bindings =
             Arc::get_mut(&mut owned.media_bindings).expect("new bindings have one owner");
         bindings.source_networks = config.rtp_source_networks.clone().into();
+        bindings.webrtc_port_range = config.webrtc_port_range.or(Some(config.rtp_port_range));
         Ok(manager)
     }
 
@@ -731,6 +732,29 @@ mod tests {
         // Give the runtime a chance to process the abort
         tokio::task::yield_now().await;
         // If we reach here without hanging, the task was aborted successfully
+    }
+    #[test]
+    fn test_webrtc_port_range_from_config_reaches_media_bindings() {
+        for override_range in [None, Some((49152, 65535))] {
+            let directory = tempfile::tempdir().unwrap();
+            let config = crate::config::Config {
+                rtp_port_range: (32000, 32999),
+                webrtc_port_range: override_range,
+                ..crate::config::Config::default()
+            };
+            let cache = Arc::new(FileCache::new(directory.path().to_path_buf()).unwrap());
+            let manager = SessionManager::from_config(
+                &config,
+                ShutdownCoordinator::new(),
+                cache,
+                Arc::new(Metrics::new()),
+            )
+            .unwrap();
+            assert_eq!(
+                manager.media_bindings.webrtc_port_range,
+                Some(override_range.unwrap_or(config.rtp_port_range))
+            );
+        }
     }
 }
 

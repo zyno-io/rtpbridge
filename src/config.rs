@@ -162,8 +162,12 @@ pub struct Config {
     )]
     pub media_ip: Vec<IpAddr>,
 
-    /// UDP port range for plain RTP endpoints (start, end inclusive)
+    /// Inclusive UDP port range for RTP endpoints and, by default, WebRTC.
     pub rtp_port_range: (u16, u16),
+
+    /// Optional inclusive UDP port range override for WebRTC sockets.
+    /// Omit to share rtp_port_range with plain RTP.
+    pub webrtc_port_range: Option<(u16, u16)>,
 
     /// Additional initial RTP/RTCP source networks allowed before symmetric
     /// RTP latches an exact peer tuple. `*` is the default.
@@ -290,6 +294,7 @@ impl Default for Config {
             media_ip: default_media_ip(),
             // rtp_port_range applies per family — each media IP gets its own pool.
             rtp_port_range: (30000, 39999),
+            webrtc_port_range: None,
             rtp_source_networks: default_rtp_source_networks(),
             disconnect_timeout_secs: 30,
             shutdown_max_wait_secs: 300,
@@ -366,6 +371,12 @@ impl Config {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
+        if let Some((start, end)) = self.webrtc_port_range {
+            anyhow::ensure!(
+                start >= 1024 && start <= end,
+                "webrtc_port_range must be an inclusive range within 1024..=65535"
+            );
+        }
         if self.listen.is_empty() {
             anyhow::bail!("listen must contain at least one address");
         }
@@ -1289,5 +1300,37 @@ mod tests {
         );
         config.transcode_cache_size = 65;
         config.validate().unwrap();
+    }
+    #[test]
+    fn test_webrtc_port_range_config_defaults_and_parsing() {
+        let default: Config = toml::from_str("").unwrap();
+        assert_eq!(default.webrtc_port_range, None);
+        let configured: Config = toml::from_str("webrtc_port_range = [49152, 65535]").unwrap();
+        assert_eq!(configured.webrtc_port_range, Some((49152, 65535)));
+        assert_eq!(configured.rtp_port_range, default.rtp_port_range);
+    }
+
+    #[test]
+    fn test_webrtc_port_range_validation() {
+        for range in [(0, 65535), (1023, 65535), (50001, 50000)] {
+            let config = Config {
+                webrtc_port_range: Some(range),
+                ..Config::default()
+            };
+            assert!(
+                config
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("webrtc_port_range")
+            );
+        }
+        for range in [(1024, 1024), (50001, 50001), (65535, 65535), (49152, 65535)] {
+            let config = Config {
+                webrtc_port_range: Some(range),
+                ..Config::default()
+            };
+            config.validate().unwrap();
+        }
     }
 }

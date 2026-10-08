@@ -146,6 +146,7 @@ pub struct MediaBinding {
 pub struct MediaBindings {
     bindings: Vec<MediaBinding>,
     pub source_networks: Arc<[ipnet::IpNet]>,
+    pub webrtc_port_range: Option<(u16, u16)>,
 }
 
 impl MediaBindings {
@@ -164,6 +165,7 @@ impl MediaBindings {
         Ok(Self {
             bindings,
             source_networks: crate::config::default_rtp_source_networks().into(),
+            webrtc_port_range: Some((port_start, port_end)),
         })
     }
 
